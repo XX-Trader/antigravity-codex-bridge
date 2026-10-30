@@ -10,11 +10,19 @@ const root = path.resolve(__dirname, '..');
 const key = 'codex-executor';
 const digest = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const readJson = file => fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
-const quote = value => {
-  const text = String(value);
-  if (/["%!\r\n]/.test(text)) throw new Error('Windows hook path contains unsupported command-expansion characters');
-  return '"' + text + '"';
-};
+function barePath(value) {
+  const text = String(value), safe = /^[^\s"'&|<>^%!()]+$/u;
+  if (safe.test(text)) return text;
+  // Quotes in the final command are re-escaped by the native Windows host.
+  // Resolve an existing ancestor to its 8.3 name; never silently pick another exe.
+  if (/["'%!^|<>\r\n]/.test(text)) throw new Error('Cannot create quote-free Windows hook path: ' + text);
+  let existing = text; const suffix = [];
+  while (!fs.existsSync(existing)) { suffix.unshift(path.basename(existing)); const parent = path.dirname(existing); if (parent === existing) break; existing = parent; }
+  const r = spawnSync('cmd.exe', ['/d', '/u', '/s', '/c', 'for %I in ("' + existing + '") do @echo %~sI'], { encoding: 'utf16le', windowsHide: true, windowsVerbatimArguments: true });
+  const short = path.join((r.stdout || '').trim(), ...suffix);
+  if (r.status !== 0 || !safe.test(short) || !fs.existsSync(existing)) throw new Error('Cannot create quote-free Windows hook path; use a path without spaces/metacharacters or enable 8.3 names: ' + text);
+  return short;
+}
 function target(file) {
   const absolute = path.resolve(file);
   if (fs.existsSync(absolute)) return fs.realpathSync(absolute);
@@ -75,9 +83,9 @@ function buildPlan(options) {
   };
   change(mcp, ['mcpServers', key], entry);
   const hooksFile = target(path.join(configDir, 'hooks.json'));
-  // Antigravity's Windows hook host is cmd.exe, not PowerShell. CALL also avoids
-  // cmd /c stripping the first/last quotes when the executable path has spaces.
-  const command = 'call ' + quote(pwsh) + ' -NoProfile -NonInteractive -File ' + quote(path.join(root, 'src', 'invoke-codex.ps1')) + ' -OriginHook -McpConfigPath ' + quote(mcp) + ' -NodeEntry ' + quote(process.execPath);
+  // No quotes anywhere: the Go host escapes embedded quotes incompatibly with CMD.
+  // Node's (possibly spaced) executable is read inside PowerShell from MCP config.
+  const command = barePath(pwsh) + ' -NoProfile -NonInteractive -File ' + barePath(path.join(root, 'src', 'invoke-codex.ps1')) + ' -OriginHook -McpConfigPath ' + barePath(mcp);
   change(hooksFile, ['codex-executor-origin'], { PreToolUse: [{ matcher: hookMatcher, hooks: [{ type: 'command', command, timeout: 10 }] }] });
   const sidecarFile = target(path.join(configDir, 'sidecars', key, 'sidecar.json'));
   const oldSidecar = document(sidecarFile);

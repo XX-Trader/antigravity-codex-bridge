@@ -1,10 +1,17 @@
 #requires -Version 7.0
 [CmdletBinding()]
-param([string]$RequestPath, [switch]$AppServer, [string]$CodexEntry, [switch]$OriginHook, [switch]$Notify, [string]$ProjectRoot, [string]$McpConfigPath, [string]$NodeEntry = 'node.exe')
+param([string]$RequestPath, [switch]$AppServer, [string]$CodexEntry, [switch]$OriginHook, [switch]$Notify, [string]$ProjectRoot, [string]$McpConfigPath, [string]$NodeEntry)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 $OutputEncoding = [Text.UTF8Encoding]::new($false)
+if (($OriginHook -or $Notify) -and -not $NodeEntry) {
+    if ($McpConfigPath) {
+        $mcp = Get-Content -LiteralPath $McpConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $NodeEntry = $mcp.mcpServers.'codex-executor'.command
+    }
+    if (-not $NodeEntry) { $NodeEntry = (Get-Command node.exe -CommandType Application -ErrorAction Stop).Source }
+}
 if ($OriginHook) {
     [string[]]$hookArgs = if ($McpConfigPath) { @('--config', $McpConfigPath) } else { @($ProjectRoot) }
     [Console]::In.ReadToEnd() | & $NodeEntry (Join-Path $PSScriptRoot 'notifier.cjs') --origin-hook @hookArgs

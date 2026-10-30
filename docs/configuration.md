@@ -7,7 +7,7 @@
 默认配置位置：
 
 - MCP：`~/.gemini/config/mcp_config.json`，也可用 `--config` 指定现有文件。文件是符号链接时更新真实目标，不覆盖链接。
-- Hook：`~/.gemini/config/hooks.json` 的 `codex-executor-origin`，只匹配桥接的六个常规工具。
+- Hook：`~/.gemini/config/hooks.json` 的 `codex-executor-origin`，处理桥接工具、MCP 包装层及已知的宿主执行入口。
 - 项目说明：项目的 `.agents/rules.json` 增加对本仓库 `.agents/rules/antigravity-codex.md` 的引用，保留已有 entries。维护本仓库自身时直接使用仓库内的规则，不重复引用。
 - 可选通知：提供 `--agentapi` 后写入 `~/.gemini/config/sidecars/codex-executor/sidecar.json`，并在全局 `config.json` 启用同名 Sidecar。保留已有 projectId。
 
@@ -75,7 +75,9 @@ MCP 和 Sidecar 分别加载。配置写入后检查真实进程路径及 `notif
 
 这些是工具接口与协作约束，不是操作系统安全沙箱；新增或改名的宿主工具仍需兼容性核查。Codex 原生子 agent 通过自身工具执行，不经过 Antigravity hook，也不经本 MCP 递归。实际可用能力、原生子线程配置及服务资源仍受已安装 Codex 和用户配置约束。
 
-Windows Hook 的宿主是 `cmd.exe`，生成命令使用 `call "完整 pwsh 路径" ...` 和双引号参数，不能使用 PowerShell 的 `& '路径'`。回归测试覆盖真实 `cmd /c`、空格、中文和 `&` 路径；包含 `%`、`!` 等命令扩展字符的 Hook 路径会明确拒绝，避免错误展开。
+Windows Hook 经宿主参数转义后交给 `cmd.exe /c`。生成的 `command` 值完全不含单双引号，不能使用 PowerShell 的 `& '路径'`，也不能依赖 `call "路径"` 绕过宿主转义。命令只带 pwsh、脚本及 MCP 配置路径；Node 路径由脚本内部读取 MCP 配置，未配置时才查找 PATH，显式 `-NodeEntry` 仍适用于直接调用和 Sidecar。
+
+Hook 路径含空格或 `&` 时，安装器尝试现有路径的 8.3 短名；短名不可用或含不支持的命令字符时，在写配置前明确失败，请改用不含空格和元字符的安装路径。不会静默换程序或生成仍带引号的命令。回归测试覆盖普通 argv 转义、原样 `cmd /c` 和 shell 调用，以及中文 JSON 与带空格的 Node 配置路径。
 
 ## 回滚安装
 
