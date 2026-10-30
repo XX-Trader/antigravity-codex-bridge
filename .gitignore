@@ -1,0 +1,13 @@
+node_modules/
+artifacts/
+.tmp/
+.cache/
+dist/
+logs/
+jobs/
+.env
+.env.*
+*.local.json
+*.log
+install-state.json
+notification-host.json
