@@ -10,7 +10,11 @@ const root = path.resolve(__dirname, '..');
 const key = 'codex-executor';
 const digest = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const readJson = file => fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
-const quote = value => "'" + String(value).replace(/'/g, "''") + "'";
+const quote = value => {
+  const text = String(value);
+  if (/["%!\r\n]/.test(text)) throw new Error('Windows hook path contains unsupported command-expansion characters');
+  return '"' + text + '"';
+};
 function target(file) {
   const absolute = path.resolve(file);
   if (fs.existsSync(absolute)) return fs.realpathSync(absolute);
@@ -71,7 +75,9 @@ function buildPlan(options) {
   };
   change(mcp, ['mcpServers', key], entry);
   const hooksFile = target(path.join(configDir, 'hooks.json'));
-  const command = '& ' + quote(pwsh) + ' -NoProfile -NonInteractive -File ' + quote(path.join(root, 'src', 'invoke-codex.ps1')) + ' -OriginHook -McpConfigPath ' + quote(mcp) + ' -NodeEntry ' + quote(process.execPath);
+  // Antigravity's Windows hook host is cmd.exe, not PowerShell. CALL also avoids
+  // cmd /c stripping the first/last quotes when the executable path has spaces.
+  const command = 'call ' + quote(pwsh) + ' -NoProfile -NonInteractive -File ' + quote(path.join(root, 'src', 'invoke-codex.ps1')) + ' -OriginHook -McpConfigPath ' + quote(mcp) + ' -NodeEntry ' + quote(process.execPath);
   change(hooksFile, ['codex-executor-origin'], { PreToolUse: [{ matcher: hookMatcher, hooks: [{ type: 'command', command, timeout: 10 }] }] });
   const sidecarFile = target(path.join(configDir, 'sidecars', key, 'sidecar.json'));
   const oldSidecar = document(sidecarFile);

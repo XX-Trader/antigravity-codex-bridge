@@ -152,4 +152,6 @@ test('native subagent verification requires real Codex spawn, not another CLI or
   assert.match(message, /原生 spawn_agent/); assert.match(message, /父agent不能自己读文件冒充委派/);
   assert.match(message, /不新开CLI冒充子agent/); assert.match(message, /不能调用 Antigravity invoke_subagent/);
   assert.match(message, /不要手填 conversation_id/); assert.match(message, /SUBAGENT_CHECK=/);
+  const resumed = eventMessage(f.job, { ...event, detail: '恢复未派发检查 CHECK_ID=' + f.job.job_id + ':99' });
+  assert.ok(resumed.includes('SUBAGENT_CHECK=' + f.job.job_id + ':99'));
 });

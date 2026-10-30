@@ -3,6 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const { buildPlan, apply, restore, target } = require('../scripts/setup.cjs');
 const { config } = require('../src/server.cjs');
 function fixture() {
@@ -11,6 +12,31 @@ function fixture() {
   const options = { home: path.join(root, 'home'), project: path.join(root, 'project'), data: path.join(root, 'runtime'), codex: process.execPath, pwsh: process.execPath, agentapi: process.execPath };
   return { root, options, done: () => fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) };
 }
+test('Windows hook runs through real cmd /c, preserves UTF-8 and spaced/metacharacter paths', () => {
+  const f = fixture(); let junction;
+  try {
+    let pwsh = process.env.CODEX_EXECUTOR_PWSH || 'pwsh.exe';
+    if (!path.isAbsolute(pwsh)) pwsh = spawnSync('where.exe', [pwsh], { encoding: 'utf8' }).stdout.trim().split(/\r?\n/)[0];
+    pwsh = fs.realpathSync(pwsh);
+    const home = path.join(f.root, 'home space & 中文'), project = path.join(f.root, 'project space & 中文'); fs.mkdirSync(home); fs.mkdirSync(project);
+    const plan = buildPlan({ ...f.options, home, project, pwsh }); apply(plan);
+    const hooks = JSON.parse(fs.readFileSync(path.join(home, '.gemini/config/hooks.json'), 'utf8'));
+    const command = hooks['codex-executor-origin'].PreToolUse[0].hooks[0].command;
+    assert.match(command, /^call "/); assert.doesNotMatch(command, /^&/);
+    junction = path.join(f.root, 'pwsh space & 中文'); fs.symlinkSync(path.dirname(pwsh), junction, 'junction');
+    const alternate = command.replace('"' + pwsh + '"', '"' + path.join(junction, path.basename(pwsh)) + '"');
+    const conversationId = '11111111-1111-1111-1111-111111111111';
+    const payload = { conversationId, workspacePaths: [project], toolCall: { name: 'call_mcp_tool', args: { ServerName: 'codex-executor', ToolName: 'codex_run', Arguments: { prompt: '中文 transport only' } } } };
+    for (const cmd of [command, alternate]) for (const mode of ['raw', 'shell']) {
+      const options = { input: JSON.stringify(payload), encoding: 'utf8', windowsHide: true, timeout: 30000 };
+      const r = mode === 'raw' ? spawnSync('cmd.exe', ['/d', '/s', '/c', cmd], { ...options, windowsVerbatimArguments: true }) : spawnSync(cmd, { ...options, shell: 'cmd.exe' });
+      assert.equal(r.status, 0, r.stderr); assert.equal(r.stderr, '');
+      const reply = JSON.parse(r.stdout); assert.equal(reply.decision, 'allow');
+      assert.equal(reply.overwrite.Arguments.conversation_id, conversationId); assert.equal(reply.overwrite.Arguments.prompt, payload.toolCall.args.Arguments.prompt);
+      assert.equal(reply.overwrite.Arguments.cwd, fs.realpathSync(project));
+    }
+  } finally { if (junction && fs.existsSync(junction)) fs.rmdirSync(junction); f.done(); }
+});
 test('setup preview does not write configuration and arbitrary absolute storage is accepted', () => {
   const f = fixture(); try {
     const plan = buildPlan(f.options);
