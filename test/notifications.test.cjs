@@ -147,3 +147,9 @@ test('parallel verification is explicit read-only dispatch, not a task-count lim
   assert.match(message, /PARALLEL_CHECK=/); assert.match(message, /不改文件/); assert.match(message, /不带旧 topic_id\/session_id/);
   assert.doesNotMatch(message, /这是后台事件，不是新的用户任务/);
 });
+test('native subagent verification requires real Codex spawn, not another CLI or Antigravity agent', t => {
+  const f = fixture(t), event = f.emit('subagent', 'subagent_check'), message = eventMessage(f.job, event);
+  assert.match(message, /原生 spawn_agent/); assert.match(message, /父agent不能自己读文件冒充委派/);
+  assert.match(message, /不新开CLI冒充子agent/); assert.match(message, /不能调用 Antigravity invoke_subagent/);
+  assert.match(message, /不要手填 conversation_id/); assert.match(message, /SUBAGENT_CHECK=/);
+});

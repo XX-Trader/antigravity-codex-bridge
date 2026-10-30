@@ -2,6 +2,8 @@
 
 让 Antigravity 负责理解需求、分析与验收，让本机 Codex CLI 实际执行任务。
 
+执行和子 agent 都属于 Codex：Antigravity 不用自己的原生子 agent、命令或写文件工具代做。需要细分时，由 Codex 会话调用自己的原生 `spawn_agent` 并汇总结果。桥接启动时显式启用 `features.multi_agent=true`，不覆盖用户的原生子线程数量配置；这与多个独立顶层 Codex 任务是两件事。
+
 这是一个 Windows 优先的本地 stdio MCP 服务，不需要 npm 运行依赖，也不复制 Codex 登录凭证。默认启用完整文件系统/命令网络访问和实时联网搜索，适用于你信任的本机项目；不要接到不可信工作区或远程公开端口。
 
 ## 能解决什么
@@ -96,6 +98,8 @@ pwsh -NoProfile -Command 'node scripts/verify.cjs --config C:/path/to/mcp_config
 它会唤醒该聊天，可能消耗 Antigravity 模型额度；应回读同一 `event_id` 的原生收件及回复，而不是只看本地 `accepted`。不会自动领取业务结果或续跑任务。
 
 要在原 Antigravity 聊天中实际验收多个 Codex 并行，可把 `--notification-check` 换成 `--parallel-check`。它明确请求 Antigravity 连续提交三个独立只读项目核查；每个任务读取文件并短暂等待20秒，以观察执行区间重叠。三是本次验收样本数，不是运行上限。该模式会调用真实 Codex 和 Antigravity、消耗额度，不修改业务文件或提交代码。应先确认当前 MCP 已加载新版，再执行一次，保留事件和任务编号，不重复派发。
+
+`--subagent-check` 则派发一次原生子 agent 验收：父 Codex 必须真正启动并等待子 agent 读取项目说明，返回原生子 agent ID；应核对实际 spawn/wait 事件，不只相信最终文字。注册名不同时可用 `--server NAME` 指定已有 MCP 服务。
 
 ## 边界
 

@@ -64,3 +64,24 @@ test('cross-process admissions exclude only the same native session', async t =>
   })));
   assert.equal(rows.filter(r => r.accepted).length, 1); assert.equal(rows.filter(r => r.rejected?.includes('already running')).length, 7);
 });
+test('wrapped native MCP calls preserve arguments and bind the real originating chat', t => {
+  const f = fixture(t), { bindOrigin, hookMatcher } = require('../src/router.cjs');
+  const conversationId = '11111111-1111-1111-1111-111111111111';
+  const payload = { conversationId, workspacePaths: [f.project], toolCall: { name: 'call_mcp_tool', args: { ServerName: 'codex-executor-parallel', ToolName: 'codex_run', Arguments: { prompt: 'keep me', wait: false } } } };
+  assert.ok(new RegExp(hookMatcher).test('call_mcp_tool'));
+  const result = bindOrigin(payload, [{ project: f.project, data: f.data }]);
+  assert.equal(result.overwrite.Arguments.prompt, 'keep me'); assert.equal(result.overwrite.Arguments.wait, false);
+  assert.equal(result.overwrite.Arguments.conversation_id, conversationId); assert.equal(result.overwrite.Arguments.cwd, f.project);
+  assert.equal(result.overwrite.ServerName, undefined); assert.equal(result.decision, 'allow');
+  assert.equal(bindOrigin({ ...payload, toolCall: { name: 'mcp_codex-subagent_codex_run', args: { prompt: 'legitimate Codex dispatch' } } }, [{ project: f.project, data: f.data }]).decision, 'allow');
+});
+test('Antigravity native execution/subagents are denied only in registered projects, Codex dispatch is allowed', t => {
+  const f = fixture(t), { bindOrigin, hookMatcher } = require('../src/router.cjs'), projects = [{ project: f.project, data: f.data }];
+  for (const name of ['invoke_subagent', 'define_subagent', 'manage_subagents', 'run_command', 'write_to_file', 'multi_replace_file_content', 'browser_subagent']) {
+    assert.ok(new RegExp(hookMatcher).test(name));
+    assert.equal(bindOrigin({ workspacePaths: [f.project], toolCall: { name, args: {} } }, projects).decision, 'deny');
+    assert.equal(bindOrigin({ workspacePaths: [], toolCall: { name, args: {} } }, projects).decision, 'allow');
+  }
+  assert.equal(bindOrigin({ workspacePaths: [f.project], toolCall: { name: 'read_file', args: {} } }, projects).decision, 'allow');
+  assert.equal(bindOrigin({ workspacePaths: [f.project], toolCall: { name: 'call_mcp_tool', args: { ToolName: 'invoke_subagent', Arguments: {} } } }, projects).decision, 'deny');
+});

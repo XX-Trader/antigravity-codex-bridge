@@ -4,6 +4,9 @@ const path = require('node:path');
 const { Broker, inside, terminal } = require('./server.cjs');
 const real = p => fs.realpathSync(p);
 const same = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+const executionTools = ['run_command', 'manage_task', 'send_command_input', 'command_status', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'apply_patch', 'edit_file', 'write_file', 'invoke_subagent', 'define_subagent', 'manage_subagents', 'spawn_agent', 'spawn_subagent', 'delegate_task', 'send_message', 'schedule'];
+const executionPattern = new RegExp('(?:^|[_/.:-])(?:' + executionTools.join('|') + ')$|subagent|sub_agent', 'i');
+const hookMatcher = '(?:^|[_/.:-])(?:codex_(run|sessions|list|wait|result|cancel)|call_mcp_tool|' + executionTools.join('|') + ')$|subagent|sub_agent';
 function scopesFor(workspaces, projects) {
   return projects.filter(p => workspaces.some(w => {
     try { const root = real(w); return same(root, p.project) || inside(root, p.project) || inside(p.project, root); } catch { return false; }
@@ -11,8 +14,19 @@ function scopesFor(workspaces, projects) {
 }
 function bindOrigin(payload, projects) {
   const name = payload?.toolCall?.name || '';
+  if (/(?:^|[_/.:-])call_mcp_tool$/.test(name)) {
+    const outer = payload.toolCall.args || {}, key = Object.hasOwn(outer, 'Arguments') ? 'Arguments' : 'arguments';
+    const innerName = outer.ToolName || outer.toolName || outer.tool_name || '';
+    const args = outer[key] || {};
+    if (typeof args !== 'object' || Array.isArray(args)) return { decision: 'deny', reason: 'MCP Arguments 必须是对象，未执行。' };
+    const result = bindOrigin({ ...payload, toolCall: { name: innerName, args } }, projects);
+    return result.overwrite ? { ...result, overwrite: { [key]: { ...args, ...result.overwrite } } } : result;
+  }
   const match = name.match(/(?:^|[_/.:-])(codex_run|codex_sessions|codex_list|codex_wait|codex_result|codex_cancel)$/);
-  if (!match) return { decision: 'allow' };
+  if (!match) {
+    if (executionPattern.test(name) && scopesFor(payload.workspacePaths || [], projects).length) return { decision: 'deny', reason: '本项目由 Antigravity 规划和验收，执行必须交给 codex_run；需要子 agent 时由 Codex 会话启动自己的原生子 agent，禁止 Antigravity 原生执行或子 agent 代做。' };
+    return { decision: 'allow' };
+  }
   const tool = match[1], args = payload.toolCall.args || {};
   const scopes = scopesFor(payload.workspacePaths || [], projects);
   if (!scopes.length) return { decision: 'deny', reason: '当前 Antigravity 项目没有已登记的 Codex 执行根；不能误用其他项目。' };
@@ -74,4 +88,4 @@ class ProjectRouter {
     return this.brokers.flatMap(b => b.list(limit, undefined, activeOnly)).filter(j => !activeOnly || !terminal.has(j.status)).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, activeOnly ? Number.MAX_SAFE_INTEGER : limit);
   }
 }
-module.exports = { ProjectRouter, bindOrigin };
+module.exports = { ProjectRouter, bindOrigin, hookMatcher };

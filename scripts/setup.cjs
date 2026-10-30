@@ -5,6 +5,7 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const { config, save, inside } = require('../src/server.cjs');
+const { hookMatcher } = require('../src/router.cjs');
 const root = path.resolve(__dirname, '..');
 const key = 'codex-executor';
 const digest = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -71,7 +72,7 @@ function buildPlan(options) {
   change(mcp, ['mcpServers', key], entry);
   const hooksFile = target(path.join(configDir, 'hooks.json'));
   const command = '& ' + quote(pwsh) + ' -NoProfile -NonInteractive -File ' + quote(path.join(root, 'src', 'invoke-codex.ps1')) + ' -OriginHook -McpConfigPath ' + quote(mcp) + ' -NodeEntry ' + quote(process.execPath);
-  change(hooksFile, ['codex-executor-origin'], { PreToolUse: [{ matcher: '(?:^|[_/.:-])codex_(run|sessions|list|wait|result|cancel)$', hooks: [{ type: 'command', command, timeout: 10 }] }] });
+  change(hooksFile, ['codex-executor-origin'], { PreToolUse: [{ matcher: hookMatcher, hooks: [{ type: 'command', command, timeout: 10 }] }] });
   const sidecarFile = target(path.join(configDir, 'sidecars', key, 'sidecar.json'));
   const oldSidecar = document(sidecarFile);
   const agentapi = options.agentapi || oldSidecar.env?.CODEX_EXECUTOR_AGENTAPI;

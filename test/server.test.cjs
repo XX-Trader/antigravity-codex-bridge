@@ -76,7 +76,8 @@ $ec = @($argv | Where-Object { $_ -like 'model_reasoning_effort=*' })
 $fast = ($argv -contains 'service_tier="fast"') -and ($argv -contains 'features.fast_mode=true')
 $si = [Array]::IndexOf($argv, '--sandbox')
 $liveWeb = $argv -contains 'web_search="live"'
-$text = 'FAKE_OK resume=' + ($argv -contains 'resume') + ' unicode=' + $prompt.Contains('中文参数') + ' model=' + $argv[$mi+1] + ' effort=' + ($ec -join ',') + ' fast=' + $fast + ' sandbox=' + $argv[$si+1] + ' web_live=' + $liveWeb
+$nativeAgents = $argv -contains 'features.multi_agent=true'
+$text = 'FAKE_OK resume=' + ($argv -contains 'resume') + ' unicode=' + $prompt.Contains('中文参数') + ' model=' + $argv[$mi+1] + ' effort=' + ($ec -join ',') + ' fast=' + $fast + ' sandbox=' + $argv[$si+1] + ' web_live=' + $liveWeb + ' native_subagents=' + $nativeAgents
 if ($prompt.Contains('NEEDS_INPUT_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT] 请确认选择A还是B' }
 if ($prompt.Contains('BLOCKED_FIXTURE')) { $text = '[CODEX_BLOCKED] 方案与当前代码矛盾' }
 [IO.File]::WriteAllText($argv[$i+1], $text, [Text.UTF8Encoding]::new($false))
@@ -135,6 +136,7 @@ exit 0
       const result = await finished(broker, first.job_id);
       assert.equal(result.status, 'completed'); assert.equal(result.exit_code, 0);
       assert.match(result.final_response, /resume=False unicode=True/);
+      assert.match(result.final_response, /native_subagents=True/);
       assert.equal(result.chat_title.status, 'set'); assert.equal(result.chat_title.name, '中文参数');
       assert.equal(fs.readFileSync(path.join(project, '.fake-title-' + result.session_id + '.txt'), 'utf8'), '中文参数');
       assert.equal(new Broker(settings).status(first.job_id).thread_id, '00000000-0000-0000-0000-000000000001');
