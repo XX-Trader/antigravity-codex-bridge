@@ -121,6 +121,8 @@ test('continuation supersedes old notices and terminal supersedes stale pending 
   const f = fixture(t); f.emit('start', 'started');
   const next = 'bbbbbbbbbbbbbbbbbbbbbbbb', nextFile = f.broker.jobPath(next); fs.mkdirSync(path.dirname(nextFile)); save(nextFile, { ...f.job, job_id: next, created_at: '2099-01-01T00:00:00.000Z' });
   assert.equal(await deliver(f.broker, id, async () => { throw Error('stale matter alert'); }), false);
+  f.emit('check', 'notification_check'); let checks = 0;
+  assert.equal(await deliver(f.broker, id, async (_, message) => { assert.match(message, /不调用任何工具/); checks++; return {}; }), true); assert.equal(checks, 1);
   fs.unlinkSync(nextFile); fs.rmdirSync(path.dirname(nextFile)); save(f.file, { ...f.job, status: 'completed' }); f.emit('end', 'terminal'); let calls = 0;
   await deliver(f.broker, id, async () => { calls++; return {}; }); assert.equal(calls, 1); assert.equal(notificationSummary(f.file).pending, 0);
 });

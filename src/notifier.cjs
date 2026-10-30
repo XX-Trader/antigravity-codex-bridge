@@ -86,11 +86,18 @@ async function deliverEvent(job, event, deliveryFile, send, options) {
   } finally { release(); }
 }
 async function deliver(broker, id, send, options = {}) {
-  const job = broker.get(id), dir = path.dirname(broker.jobPath(id)), events = notificationEvents(broker.jobPath(id));
+  const job = broker.get(id), dir = path.dirname(broker.jobPath(id)); let events = notificationEvents(broker.jobPath(id));
   const newer = fs.readdirSync(broker.jobs).filter(n => /^[a-f0-9]{24}$/.test(n) && n !== id).some(n => {
     try { const next = read(broker.jobPath(n)); return next.topic_id === job.topic_id && next.conversation_id === job.conversation_id && next.created_at > job.created_at; } catch { return false; }
   });
-  if (newer) return false; // A continuation supersedes old progress/terminal notices, not the saved evidence.
+  if (newer) {
+    for (const event of events.filter(e => e.kind !== 'notification_check')) {
+      const file = event.file.replace(/\.json$/, '.delivery.json');
+      if (!fs.existsSync(file) || read(file).state === 'not_sent') save(file, { state: 'superseded', event_id: event.event_id, reason: 'A newer job continued this matter.' });
+    }
+    events = events.filter(e => e.kind === 'notification_check');
+    if (!events.length) return false; // Explicit diagnostics may use an old job; stale business notices may not.
+  }
   if (!events.length) {
     const file = path.join(dir, 'notice.json'); if (!fs.existsSync(file)) return false;
     const notice = read(file);
