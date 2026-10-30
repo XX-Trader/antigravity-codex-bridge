@@ -26,6 +26,11 @@ description: Antigravity 负责理解与验收，Codex 负责执行；按事项�
 - parallel_check 是用户通过显式验收命令授权的派发请求，不是普通进度事件；按消息要求实际提交独立只读任务。样本数量不是并发上限，不重复已有编号，不扩大成业务改动。
 - subagent_check 是用户明确授权的原生子 agent 验收；只向 Codex 派发，由 Codex 真正调用原生子 agent，不能由 Antigravity 开子 agent 或自行执行补齐证据。原生能力不可用就如实说明，不把声称委派当成实际委派。
 - 只有 terminal 事件才取一次 codex_result，核对实际命令、输出、退出码、文件和未完成项。needs_input/blocked 时先审查，在已有授权内修正并续接；需要用户选择再问，不擅自批准。发现 notification.pending/uncertain 或 service.online=false 时如实说明通知未确认，不能承诺必然自动提醒。
+- needs_input 的 handoff 保存问题、选项、建议和已完成部分。用户偏好、范围、权限与不可逆选择必须原样展示并等待用户回答，不能默认选推荐项。用户回答后，用同一 topic_id 或 session_id 续接一次，带上用户原答复；不新开事项，不重做已完成步骤。非交互 exec 不提供进程内实时选择框，不能声称已经接通原生交互问答。
+- terminal 的 execution_state=background_unconfirmed 表示对话结束但后台命令退出尚未确认，verification_state=pending。先检查回执中的后台命令/session/日志，判断继续等待、必要核查还是需要用户选择，不把 completed/exit_code=0 说成测试或业务全部完成，不重启仍可能活动的命令。
+- notification_alert 只针对超过60秒未投递、发送前重试耗尽或发送结果不明；同根因同聊天合并一次。核对原回执，不重派任务；notification_recovered 只简短说明，无须再调工具。执行失败/超时/needs_input/blocked 已包含在原终态回执中，不另发重复告警。正常链接耗时和短暂恢复不告警。
+- execution_alert 表示 worker 已退出但其子进程可能还活着：只领取一次原回执核对归属、日志和结果，不重派、不按裸 PID 直接终止。worker 异常退出且没有终态事件时，由本地通知器补齐原任务的终态事件，不重执行。
+- 通知器每5秒只在本机补查未确认队列与活跃任务，不调用模型、不重跑任务、不发送心跳；这不是模型轮询。实际告警或必要状态通知唤醒本模型仍可能消耗 token。通道故障先保存本地告警并在回执暴露，恢复前不得承诺告警已送达。
 - 查看任务、询问进度或领取该事项回执时，把 chat.vscode_uri 展示为“在 Codex 聊天窗查看完整任务”的可点击链接。Insiders 使用 vscode_insiders_uri。progress 仅是最近落盘事件，不是实时心跳或成功证明；chat=null 不得触发重派或轮询。
 - 重启后用带 cwd 的 codex_list/codex_sessions 找原事项，打开同一链接，不重新执行。不宣称后台任务必然自动出现在扩展侧栏。已结束旧桥接任务缺标题时，可显式用 codex_result(job_id=原ID, sync_title=true) 补齐；不覆盖手工标题。
 - 同一事项/会话不能同时启动两轮；新独立事项不受这个保护影响。同工作树不做人数限流或隐式排队。需要查看全部活动任务时可显式调用 codex_list(cwd=当前根, active_only=true)，不把默认最近20条的历史展示当成运行上限。不同根分别注册，不能跨项目领取、取消或把当前任意分支当成任务分支。

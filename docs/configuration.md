@@ -57,6 +57,10 @@
 
 每个任务在 `notifications/` 保存有序事件和对应 `.delivery.json`；进度与最终回执分开，带 `event_id`、`sequence`、原聊天和 Codex 查看入口。文件事件触发，普通变化最多合并约 300ms，终态优先；不是定期调用模型，也不逐行推送日志。命令阶段识别是保守匹配，不是任意业务的精确百分比。
 
+文件监听只是唤醒提示，不是唯一保障。通知器每5秒本地补查活跃/未确认任务，同时发现漏掉的新任务目录；已确认历史不反复读取。此过程不调用模型、Codex 或业务命令，不发检查心跳。`notification-health.json` 保存最近检查、发送与监听错误，回执不再仅以 PID 存活判断健康。
+
+`notification-alerts.json` 合并同聊天、同根因的通知异常：超过60秒仍待投递、发送前失败重试耗尽、发送结果不明。告警自身不递归生成告警；同一异常首次通知一次，已送达的告警恢复后通知一次。告警尚未发出就恢复时只更新本地记录，避免补发过时告警。通道本身坏了不能保证立即通知，先在本地和工具回执暴露。执行失败/超时/受阻沿用原终态通知，不再重复发送。真实通知唤醒 Antigravity 仍可能消耗 token，本地补查不消耗。
+
 发送前调用原生会话元数据接口核对宿主。此时失败记 `not_sent`，最多按 2/10/30 秒退避重试，宿主重启后可恢复。调用发送接口后结果不明记 `uncertain`；只有原生 Sidecar 成功事件记录匹配收件人和事件编号时才自动确认，不靠“没有记录”推断未送达。无法确认时保留并通过回执暴露，禁止盲目重放。`accepted` 不是聊天渲染或业务完成证明。
 
 通知进程按宿主连接与代码 build 生成代际标识，同一代只允许一个 owner，新代接管后旧版通知进程退出；单条事件另有跨进程 claim。遗留旧版进程不懂此协议，需要核实进程身份后单独退出通知进程，不能连带结束 Codex worker。运行中的旧 worker 可由新版通知器接管进度，历史事项已续接时不再推送过时回执。
@@ -74,6 +78,10 @@ MCP 和 Sidecar 分别加载。配置写入后检查真实进程路径及 `notif
 项目内的执行交给 Codex，子任务交给 Codex 原生子 agent；Antigravity 只做编排、必要的只读查阅和验收。PreToolUse hook 在已注册项目内拦截已知的 Antigravity 命令、写文件和原生子 agent 入口，允许 Codex MCP 派发及只读查阅。它还处理 `call_mcp_tool` 包装层，在嵌套 `Arguments` 中绑定真实聊天与 cwd，不能只匹配裸 `codex_run` 名字。未注册项目不因此被全局锁住。
 
 这些是工具接口与协作约束，不是操作系统安全沙箱；新增或改名的宿主工具仍需兼容性核查。Codex 原生子 agent 通过自身工具执行，不经过 Antigravity hook，也不经本 MCP 递归。实际可用能力、原生子线程配置及服务资源仍受已安装 Codex 和用户配置约束。
+
+桥接使用非交互 `exec`，不是原生交互式选择框代理。Codex 需要用户选择时，结束该轮并输出 `[CODEX_NEEDS_INPUT]`，随后给出包含 `question`、字符串数组 `options`、可选 `recommendation` 和 `completed` 的 JSON；旧式纯文本仍保留。回执和终态通知保存、展示问题，等待用户回答后用原 topic/session 续接，不自动选择或重新开始。`[CODEX_BLOCKED]` 同样保留具体阻塞原因。
+
+`completed` 仅表示 CLI 轮次结束。若命令只有 started、没有 completed，或 Codex 明确报告 `[CODEX_BACKGROUND_RUNNING]`，回执标记 `execution_state=background_unconfirmed`、`verification_state=pending`，保存已观测的未确认命令。它不证明进程仍活着，也不证明测试失败；由 Antigravity 结合原日志/session 判断下一步，不能把未知退出当作通过。
 
 Windows Hook 经宿主参数转义后交给 `cmd.exe /c`。生成的 `command` 值完全不含单双引号，不能使用 PowerShell 的 `& '路径'`，也不能依赖 `call "路径"` 绕过宿主转义。命令只带 pwsh、脚本及 MCP 配置路径；Node 路径由脚本内部读取 MCP 配置，未配置时才查找 PATH，显式 `-NodeEntry` 仍适用于直接调用和 Sidecar。
 

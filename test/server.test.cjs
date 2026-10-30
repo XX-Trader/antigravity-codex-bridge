@@ -79,6 +79,8 @@ $liveWeb = $argv -contains 'web_search="live"'
 $nativeAgents = $argv -contains 'features.multi_agent=true'
 $text = 'FAKE_OK resume=' + ($argv -contains 'resume') + ' unicode=' + $prompt.Contains('中文参数') + ' model=' + $argv[$mi+1] + ' effort=' + ($ec -join ',') + ' fast=' + $fast + ' sandbox=' + $argv[$si+1] + ' web_live=' + $liveWeb + ' native_subagents=' + $nativeAgents
 if ($prompt.Contains('NEEDS_INPUT_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT] 请确认选择A还是B' }
+if ($prompt.Contains('STRUCTURED_QUESTION_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT]' + [Environment]::NewLine + '{"question":"选择工作树还是等待？","options":["工作树：隔离修改","等待：复用目录"],"recommendation":"等待","completed":"已定位文件范围"}' }
+if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { $text = '[CODEX_BACKGROUND_RUNNING] 测试命令 test-pending 退出结果未确认，请勿重跑。' }
 if ($prompt.Contains('BLOCKED_FIXTURE')) { $text = '[CODEX_BLOCKED] 方案与当前代码矛盾' }
 [IO.File]::WriteAllText($argv[$i+1], $text, [Text.UTF8Encoding]::new($false))
 $tid = '00000000-0000-0000-0000-000000000001'
@@ -92,6 +94,7 @@ if ($prompt.Contains('PROGRESS_FIXTURE')) {
   '{"type":"item.started","item":{"id":"check1","type":"command_execution","command":"cargo test -p fixture"}}'
   '{"type":"item.completed","item":{"id":"check1","type":"command_execution","command":"cargo test -p fixture","exit_code":0}}'
 }
+if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { '{"type":"item.started","item":{"id":"test-pending","type":"command_execution","command":"cargo test -p fixture"}}' }
 '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"part-1","exit_code":0}}'
 '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"part-2","exit_code":0}}'
 '{"type":"item.completed","item":{"type":"agent_message","text":"FAKE_OK"}}'
@@ -303,6 +306,17 @@ exit 0
         const kinds = notificationEvents(notices.jobPath(progress.job_id)).map(e => e.kind);
         assert.ok(kinds.includes('started')); assert.ok(kinds.includes('session_ready')); assert.ok(kinds.includes('phase_started')); assert.ok(kinds.includes('phase_finished'));
       } finally { watcher.close(); }
+    });
+    await t.test('structured question resumes exact topic/session with user answer; background command is not verified', async () => {
+      const paused = await broker.run({ wait: true, prompt: 'STRUCTURED_QUESTION_FIXTURE', topic: '选择题交接' });
+      assert.equal(paused.status, 'needs_input'); assert.equal(paused.handoff.question, '选择工作树还是等待？');
+      assert.deepEqual(paused.handoff.options, ['工作树：隔离修改', '等待：复用目录']);
+      assert.deepEqual(new Broker(settings).receipt(paused.job_id).handoff, paused.handoff);
+      const continued = await broker.run({ wait: true, topic_id: paused.topic_id, prompt: '用户选择：等待。继续原事项，不重做已完成步骤。' });
+      assert.equal(continued.status, 'completed'); assert.equal(continued.session_id, paused.session_id); assert.equal(continued.topic_id, paused.topic_id);
+      const background = await broker.run({ wait: true, prompt: 'BACKGROUND_HANDOFF_FIXTURE', topic: '后台命令交接' });
+      assert.equal(background.status, 'completed'); assert.equal(background.execution_state, 'background_unconfirmed'); assert.equal(background.verification_state, 'pending');
+      assert.equal(background.background_commands[0].item_id, 'test-pending');
     });
     await t.test('multi-project routing: independent workers/locks, cwd scope and no cross-project matter access', async () => {
       const otherProject = path.join(root, '另一个项目'), otherData = path.join(root, 'other-runtime'); fs.mkdirSync(otherProject); fs.mkdirSync(otherData);

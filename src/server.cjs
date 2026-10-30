@@ -41,6 +41,19 @@ function capacityDelay(until, dir) {
 }
 const stamp = () => new Date().toISOString();
 const read = file => JSON.parse(fs.readFileSync(file, 'utf8'));
+function finalHandoff(text = '') {
+  const match = text.trimStart().match(/^\[CODEX_(NEEDS_INPUT|BLOCKED|BACKGROUND_RUNNING)\]\s*([\s\S]*)$/);
+  if (!match) return null;
+  const kind = { NEEDS_INPUT: 'needs_input', BLOCKED: 'blocked', BACKGROUND_RUNNING: 'background_running' }[match[1]];
+  const body = match[2].trim(); let structured;
+  try { structured = JSON.parse(body.replace(/^```(?:json)?\s*|\s*```$/g, '')); } catch { /* Older workers return plain text; preserve it verbatim. */ }
+  const handoff = { kind, text: body.slice(0, 8000) };
+  if (structured && typeof structured === 'object' && !Array.isArray(structured)) {
+    for (const key of ['question', 'recommendation', 'completed', 'reason']) if (typeof structured[key] === 'string') handoff[key] = structured[key].slice(0, 3000);
+    if (Array.isArray(structured.options)) handoff.options = structured.options.filter(v => typeof v === 'string').slice(0, 12).map(v => v.slice(0, 1000));
+  }
+  return handoff;
+}
 function save(file, value) {
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
@@ -99,7 +112,7 @@ function publishNotification(jobFile, job, key, kind, detail = '') {
     const events = notificationEvents(jobFile), existing = events.find(e => e.key === key);
     if (existing) return existing;
     const sequence = (events.at(-1)?.sequence || 0) + 1;
-    const event = { schema: 2, event_id: `${job.job_id}:${sequence}`, sequence, key, kind, job_id: job.job_id, topic_id: job.topic_id, conversation_id: job.conversation_id, topic: job.topic, status: job.status, chat: chatAccess(job.thread_id), detail: String(detail).slice(0, 700), created_at: stamp() };
+    const event = { schema: 2, event_id: `${job.job_id}:${sequence}`, sequence, key, kind, job_id: job.job_id, topic_id: job.topic_id, conversation_id: job.conversation_id, topic: job.topic, status: job.status, chat: chatAccess(job.thread_id), detail: String(detail).slice(0, 700), created_at: stamp(), ...(kind === 'terminal' ? { handoff: job.handoff || null, execution_state: job.execution_state || null, verification_state: job.verification_state || 'not_verified', background_commands: job.background_commands || [] } : {}) };
     const file = path.join(dir, String(sequence).padStart(8, '0') + '.json'); createOnce(file, event);
     return { ...event, file };
   } finally { release(); }
@@ -114,7 +127,11 @@ function notificationSummary(jobFile) {
   if (!rows.length && fs.existsSync(legacy)) rows.push(read(legacy));
   const hostFile = process.env.CODEX_EXECUTOR_DATA && path.join(process.env.CODEX_EXECUTOR_DATA, 'notification-host.json');
   const host = hostFile && fs.existsSync(hostFile) ? read(hostFile) : null;
-  return { latest: rows.at(-1) || null, pending: rows.filter(r => ['pending', 'not_sent'].includes(r.state)).length, uncertain: rows.filter(r => ['uncertain', 'sending'].includes(r.state)).length, service: { online: hostFile ? !!host && alive(host.pid) : null, build_matches: hostFile ? !!host && host.build === process.env.CODEX_EXECUTOR_BUILD : null }, note: 'accepted means host API accepted, not proof that the chat rendered or business checks passed. not_sent is retryable; uncertain needs receipt reconciliation, never blind replay.' };
+  const healthFile = path.join(path.dirname(path.dirname(jobFile)), '..', 'notification-health.json');
+  const health = fs.existsSync(healthFile) ? read(healthFile) : null;
+  const alertFile = path.join(path.dirname(healthFile), 'notification-alerts.json');
+  const alerts = fs.existsSync(alertFile) ? Object.values(read(alertFile).groups || {}).filter(g => g.state === 'open' && g.jobs?.includes(path.basename(dir))) : [];
+  return { latest: rows.at(-1) || null, pending: rows.filter(r => ['pending', 'not_sent'].includes(r.state)).length, uncertain: rows.filter(r => ['uncertain', 'sending'].includes(r.state)).length, alerts, service: { online: hostFile ? !!host && alive(host.pid) && (!health || (!health.closed && Date.now() - Date.parse(health.checked_at) < 20000)) : null, build_matches: hostFile ? !!host && host.build === process.env.CODEX_EXECUTOR_BUILD : null, health }, note: 'accepted means host API accepted, not proof that the chat rendered or business checks passed. not_sent is retryable; uncertain needs receipt reconciliation, never blind replay.' };
 }
 function commandPhase(command = '') {
   if (/\b(?:cargo\s+clippy|clippy\b)/i.test(command)) return '静态检查';
@@ -325,7 +342,7 @@ class Broker {
     } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
   summary(job) {
-    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title', 'notification_error', 'concurrency'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), chat: chatAccess(job.thread_id), notification: job.job_id ? notificationSummary(this.jobPath(job.job_id)) : null, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
+    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title', 'notification_error', 'concurrency', 'handoff', 'execution_state', 'verification_state', 'background_commands'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), chat: chatAccess(job.thread_id), notification: job.job_id ? notificationSummary(this.jobPath(job.job_id)) : null, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
   }
   start(input, resumption = null) {
     if (process.env.CODEX_EXECUTOR_CHILD === '1') throw new Error('Recursive Codex delegation is disabled');
@@ -421,6 +438,7 @@ class Broker {
       model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6), ...(job.capacity_retry_at ? { capacity_retry_at: job.capacity_retry_at } : {}),
       ...(job.conversation_id ? { conversation_id: job.conversation_id } : {}),
       exit_code: job.exit_code ?? null, ...(job.error ? { error: job.error } : {}),
+      handoff: job.handoff || null, execution_state: job.execution_state || (terminal.has(job.status) ? 'cli_finished' : 'running'), verification_state: job.verification_state || 'not_verified', background_commands: job.background_commands || [],
       final_response: tail(resultFile, 8000), result_truncated: size > 8000,
       progress: latestProgress(path.join(dir, 'events.jsonl')), notification: notificationSummary(this.jobPath(id)),
       ...(usage ? { usage } : {}),
@@ -547,6 +565,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       fs.rmSync(path.join(dir, 'result.txt'), { force: true });
       fs.writeSync(events, JSON.stringify({ type: 'bridge.attempt', attempt, model: job.settings.model }) + '\n');
       let child, timer, killSent = false, turnCompleted = false, turnFailed = false, lastError = '', businessStarted = false, usage;
+      const openCommands = new Map();
       const stop = reason => {
         if (killSent || !child || child.exitCode !== null) return;
         stopReason = reason; killSent = true;
@@ -570,6 +589,10 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
             if (event.type === 'turn.completed') { turnCompleted = true; turnFailed = false; usage = event.usage; if (lastError) { update({ recovered_error: lastError }); lastError = ''; } }
             if (event.type === 'turn.failed' || event.type === 'error') { turnFailed = true; lastError = event.error?.message || event.message || ''; }
             if (['item.started', 'item.completed'].includes(event.type) && ['command_execution', 'file_change'].includes(event.item?.type)) businessStarted = true;
+            if (event.item?.type === 'command_execution' && event.item.id) {
+              if (event.type === 'item.started') openCommands.set(event.item.id, { item_id: event.item.id, command: String(event.item.command || '').slice(0, 2000), state: 'exit_unconfirmed' });
+              if (event.type === 'item.completed') openCommands.delete(event.item.id);
+            }
             if (event.item?.type === 'file_change' && event.type === 'item.completed') notify(`files-${attempt}`, 'files_changed', '已写入首批文件变更，仍需后续验证。');
             const phase = event.item?.type === 'command_execution' && commandPhase(event.item.command);
             if (phase && event.type === 'item.started') notify(`${phase}-${attempt}-start`, 'phase_started', `正在执行${phase}。`);
@@ -599,9 +622,12 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
         if (!await clock.wait(retryAt, dir)) { stopReason = 'cancelled'; break; }
         continue;
       }
-      const final = tail(path.join(dir, 'result.txt'), 8000);
-      const handoff = successful && final.startsWith('[CODEX_NEEDS_INPUT]') ? 'needs_input' : successful && final.startsWith('[CODEX_BLOCKED]') ? 'blocked' : null;
-      finish({ status: stopReason || handoff || (successful ? 'completed' : 'failed'), execution_used_ms: executionUsed, exit_code: outcome.code, ended_at: stamp(), retrying_capacity: false,
+      // The handoff marker is at the beginning, not in the UI's truncated tail.
+      const finalFile = path.join(dir, 'result.txt');
+      const final = fs.existsSync(finalFile) ? fs.readFileSync(finalFile, 'utf8') : '';
+      const handoff = successful ? finalHandoff(final) : null;
+      const background = [...openCommands.values()].slice(0, 20), pendingBackground = background.length > 0 || handoff?.kind === 'background_running';
+      finish({ status: stopReason || (['needs_input', 'blocked'].includes(handoff?.kind) ? handoff.kind : null) || (successful ? 'completed' : 'failed'), handoff, execution_state: pendingBackground ? 'background_unconfirmed' : 'cli_finished', verification_state: pendingBackground ? 'pending' : 'not_verified', background_commands: background, execution_used_ms: executionUsed, exit_code: outcome.code, ended_at: stamp(), retrying_capacity: false,
         ...(!successful && !stopReason ? { error: lastError || 'Codex did not emit a successful turn.completed event' } : {}) });
       break;
     }
@@ -635,7 +661,7 @@ const tools = [
 
 function dispatch(broker, request, signal) {
   const { method, params = {} } = request;
-  if (method === 'initialize') return { protocolVersion: ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'].includes(params.protocolVersion) ? params.protocolVersion : '2024-11-05', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'codex-executor', version: VERSION }, instructions: `Execution boundary: Antigravity only plans, delegates and reviews; all execution and subagents must be Codex-owned. Codex-native spawn_agent is allowed, recursive calls through this MCP are not. Registered roots: ${(broker.settings?.projects || [broker.settings]).filter(Boolean).map(p => p.project).join(' ; ')}. Trusted-project executions default to danger-full-access and live web search. An explicit sandbox mode may be selected for a new turn, including upgrading a finished same-session continuation; never hot-change or resubmit a running task. Bind cwd to the current Antigravity project; never assume a different registered directory. Use codex_run once with a short topic and an available model ID or configured alias chosen for the task when needed. Default Medium and background acknowledgment; continue normal conversation without a waiting tool. Each unrelated matter gets its own topic/Codex session; reuse topic_id only for the same matter. A project-only identity hook binds the originating chat; a native sidecar pushes durable lifecycle events to that exact chat, each with event_id and sequence. Show progress and the saved chat link briefly without calling tools or executing another task. Only terminal events require codex_result once to review evidence or intervene within authorization. notification_check only acknowledges its exact event ID, with no tools or business execution. parallel_check is an explicitly user-authorized native acceptance request: actually submit the independent read-only sample tasks it describes; the sample count is not a concurrency cap. Expose notification pending/not_sent/uncertain and service health; API acceptance is not rendered-chat or business acceptance. When a user asks to view a task, show its returned chat.vscode_uri as a clickable Markdown link; codex_list recovers these links after restart. Do not claim exec tasks automatically appear in the extension history list. Opening history does not authorize a new turn. Exact capacity errors resume the same model/thread, at most six starts per rolling hour with no lifetime cap; scripts wait, not models. Independent matters in the same worktree run without a numeric concurrency cap. Only duplicate simultaneous turns for the same topic/session are excluded. Before dispatch, assess file/API dependencies; if tightly coupled, ask the user whether to use separate worktrees or wait for the prerequisite, never create worktrees silently. Coordinate shared Git index, branch changes and final integration serially; switching branches in one shared directory is not isolation. Use codex_list(active_only=true) on explicit progress requests to see all active tasks, not periodic polling. No auto-upgrades, schedule/timer/status polling or unrelated-chat messages.` };
+  if (method === 'initialize') return { protocolVersion: ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'].includes(params.protocolVersion) ? params.protocolVersion : '2024-11-05', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'codex-executor', version: VERSION }, instructions: `Execution boundary: Antigravity only plans, delegates and reviews; all execution and subagents must be Codex-owned. Codex-native spawn_agent is allowed, recursive calls through this MCP are not. Registered roots: ${(broker.settings?.projects || [broker.settings]).filter(Boolean).map(p => p.project).join(' ; ')}. Trusted-project executions default to danger-full-access and live web search. An explicit sandbox mode may be selected for a new turn, including upgrading a finished same-session continuation; never hot-change or resubmit a running task. Bind cwd to the current Antigravity project; never assume a different registered directory. Use codex_run once with a short topic and an available model ID or configured alias chosen for the task when needed. Default Medium and background acknowledgment; continue normal conversation without a waiting tool. Each unrelated matter gets its own topic/Codex session; reuse topic_id only for the same matter. A project-only identity hook binds the originating chat; a native sidecar pushes durable lifecycle events to that exact chat, each with event_id and sequence. Show progress and the saved chat link briefly without calling tools or executing another task. Only terminal events require codex_result once to review evidence or intervene within authorization. execution_alert permits one inspect-only receipt read, never a redispatch. Forward needs_input handoff questions/options to the user without auto-selecting; resume the exact topic/session once after their answer. background_unconfirmed means CLI ended but command exit/verification is pending. notification_check only acknowledges its exact event ID, with no tools or business execution. parallel_check is an explicitly user-authorized native acceptance request: actually submit the independent read-only sample tasks it describes; the sample count is not a concurrency cap. Expose notification pending/not_sent/uncertain and service health; API acceptance is not rendered-chat or business acceptance. When a user asks to view a task, show its returned chat.vscode_uri as a clickable Markdown link; codex_list recovers these links after restart. Do not claim exec tasks automatically appear in the extension history list. Opening history does not authorize a new turn. Exact capacity errors resume the same model/thread, at most six starts per rolling hour with no lifetime cap; scripts wait, not models. Independent matters in the same worktree run without a numeric concurrency cap. Only duplicate simultaneous turns for the same topic/session are excluded. Before dispatch, assess file/API dependencies; if tightly coupled, ask the user whether to use separate worktrees or wait for the prerequisite, never create worktrees silently. Coordinate shared Git index, branch changes and final integration serially; switching branches in one shared directory is not isolation. Use codex_list(active_only=true) on explicit progress requests to see all active tasks, not periodic polling. No auto-upgrades, model-based schedule/timer/status polling or unrelated-chat messages. Five-second local outbox reconciliation does not call a model or send heartbeats.` };
   if (method === 'ping') return {};
   if (method === 'tools/list') return { tools };
   if (method !== 'tools/call') throw Object.assign(new Error(`Unknown method: ${method}`), { code: -32601 });
@@ -685,7 +711,7 @@ function serve(settings = config()) {
   lines.on('close', () => { setImmediate(() => { for (const controller of requests.values()) controller.abort(); }); });
 }
 
-module.exports = { taskTitle, syncTaskTitle, latestProgress, chatAccess, nativeMetadata, toolResponse, worker, capacityRetryAt, isCapacity, capacityMessage, Broker, config, dispatch, tools, inside, read, save, terminal, childEnvironment, notificationEvents, publishNotification, notificationSummary, commandPhase, alive, takeFileClaim };
+module.exports = { finalHandoff, taskTitle, syncTaskTitle, latestProgress, chatAccess, nativeMetadata, toolResponse, worker, capacityRetryAt, isCapacity, capacityMessage, Broker, config, dispatch, tools, inside, read, save, terminal, childEnvironment, notificationEvents, publishNotification, notificationSummary, commandPhase, alive, takeFileClaim };
 if (require.main === module) {
   if (process.argv[2] === '--worker') worker(process.argv[3]).catch(error => {
     try { fs.writeFileSync(path.join(path.dirname(process.argv[3]), 'worker-error.txt'), `${error.stack}\n`, 'utf8'); } catch {}
