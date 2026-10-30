@@ -408,6 +408,7 @@ test('native chat links are restart-stable and reject URI injection', async () =
   assert.equal(listed.sessions[0].chat.vscode_uri, expected);
   assert.equal(b.summary({ thread_id: id }).chat.vscode_uri, expected);
   assert.equal(b.summary({}).chat, null);
+  assert.equal(b.summary({}).notification, null);
   const result = await dispatch(b, { method: 'tools/call', params: { name: 'codex_sessions', arguments: { limit: 1 } } });
   assert.equal(result.isError, false);
   assert.equal(JSON.parse(result.content[0].text).sessions[0].chat.vscode_uri, expected);
