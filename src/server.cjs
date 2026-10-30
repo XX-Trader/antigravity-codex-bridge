@@ -59,6 +59,70 @@ function createOnce(file, value) {
   try { fs.linkSync(tmp, file); } catch (error) { if (error.code !== 'EEXIST') throw error; }
   finally { fs.unlinkSync(tmp); }
 }
+function takeFileClaim(file) {
+  const nonce = crypto.randomUUID(), name = `${process.pid}-${nonce}.json`;
+  const prepared = `${file}.${process.pid}.${nonce}.tmp`;
+  const removeOwner = owner => {
+    try { fs.unlinkSync(path.join(file, owner)); } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    try { fs.rmdirSync(file); } catch (error) { if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error; }
+    return true;
+  };
+  fs.mkdirSync(prepared); fs.writeFileSync(path.join(prepared, name), JSON.stringify({ pid: process.pid, nonce }), { flag: 'wx' });
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { fs.renameSync(prepared, file); return () => removeOwner(name); }
+      catch (error) {
+        if (!['EEXIST', 'EPERM', 'EACCES', 'ENOTEMPTY'].includes(error.code)) throw error;
+        let owners; try { owners = fs.readdirSync(file).filter(n => /^\d+-[a-f0-9-]+\.json$/.test(n)); } catch { return null; }
+        if (owners.length !== 1) return null; // Empty means another process is publishing its owner, not an expired lock.
+        let previous; try { previous = read(path.join(file, owners[0])); } catch { return null; }
+        if (alive(previous.pid)) return null;
+        if (!removeOwner(owners[0])) return null;
+      }
+    }
+    return null;
+  } finally { if (fs.existsSync(prepared)) { fs.unlinkSync(path.join(prepared, name)); fs.rmdirSync(prepared); } }
+}
+// Durable events are independent of delivery. Short claims also serialize explicit diagnostics.
+function notificationEvents(jobFile) {
+  const dir = path.join(path.dirname(jobFile), 'notifications');
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter(n => /^\d{8}\.json$/.test(n)).sort().map(n => ({ ...read(path.join(dir, n)), file: path.join(dir, n) }));
+}
+function publishNotification(jobFile, job, key, kind, detail = '') {
+  if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(job.conversation_id || '')) return null;
+  const dir = path.join(path.dirname(jobFile), 'notifications'); fs.mkdirSync(dir, { recursive: true });
+  let release;
+  for (let n = 0; n < 100 && !release; n++) { release = takeFileClaim(path.join(dir, '.publish.claim')); if (!release) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
+  if (!release) throw new Error('Notification publisher busy; no event overwritten');
+  try {
+    const events = notificationEvents(jobFile), existing = events.find(e => e.key === key);
+    if (existing) return existing;
+    const sequence = (events.at(-1)?.sequence || 0) + 1;
+    const event = { schema: 2, event_id: `${job.job_id}:${sequence}`, sequence, key, kind, job_id: job.job_id, topic_id: job.topic_id, conversation_id: job.conversation_id, topic: job.topic, status: job.status, chat: chatAccess(job.thread_id), detail: String(detail).slice(0, 700), created_at: stamp() };
+    const file = path.join(dir, String(sequence).padStart(8, '0') + '.json'); createOnce(file, event);
+    return { ...event, file };
+  } finally { release(); }
+}
+function notificationSummary(jobFile) {
+  const dir = path.dirname(jobFile), events = notificationEvents(jobFile);
+  const rows = events.map(event => {
+    const delivery = event.file.replace(/\.json$/, '.delivery.json');
+    return { event_id: event.event_id, sequence: event.sequence, kind: event.kind, ...(fs.existsSync(delivery) ? read(delivery) : { state: 'pending' }) };
+  });
+  const legacy = path.join(dir, 'delivery.json');
+  if (!rows.length && fs.existsSync(legacy)) rows.push(read(legacy));
+  const hostFile = process.env.CODEX_EXECUTOR_DATA && path.join(process.env.CODEX_EXECUTOR_DATA, 'notification-host.json');
+  const host = hostFile && fs.existsSync(hostFile) ? read(hostFile) : null;
+  return { latest: rows.at(-1) || null, pending: rows.filter(r => ['pending', 'not_sent'].includes(r.state)).length, uncertain: rows.filter(r => ['uncertain', 'sending'].includes(r.state)).length, service: { online: hostFile ? !!host && alive(host.pid) : null, build_matches: hostFile ? !!host && host.build === process.env.CODEX_EXECUTOR_BUILD : null }, note: 'accepted means host API accepted, not proof that the chat rendered or business checks passed. not_sent is retryable; uncertain needs receipt reconciliation, never blind replay.' };
+}
+function commandPhase(command = '') {
+  if (/\b(?:cargo\s+clippy|clippy\b)/i.test(command)) return '静态检查';
+  if (/\b(?:cargo\s+test|pytest|npm\s+(?:run\s+)?test|node\s+--test)\b/i.test(command)) return '测试';
+  if (/\b(?:cargo\s+build|npm\s+run\s+build|cmake\s+--build)\b/i.test(command)) return '构建';
+  if (/\bgit\s+(?:-\S+\s+)*commit\b/i.test(command)) return 'Git 提交';
+  return null;
+}
 function alive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
@@ -149,7 +213,7 @@ function nativeMetadata(settings, method, params) {
       if (reply.id === 0) { send({ method: 'initialized', params: {} }); send({ id: 1, method, params }); }
       if (reply.id === 1) finish(null, reply.result);
     });
-    send({ id: 0, method: 'initialize', params: { clientInfo: { name: 'codex-executor-session-metadata', version: '1.3.1' } } });
+    send({ id: 0, method: 'initialize', params: { clientInfo: { name: 'codex-executor-session-metadata', version: VERSION } } });
   });
 }
 
@@ -254,7 +318,7 @@ class Broker {
     } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
   summary(job) {
-    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), chat: chatAccess(job.thread_id), model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
+    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title', 'notification_error'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), chat: chatAccess(job.thread_id), notification: notificationSummary(this.jobPath(job.job_id)), model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
   }
   start(input, resumption = null) {
     if (process.env.CODEX_EXECUTOR_CHILD === '1') throw new Error('Recursive Codex delegation is disabled');
@@ -298,7 +362,7 @@ class Broker {
       const job = {
         job_id: id, status: 'queued', created_at: stamp(), cwd, sandbox,
         prompt: input.prompt, timeout_seconds: input.timeout_seconds || 3600,
-        settings: taskSettings, topic_id: parent?.topic_id || input.topic_id || id, topic: parent?.topic || topicParent?.topic || input.topic?.trim() || taskTitle({ prompt: input.prompt }),
+        settings: taskSettings, notification_schema: 2, topic_id: parent?.topic_id || input.topic_id || id, topic: parent?.topic || topicParent?.topic || input.topic?.trim() || taskTitle({ prompt: input.prompt }),
         ...(input.conversation_id ? { conversation_id: input.conversation_id } : {}),
         ...(parent ? { parent_job_id: parent.job_id, thread_id: parent.thread_id, ...(parent.chat_title ? { chat_title: parent.chat_title } : {}) } : {}),
         ...(resumption ? { resumed_session: true, thread_id: resumption.id } : {})
@@ -312,7 +376,7 @@ class Broker {
         this.unlock(id);
       });
       worker.unref();
-      return { ...this.summary(job), session_id: job.thread_id || null, next: 'Background task accepted; continue normal chat. A scoped native sidecar sends one completion/decision event to the originating conversation when activated. On that event collect codex_result once; no polling or duplicate submission.' };
+      return { ...this.summary(job), session_id: job.thread_id || null, next: 'Background task accepted; continue normal chat. The native sidecar pushes meaningful progress and a terminal/decision event to this chat. Progress includes the saved chat link: display it briefly without executing or polling. Only a terminal event needs codex_result once. Notification delivery state is distinct from task acceptance; never submit duplicates.' };
     } catch (error) { this.unlock(id); throw error; }
   }
   status(id) { return this.summary(this.get(id)); }
@@ -351,7 +415,7 @@ class Broker {
       ...(job.conversation_id ? { conversation_id: job.conversation_id } : {}),
       exit_code: job.exit_code ?? null, ...(job.error ? { error: job.error } : {}),
       final_response: tail(resultFile, 8000), result_truncated: size > 8000,
-      progress: latestProgress(path.join(dir, 'events.jsonl')),
+      progress: latestProgress(path.join(dir, 'events.jsonl')), notification: notificationSummary(this.jobPath(id)),
       ...(usage ? { usage } : {}),
       acceptance: 'CLI completion is not business acceptance; review the returned evidence.',
       paths: { receipt: path.join(dir, 'receipt.json'), result: resultFile, events: path.join(dir, 'events.jsonl'), stderr: path.join(dir, 'stderr.log') }
@@ -454,6 +518,10 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
   let stopReason;
   const update = changes => { job = { ...job, ...changes }; save(file, job); };
   const finish = changes => { broker.unlock(job.job_id); update(changes); };
+  const notify = (key, kind, detail) => {
+    try { publishNotification(file, job, key, kind, detail); }
+    catch (error) { update({ notification_error: error.message }); fs.writeSync(stderr, 'notification persistence: ' + error.message + '\n'); }
+  };
   let naming = null;
   const updateTitle = () => {
     if (naming || !job.thread_id || job.resumed_session || ['set', 'preserved'].includes(job.chat_title?.status)) return;
@@ -462,11 +530,13 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
   let executionUsed = job.execution_used_ms || 0;
   try {
     update({ status: 'running', started_at: stamp(), worker_pid: process.pid, attempts: [] });
+    notify('started', 'started', '已开始执行；这不是完成回执。');
     for (let attempt = 1; ; attempt++) {
       if (fs.existsSync(path.join(dir, 'cancel'))) { stopReason = 'cancelled'; break; }
       if (executionUsed >= job.timeout_seconds * 1000) { stopReason = 'timed_out'; break; }
       const started = clock.now(), deadline = Date.now() + job.timeout_seconds * 1000 - executionUsed;
       update({ attempt, status: 'running', capacity_retry_at: null });
+      if (attempt > 1) notify(`resumed-${attempt}`, 'resumed', `原模型、原会话续跑，第 ${attempt} 次启动。`);
       fs.rmSync(path.join(dir, 'result.txt'), { force: true });
       fs.writeSync(events, JSON.stringify({ type: 'bridge.attempt', attempt, model: job.settings.model }) + '\n');
       let child, timer, killSent = false, turnCompleted = false, turnFailed = false, lastError = '', businessStarted = false, usage;
@@ -489,10 +559,14 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
           fs.writeSync(events, line + '\n');
           try {
             const event = JSON.parse(line);
-            if (event.type === 'thread.started' && event.thread_id) { update({ thread_id: event.thread_id }); updateTitle(); }
-            if (event.type === 'turn.completed') { turnCompleted = true; usage = event.usage; }
+            if (event.type === 'thread.started' && event.thread_id) { update({ thread_id: event.thread_id }); updateTitle(); notify('session', 'session_ready', '原生 Codex 会话已建立，可打开已保存的执行过程。'); }
+            if (event.type === 'turn.completed') { turnCompleted = true; turnFailed = false; usage = event.usage; if (lastError) { update({ recovered_error: lastError }); lastError = ''; } }
             if (event.type === 'turn.failed' || event.type === 'error') { turnFailed = true; lastError = event.error?.message || event.message || ''; }
             if (['item.started', 'item.completed'].includes(event.type) && ['command_execution', 'file_change'].includes(event.item?.type)) businessStarted = true;
+            if (event.item?.type === 'file_change' && event.type === 'item.completed') notify(`files-${attempt}`, 'files_changed', '已写入首批文件变更，仍需后续验证。');
+            const phase = event.item?.type === 'command_execution' && commandPhase(event.item.command);
+            if (phase && event.type === 'item.started') notify(`${phase}-${attempt}-start`, 'phase_started', `正在执行${phase}。`);
+            if (phase && event.type === 'item.completed') notify(`${phase}-${attempt}-${event.item.id}`, 'phase_finished', `${phase}命令结束，退出码 ${event.item.exit_code ?? 'unknown'}；不代表整个任务验收完成。`);
           } catch { /* Keep unknown output verbatim; never classify a quoted tool result as a capacity failure. */ }
         });
         timer = setInterval(() => { if (fs.existsSync(path.join(dir, 'cancel'))) stop('cancelled'); else if (Date.now() >= deadline) stop('timed_out'); }, 500);
@@ -514,6 +588,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       if (capacity && (!businessStarted || job.thread_id)) {
         const retryAt = capacityRetryAt(job.attempts, clock.now());
         update({ status: 'waiting_capacity', capacity_retry_at: new Date(retryAt).toISOString(), execution_used_ms: executionUsed });
+        notify(`capacity-${attempt}`, 'waiting_capacity', `等待原模型容量；最早续跑时间 ${job.capacity_retry_at}。不会自动换模型。`);
         if (!await clock.wait(retryAt, dir)) { stopReason = 'cancelled'; break; }
         continue;
       }
@@ -530,6 +605,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
     fs.closeSync(events); fs.closeSync(stderr);
     if (terminal.has(job.status)) {
       broker.receipt(job.job_id);
+      notify('terminal', 'terminal', job.error || '执行轮次已结束，请核对原结果与业务验收条件。');
       if (job.conversation_id) createOnce(path.join(dir, 'notice.json'), { job_id: job.job_id, topic_id: job.topic_id, conversation_id: job.conversation_id, status: job.status, created_at: stamp() });
     }
     broker.unlock(job.job_id);
@@ -602,7 +678,7 @@ function serve(settings = config()) {
   lines.on('close', () => { setImmediate(() => { for (const controller of requests.values()) controller.abort(); }); });
 }
 
-module.exports = { taskTitle, syncTaskTitle, latestProgress, chatAccess, nativeMetadata, toolResponse, worker, capacityRetryAt, isCapacity, capacityMessage, Broker, config, dispatch, tools, inside, read, save, terminal, childEnvironment };
+module.exports = { taskTitle, syncTaskTitle, latestProgress, chatAccess, nativeMetadata, toolResponse, worker, capacityRetryAt, isCapacity, capacityMessage, Broker, config, dispatch, tools, inside, read, save, terminal, childEnvironment, notificationEvents, publishNotification, notificationSummary, commandPhase, alive, takeFileClaim };
 if (require.main === module) {
   if (process.argv[2] === '--worker') worker(process.argv[3]).catch(error => {
     try { fs.writeFileSync(path.join(path.dirname(process.argv[3]), 'worker-error.txt'), `${error.stack}\n`, 'utf8'); } catch {}

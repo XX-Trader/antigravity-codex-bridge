@@ -8,7 +8,7 @@
 
 - 后台提交后立即返回，Antigravity 可以继续正常对话，不用反复调用模型查询进度。
 - 一个事项对应一个 Codex 会话；保留 job、topic、session 身份，重启后找回并继续，不从头重派。
-- 完成、需要选择或方案阻塞时，通过可选的原生 Sidecar 向原 Antigravity 会话发送一次事件。
+- 开始执行、原生会话建立、文件变更、测试/构建/提交阶段、容量等待和结束时，通过可选的原生 Sidecar 向原聊天推送关键变化；不是逐行刷日志。
 - 返回 Codex 原生聊天链接，可查看已保存的任务、工具过程和最终回复；标题使用具体执行任务。
 - 默认完整访问和 `web_search="live"`，支持显式收窄权限、多个项目独立注册、同根串行、防重复执行和受控容量续跑。
 - 模型默认继承你的 Codex 配置，也可以指定账号可用的模型 ID 或本机别名；不自动换模型。
@@ -59,7 +59,9 @@ pwsh -NoProfile -File scripts/Setup.ps1 --project 'C:/work/my-project' --data 'C
 | `codex_wait` | 一次等待既有任务完成，不重新提交 |
 | `codex_cancel` | 只取消该任务拥有的子进程，不回滚源码改动 |
 
-`topic` 应是“修复播放器切集失败”这样的实际任务，而不是“Codex 执行者”。收到结果后，把 `chat.vscode_uri` 以可点击链接展示给用户。`chat=null` 可能只是尚未取得原生会话 ID，不是重复提交的理由。
+`topic` 应是“修复播放器切集失败”这样的实际任务，而不是“Codex 执行者”。会话建立事件带有原生聊天链接，不必等到最终回执。把 `chat.vscode_uri` 展示给用户；`chat=null` 不代表失败，也不是重复提交的理由。
+
+通知有持久化事件编号和独立投递状态。`accepted` 仅表示宿主 API 接受，不能冒充用户已看到；发送前已知失败为 `not_sent`，可有限退避和重启补送；结果不明为 `uncertain`，先核对原生收件记录，不盲目重发。`codex_list` / `codex_result` 的 `notification` 显示待投递、未知结果及通知进程状态。
 
 扩展可能不在历史侧栏列出 `exec` 来源的会话，本项目提供准确会话 ID 的打开入口，不伪造来源或编辑 Codex 数据库。链接路由依赖扩展版本；聊天内容是 Codex 已保存、允许展示的历史，不包含未公开的内部推理。`progress` 是最后落盘事件，不是实时心跳。
 
@@ -80,6 +82,14 @@ pwsh -NoProfile -Command 'node scripts/verify.cjs --config C:/path/to/mcp_config
 ```
 
 显式加 `--smoke` 或 `--write-smoke` 才会调用真实 Codex，可能消耗账号额度；不要在同一项目已有任务运行时启动测试。单元测试、原生协议验证、Antigravity 的真实通知/界面验收是不同层级，不能互相替代。
+
+可以向已有任务的原 Antigravity 聊天发送一条明确标注的通知验收事件，不重新执行 Codex：
+
+```pwsh
+pwsh -NoProfile -Command 'node scripts/verify.cjs --config C:/path/to/mcp_config.json --notification-check --receipt JOB_ID'
+```
+
+它会唤醒该聊天，可能消耗 Antigravity 模型额度；应回读同一 `event_id` 的原生收件及回复，而不是只看本地 `accepted`。不会自动领取业务结果或续跑任务。
 
 ## 边界
 

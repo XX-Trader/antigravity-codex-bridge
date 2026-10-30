@@ -37,7 +37,16 @@ async function tool(name, args, timeout) {
   child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
   const list = await call('tools/list'); console.log('codex_registered=true server=' + init.serverInfo.name + ' version=' + init.serverInfo.version + ' tools=' + list.tools.length);
   if (argv.includes('--sessions')) console.log(JSON.stringify(await tool('codex_sessions', { limit: 5, ...(value('--project') ? { cwd: value('--project') } : {}), ...(argv.includes('--local-only') ? { include_native: false } : {}) }), null, 2));
-  if (value('--receipt')) console.log(JSON.stringify(await tool('codex_wait', { job_id: value('--receipt') }, 660000), null, 2));
+  if (value('--receipt')) {
+    const result = await tool(argv.includes('--notification-check') ? 'codex_result' : 'codex_wait', { job_id: value('--receipt') }, 660000);
+    if (argv.includes('--notification-check')) {
+      const { read, publishNotification } = require('../src/server.cjs');
+      const file = path.join(path.dirname(result.paths.receipt), 'job.json'), job = read(file);
+      if (!job.conversation_id) throw new Error('This job has no originating Antigravity chat; no diagnostic was sent');
+      const event = publishNotification(file, job, 'check-' + crypto.randomUUID(), 'notification_check', '仅验证通知投递，不启动任何执行任务。');
+      console.log(JSON.stringify({ event_id: event.event_id, conversation_id: job.conversation_id, event_file: event.file, next: 'Verify the exact event ID in native chat history. Host API acceptance alone is not chat receipt confirmation.' }, null, 2));
+    } else console.log(JSON.stringify(result, null, 2));
+  }
   if (argv.includes('--smoke') || argv.includes('--write-smoke') || value('--continue')) {
     const writeFile = path.join(entry.env.CODEX_EXECUTOR_DATA, 'write-probe-' + crypto.randomBytes(6).toString('hex') + '.txt');
     const prompt = value('--continue') ? '这是隔离接入验收的原会话续接，不是业务开发。不要运行命令、改文件、提交或推送。只回复 CODEX_EXECUTOR_CONTINUE_OK。' : argv.includes('--write-smoke') ? '这是隔离接入写入验收，不是业务开发。不要读业务源码、提交、推送、部署或下单。只创建 ' + writeFile + '，以无 BOM UTF-8 写入 CODEX_EXECUTOR_WRITE_OK，然后通过 PowerShell 7 实际读回，报告字面 stdout 和退出码。不要更改其它文件或创建文档。' : '这是只读接入验收，不是业务开发。不要读业务源码、改文件、提交、推送、部署或启动长任务。只实际运行 PowerShell 7，stdout 必须包含 CODEX_EXECUTOR_SMOKE_OK，并报告退出码。';

@@ -77,7 +77,7 @@ function buildPlan(options) {
   const agentapi = options.agentapi || oldSidecar.env?.CODEX_EXECUTOR_AGENTAPI;
   if (agentapi) {
     const native = executable(agentapi, []);
-    change(sidecarFile, [], { command: pwsh, args: ['-NoProfile', '-NonInteractive', '-File', path.join(root, 'src', 'invoke-codex.ps1'), '-Notify', '-NodeEntry', process.execPath], restart_policy: 'on-failure', description: 'Codex completion/decision events via filesystem notifications; no model polling', display_name: 'Codex task receipts', env: { ...Object.fromEntries(Object.entries(env).filter(([name]) => name.startsWith('CODEX_EXECUTOR_'))), CODEX_EXECUTOR_AGENTAPI: native } });
+    change(sidecarFile, [], { command: pwsh, args: ['-NoProfile', '-NonInteractive', '-File', path.join(root, 'src', 'invoke-codex.ps1'), '-Notify', '-NodeEntry', process.execPath], restart_policy: 'on-failure', description: 'Durable Codex progress and result events; host ownership, delivery recovery and no model polling', display_name: 'Codex task progress', env: { ...Object.fromEntries(Object.entries(env).filter(([name]) => name.startsWith('CODEX_EXECUTOR_'))), CODEX_EXECUTOR_AGENTAPI: native } });
     const globalFile = target(path.join(configDir, 'config.json'));
     const old = document(globalFile).sidecars?.[key] || {};
     change(globalFile, ['sidecars', key], { ...old, enabled: true });

@@ -18,7 +18,8 @@ description: Antigravity 负责理解与验收，Codex 负责执行；按事项�
 ## 等待与结果
 
 - 不用 schedule、定时器、周期性模型状态查询或重复派发。用户明确要等待才使用 wait=true 或一次 codex_wait；普通聊天不检查后台任务。
-- 收到对应 job_id 的 CODEX_EVENT，只取一次 codex_result，核对实际命令、输出、退出码、文件和未完成项。needs_input/blocked 时先审查，在已有授权内修正并续接；需要用户选择再问，不擅自批准。
+- 收到 CODEX_EVENT 先区分事件类型。started/session_ready/phase_started/phase_finished/waiting_capacity/resumed/recovered/progress 只简短展示变化和聊天链接，不调用 codex_run，不轮询；notification_check 只确认事件编号，不调用任何工具。按 event_id 去重，不把进度当成完成。
+- 只有 terminal 事件才取一次 codex_result，核对实际命令、输出、退出码、文件和未完成项。needs_input/blocked 时先审查，在已有授权内修正并续接；需要用户选择再问，不擅自批准。发现 notification.pending/uncertain 或 service.online=false 时如实说明通知未确认，不能承诺必然自动提醒。
 - 查看任务、询问进度或领取该事项回执时，把 chat.vscode_uri 展示为“在 Codex 聊天窗查看完整任务”的可点击链接。Insiders 使用 vscode_insiders_uri。progress 仅是最近落盘事件，不是实时心跳或成功证明；chat=null 不得触发重派或轮询。
 - 重启后用带 cwd 的 codex_list/codex_sessions 找原事项，打开同一链接，不重新执行。不宣称后台任务必然自动出现在扩展侧栏。已结束旧桥接任务缺标题时，可显式用 codex_result(job_id=原ID, sync_title=true) 补齐；不覆盖手工标题。
 - 同根串行，忙时新任务没有提交、也没有自动排队。不同根分别注册，不能跨项目领取、取消或把当前任意分支当成任务分支。

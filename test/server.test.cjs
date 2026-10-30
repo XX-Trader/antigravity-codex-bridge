@@ -85,10 +85,16 @@ if ($argv -contains 'resume') { $tid = $argv[[Array]::IndexOf($argv, 'resume')+1
 elseif ($prompt.Contains('SECOND_SESSION')) { $tid = '00000000-0000-0000-0000-000000000002' }
 elseif ($prompt.Contains('TITLE_METADATA_ERROR')) { $tid = '00000000-0000-0000-0000-000000000004' }
 '{"type":"thread.started","thread_id":"' + $tid + '"}'
+if ($prompt.Contains('RECOVERED_ERROR_FIXTURE')) { '{"type":"error","message":"Reconnecting... 2/5 (request timed out)"}' }
+if ($prompt.Contains('PROGRESS_FIXTURE')) {
+  '{"type":"item.started","item":{"id":"check1","type":"command_execution","command":"cargo test -p fixture"}}'
+  '{"type":"item.completed","item":{"id":"check1","type":"command_execution","command":"cargo test -p fixture","exit_code":0}}'
+}
 '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"part-1","exit_code":0}}'
 '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"part-2","exit_code":0}}'
 '{"type":"item.completed","item":{"type":"agent_message","text":"FAKE_OK"}}'
 '{"type":"turn.completed"}'
+if ($prompt.Contains('LATE_ERROR_FIXTURE')) { '{"type":"turn.failed","error":{"message":"final failure"}}' }
 exit 0
 `, 'utf8');
   const settings = config({ CODEX_EXECUTOR_PROJECT: project, CODEX_EXECUTOR_DATA: data, CODEX_EXECUTOR_ENTRY: entry, CODEX_EXECUTOR_PWSH: process.env.CODEX_EXECUTOR_PWSH });
@@ -162,6 +168,10 @@ exit 0
       assert.equal(failed.status, 'failed'); assert.equal(failed.exit_code, 7); assert.match(failed.stderr_tail, /fixture failure/);
       const empty = await finished(broker, broker.start({ prompt: 'EMPTY_FIXTURE' }).job_id);
       assert.equal(empty.status, 'failed'); assert.equal(empty.exit_code, 0); assert.match(empty.error, /turn.completed/);
+      const recovered = await broker.run({ wait: true, prompt: 'RECOVERED_ERROR_FIXTURE' });
+      assert.equal(recovered.status, 'completed'); assert.equal(recovered.error, undefined);
+      const late = await broker.run({ wait: true, prompt: 'LATE_ERROR_FIXTURE' });
+      assert.equal(late.status, 'failed'); assert.match(late.error, /final failure/);
     });
     await t.test('one-call receipt, multi-part output, session switching and originating chat isolation', async () => {
       const chatA = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', chatB = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
@@ -261,18 +271,23 @@ exit 0
       assert.equal(originHook({ ...payload, workspacePaths: [data] }, project).decision, 'deny');
       const noticeData = path.join(root, 'notice-runtime'); fs.mkdirSync(noticeData); const notices = new Broker({ ...settings, data: noticeData });
       let messages = []; const watcher = watch(notices, async (recipient, text) => { messages.push({ recipient, text }); return { exit_code: 0 }; });
+      const terminalMessages = () => messages.filter(m => m.text.includes('事件=terminal'));
       try {
         const r = await notices.run({ wait: true, prompt: 'NEEDS_INPUT_FIXTURE', topic: '等待选择', conversation_id: chat });
         assert.equal(r.status, 'needs_input'); assert.equal(fs.existsSync(notices.lock), false);
-        for (let i = 0; i < 40 && !messages.length; i++) await sleep(50);
-        assert.equal(messages.length, 1); assert.equal(messages[0].recipient, chat); assert.match(messages[0].text, /CODEX_EVENT/);
+        for (let i = 0; i < 40 && !terminalMessages().length; i++) await sleep(50);
+        assert.equal(terminalMessages().length, 1); assert.ok(messages.every(m => m.recipient === chat)); assert.match(messages[0].text, /CODEX_EVENT/);
         assert.equal(await deliver(notices, r.job_id, async () => { throw Error('duplicate delivery'); }), false);
         const paused = await notices.run({ wait: true, prompt: 'BLOCKED_FIXTURE', topic: '逻辑问题', conversation_id: chat }); assert.equal(paused.status, 'blocked');
         const noticePath = path.join(path.dirname(notices.jobPath(paused.job_id)), 'notice.json');
         for (let i = 0; i < 40 && !fs.existsSync(noticePath); i++) await sleep(50);
         assert.ok(fs.existsSync(noticePath));
-        for (let i = 0; i < 40 && messages.length < 2; i++) await sleep(50);
-        assert.equal(messages.length, 2);
+        for (let i = 0; i < 40 && terminalMessages().length < 2; i++) await sleep(50);
+        assert.equal(terminalMessages().length, 2);
+        const progress = await notices.run({ wait: true, prompt: 'PROGRESS_FIXTURE', topic: '测试阶段变化', conversation_id: chat });
+        const { notificationEvents } = require('../src/server.cjs');
+        const kinds = notificationEvents(notices.jobPath(progress.job_id)).map(e => e.kind);
+        assert.ok(kinds.includes('started')); assert.ok(kinds.includes('session_ready')); assert.ok(kinds.includes('phase_started')); assert.ok(kinds.includes('phase_finished'));
       } finally { watcher.close(); }
     });
     await t.test('multi-project routing: independent workers/locks, cwd scope and no cross-project matter access', async () => {
