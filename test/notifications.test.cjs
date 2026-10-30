@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { Broker, save, read, publishNotification, notificationEvents, notificationSummary, commandPhase } = require('../src/server.cjs');
+const { Broker, save, read, publishNotification, notificationEvents, notificationSummary, commandPhase, dispatch } = require('../src/server.cjs');
 const { deliver, watch, claimHost, recordedReceipt, nativeSend, eventMessage } = require('../src/notifier.cjs');
 const chat = '11111111-1111-1111-1111-111111111111';
 const id = 'aaaaaaaaaaaaaaaaaaaaaaaa';
@@ -136,4 +136,6 @@ test('native preflight failures are known-not-sent, post-send failures remain un
 test('phase detection selects meaningful gates, not every read/log line', () => {
   assert.equal(commandPhase('cargo test --offline -p api'), '测试'); assert.equal(commandPhase('cargo clippy --workspace'), '静态检查');
   assert.equal(commandPhase('git status --short'), null); assert.equal(commandPhase('Get-Content file.txt'), null);
+  const instructions = dispatch({ settings: { project: 'fixture' } }, { method: 'initialize' }).instructions;
+  assert.match(instructions, /Only terminal events require codex_result/); assert.match(instructions, /notification_check only acknowledges/);
 });
