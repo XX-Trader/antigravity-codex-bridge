@@ -8,7 +8,7 @@ if (process.platform !== 'win32') throw new Error('The execution integration tes
 const base = path.resolve(process.env.CODEX_EXECUTOR_TEST_ROOT || path.join(os.tmpdir(), 'antigravity-codex-tests'));
 fs.mkdirSync(base, { recursive: true });
 const root = fs.mkdtempSync(path.join(base, 'run-'));
-const result = spawnSync(process.execPath, ['--test', 'test/server.test.cjs', 'test/setup.test.cjs', 'test/notifications.test.cjs'], { cwd: path.resolve(__dirname, '..'), env: { ...process.env, CODEX_EXECUTOR_TEST_ROOT: root, CODEX_EXECUTOR_PWSH: process.env.CODEX_EXECUTOR_PWSH || 'pwsh.exe' }, encoding: 'utf8', timeout: 600000 });
+const result = spawnSync(process.execPath, ['--test', 'test/server.test.cjs', 'test/setup.test.cjs', 'test/notifications.test.cjs', 'test/concurrency.test.cjs'], { cwd: path.resolve(__dirname, '..'), env: { ...process.env, CODEX_EXECUTOR_TEST_ROOT: root, CODEX_EXECUTOR_PWSH: process.env.CODEX_EXECUTOR_PWSH || 'pwsh.exe' }, encoding: 'utf8', timeout: 600000 });
 process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || '');
 if (result.error) process.stderr.write(result.error.stack + '\n');
 if (result.status === 0) {

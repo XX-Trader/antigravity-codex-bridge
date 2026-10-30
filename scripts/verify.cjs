@@ -7,8 +7,11 @@ const { spawn } = require('node:child_process');
 const argv = process.argv.slice(2);
 const value = name => argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined;
 const configFile = value('--config');
-if (!configFile) throw new Error('Usage: node scripts/verify.cjs --config CONFIG [--sessions --project ROOT --local-only] [--smoke|--write-smoke] [--continue JOB_ID] [--receipt JOB_ID]');
-const entry = JSON.parse(fs.readFileSync(configFile, 'utf8')).mcpServers?.['codex-executor'];
+if (!configFile) throw new Error('Usage: node scripts/verify.cjs --config CONFIG [--sessions --project ROOT --local-only] [--smoke|--write-smoke] [--continue JOB_ID] [--receipt JOB_ID [--notification-check|--parallel-check]]');
+if (argv.includes('--parallel-check') && argv.includes('--notification-check')) throw new Error('Choose one native verification mode');
+if ((argv.includes('--parallel-check') || argv.includes('--notification-check')) && !value('--receipt')) throw new Error('Native verification requires an existing --receipt JOB_ID with an originating chat');
+const serverName = value('--server') || 'codex-executor';
+const entry = JSON.parse(fs.readFileSync(configFile, 'utf8')).mcpServers?.[serverName];
 if (!entry) { console.log('codex_registered=false'); process.exit(0); }
 const child = spawn(entry.command, entry.args || [], { windowsHide: true, env: { ...process.env, ...entry.env }, stdio: ['pipe', 'pipe', 'pipe'] });
 let seq = 0, stderr = '';
@@ -38,12 +41,14 @@ async function tool(name, args, timeout) {
   const list = await call('tools/list'); console.log('codex_registered=true server=' + init.serverInfo.name + ' version=' + init.serverInfo.version + ' tools=' + list.tools.length);
   if (argv.includes('--sessions')) console.log(JSON.stringify(await tool('codex_sessions', { limit: 5, ...(value('--project') ? { cwd: value('--project') } : {}), ...(argv.includes('--local-only') ? { include_native: false } : {}) }), null, 2));
   if (value('--receipt')) {
-    const result = await tool(argv.includes('--notification-check') ? 'codex_result' : 'codex_wait', { job_id: value('--receipt') }, 660000);
-    if (argv.includes('--notification-check')) {
+    const nativeCheck = argv.includes('--notification-check') || argv.includes('--parallel-check');
+    const result = await tool(nativeCheck ? 'codex_result' : 'codex_wait', { job_id: value('--receipt') }, 660000);
+    if (nativeCheck) {
       const { read, publishNotification } = require('../src/server.cjs');
       const file = path.join(path.dirname(result.paths.receipt), 'job.json'), job = read(file);
       if (!job.conversation_id) throw new Error('This job has no originating Antigravity chat; no diagnostic was sent');
-      const event = publishNotification(file, job, 'check-' + crypto.randomUUID(), 'notification_check', '仅验证通知投递，不启动任何执行任务。');
+      const parallel = argv.includes('--parallel-check');
+      const event = publishNotification(file, job, 'check-' + crypto.randomUUID(), parallel ? 'parallel_check' : 'notification_check', parallel ? `用户授权：MCP_SERVER=${serverName}，请仅使用该服务实际派发三个独立只读核查任务，验证同工作树并行。` : '仅验证通知投递，不启动任何执行任务。');
       console.log(JSON.stringify({ event_id: event.event_id, conversation_id: job.conversation_id, event_file: event.file, next: 'Verify the exact event ID in native chat history. Host API acceptance alone is not chat receipt confirmation.' }, null, 2));
     } else console.log(JSON.stringify(result, null, 2));
   }

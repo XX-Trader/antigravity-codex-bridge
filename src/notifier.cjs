@@ -44,10 +44,11 @@ function recordedReceipt(directory, event) {
 }
 function eventMessage(job, event) {
   const link = event.chat || chatAccess(job.thread_id);
-  const action = event.kind === 'notification_check' ? `这是通知链路验收，只回复“通知已收到 event_id=${event.event_id}”并展示查看入口；不调用任何工具、不执行或续跑业务任务。` : event.kind === 'terminal' || !event.schema
+  const action = event.kind === 'parallel_check' ? `这是用户明确授权的同工作树并发验收，请现在执行，不只是确认收到。当前执行根=${JSON.stringify(job.cwd)}。请连续调用3次 codex_run，三次都 wait=false、使用该 cwd，不带旧 topic_id/session_id；分别做独立只读核查：1项目说明与协作约定；2测试入口与建议的定向测试；3源码模块边界与可独立拆分点。每个任务的 topic 用具体核查名称，prompt 必须包含 PARALLEL_CHECK=${event.event_id} 和各自编号。三者均须实际用 PowerShell7 读取相关文件、输出自己的编号，最后在同一命令短暂等待20秒用于观察重叠，不改文件、不运行重型构建、不提交、不切分支、不安装或重启、不读取凭证。三者互不依赖，可以直接同工作树并发，不需要 worktree；3只是本次验收样本数，不是并发上限。不要自动改模型，沿用本机默认与Medium。提交第一个后继续提交剩余两个，不因进度事件中断，不逐个调用 codex_wait。全部受理后列出3个job_id，收到终态再分别领取结果和展示聊天链接。不得重派已有编号或扩大成业务开发。`
+    : event.kind === 'notification_check' ? `这是通知链路验收，只回复“通知已收到 event_id=${event.event_id}”并展示查看入口；不调用任何工具、不执行或续跑业务任务。` : event.kind === 'terminal' || !event.schema
     ? `请只调用一次 codex_result(job_id=${job.job_id}) 领取原结果并验收；不要重复派发。`
     : '这是执行中的状态变化，请简短展示进度与查看入口，不调用 codex_run、不轮询、不把进度当成完成。';
-  return `[CODEX_EVENT ${job.job_id}] event_id=${event.event_id || job.job_id + ':legacy'} sequence=${event.sequence || 0} 事项=${JSON.stringify(job.topic || job.topic_id)}，topic_id=${job.topic_id}，状态=${event.status}，事件=${event.kind || 'terminal'}。${event.detail || ''}\n${link ? `[在 Codex 聊天窗查看完整任务](${link.vscode_uri})\n` : ''}这是后台事件，不是新的用户任务。${action} CLI 执行结束、通知送达与业务验收是不同状态。`;
+  return `[CODEX_EVENT ${job.job_id}] event_id=${event.event_id || job.job_id + ':legacy'} sequence=${event.sequence || 0} 事项=${JSON.stringify(job.topic || job.topic_id)}，topic_id=${job.topic_id}，状态=${event.status}，事件=${event.kind || 'terminal'}。${event.detail || ''}\n${link ? `[在 Codex 聊天窗查看完整任务](${link.vscode_uri})\n` : ''}${event.kind === 'parallel_check' ? '这是用户授权的验收派发。' : '这是后台事件，不是新的用户任务。'}${action} CLI 执行结束、通知送达与业务验收是不同状态。`;
 }
 function claimHost(data, generation) {
   const file = path.join(data, 'notification-host.json'), release = takeClaim(file + '.claim');
@@ -91,11 +92,11 @@ async function deliver(broker, id, send, options = {}) {
     try { const next = read(broker.jobPath(n)); return next.topic_id === job.topic_id && next.conversation_id === job.conversation_id && next.created_at > job.created_at; } catch { return false; }
   });
   if (newer) {
-    for (const event of events.filter(e => e.kind !== 'notification_check')) {
+    for (const event of events.filter(e => !['notification_check', 'parallel_check'].includes(e.kind))) {
       const file = event.file.replace(/\.json$/, '.delivery.json');
       if (!fs.existsSync(file) || read(file).state === 'not_sent') save(file, { state: 'superseded', event_id: event.event_id, reason: 'A newer job continued this matter.' });
     }
-    events = events.filter(e => e.kind === 'notification_check');
+    events = events.filter(e => ['notification_check', 'parallel_check'].includes(e.kind));
     if (!events.length) return false; // Explicit diagnostics may use an old job; stale business notices may not.
   }
   if (!events.length) {
@@ -109,7 +110,7 @@ async function deliver(broker, id, send, options = {}) {
   for (const event of events) {
     const file = event.file.replace(/\.json$/, '.delivery.json');
     // A quick task can finish before the debounce; show one final receipt, not stale running alerts.
-    if (event !== last && (last.kind === 'terminal' || (event.kind === 'started' && last.kind === 'session_ready')) && (!fs.existsSync(file) || read(file).state === 'not_sent')) { save(file, { state: 'superseded', event_id: event.event_id, superseded_by: last.event_id }); continue; }
+    if (event !== last && !['notification_check', 'parallel_check'].includes(event.kind) && (last.kind === 'terminal' || (event.kind === 'started' && last.kind === 'session_ready')) && (!fs.existsSync(file) || read(file).state === 'not_sent')) { save(file, { state: 'superseded', event_id: event.event_id, superseded_by: last.event_id }); continue; }
     sent = await deliverEvent(job, event, file, send, options) || sent;
   }
   return sent;

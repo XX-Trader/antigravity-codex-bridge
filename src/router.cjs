@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
-const { Broker, inside } = require('./server.cjs');
+const { Broker, inside, terminal } = require('./server.cjs');
 const real = p => fs.realpathSync(p);
 const same = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
 function scopesFor(workspaces, projects) {
@@ -69,9 +69,9 @@ class ProjectRouter {
   wait(id, signal) { return this.forJob(id).wait(id, signal); }
   cancel(id) { return this.forJob(id).cancel(id); }
   async sessions(input = {}) { return this.forCwd(input.cwd).sessions(input); }
-  list(limit = 20, cwd) {
-    if (cwd) return this.forCwd(cwd).list(limit);
-    return this.brokers.flatMap(b => b.list(limit)).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, limit);
+  list(limit = 20, cwd, activeOnly = false) {
+    if (cwd) return this.forCwd(cwd).list(limit, undefined, activeOnly);
+    return this.brokers.flatMap(b => b.list(limit, undefined, activeOnly)).filter(j => !activeOnly || !terminal.has(j.status)).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, activeOnly ? Number.MAX_SAFE_INTEGER : limit);
   }
 }
 module.exports = { ProjectRouter, bindOrigin };

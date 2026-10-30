@@ -138,4 +138,12 @@ test('phase detection selects meaningful gates, not every read/log line', () => 
   assert.equal(commandPhase('git status --short'), null); assert.equal(commandPhase('Get-Content file.txt'), null);
   const instructions = dispatch({ settings: { project: 'fixture' } }, { method: 'initialize' }).instructions;
   assert.match(instructions, /Only terminal events require codex_result/); assert.match(instructions, /notification_check only acknowledges/);
+  assert.match(instructions, /without a numeric concurrency cap/);
+});
+test('parallel verification is explicit read-only dispatch, not a task-count limit or a status acknowledgment', t => {
+  const f = fixture(t), event = f.emit('parallel', 'parallel_check');
+  const message = eventMessage(f.job, event);
+  assert.match(message, /连续调用3次 codex_run/); assert.match(message, /3只是本次验收样本数/);
+  assert.match(message, /PARALLEL_CHECK=/); assert.match(message, /不改文件/); assert.match(message, /不带旧 topic_id\/session_id/);
+  assert.doesNotMatch(message, /这是后台事件，不是新的用户任务/);
 });

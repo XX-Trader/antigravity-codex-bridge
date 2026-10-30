@@ -84,6 +84,7 @@ $tid = '00000000-0000-0000-0000-000000000001'
 if ($argv -contains 'resume') { $tid = $argv[[Array]::IndexOf($argv, 'resume')+1] }
 elseif ($prompt.Contains('SECOND_SESSION')) { $tid = '00000000-0000-0000-0000-000000000002' }
 elseif ($prompt.Contains('TITLE_METADATA_ERROR')) { $tid = '00000000-0000-0000-0000-000000000004' }
+elseif ($prompt.Contains('CONCURRENT_FIXTURE')) { $tid = [guid]::NewGuid().ToString() }
 '{"type":"thread.started","thread_id":"' + $tid + '"}'
 if ($prompt.Contains('RECOVERED_ERROR_FIXTURE')) { '{"type":"error","message":"Reconnecting... 2/5 (request timed out)"}' }
 if ($prompt.Contains('PROGRESS_FIXTURE')) {
@@ -125,12 +126,12 @@ exit 0
       fs.mkdirSync(broker.lock); const other = 'ffffffffffffffffffffffff';
       fs.writeFileSync(path.join(broker.lock, `${other}.json`), '{}');
       broker.unlock('eeeeeeeeeeeeeeeeeeeeeeee');
-      assert.equal(broker.lockOwner().job_id, other); broker.unlock(other); assert.equal(fs.existsSync(broker.lock), false);
+      assert.equal(broker.lockOwner().job_id, other); broker.unlock(other); assert.equal(broker.lockOwner(), null);
     });
     let first;
     await t.test('background completion, UTF-8 and restart-safe reads', async () => {
       first = broker.start({ prompt: '中文参数', sandbox: 'read-only' });
-      assert.throws(() => broker.start({ prompt: 'duplicate' }), /already owns/);
+      await assert.rejects(broker.run({ prompt: 'duplicate', topic_id: first.topic_id }), /still running/);
       const result = await finished(broker, first.job_id);
       assert.equal(result.status, 'completed'); assert.equal(result.exit_code, 0);
       assert.match(result.final_response, /resume=False unicode=True/);
@@ -138,6 +139,17 @@ exit 0
       assert.equal(fs.readFileSync(path.join(project, '.fake-title-' + result.session_id + '.txt'), 'utf8'), '中文参数');
       assert.equal(new Broker(settings).status(first.job_id).thread_id, '00000000-0000-0000-0000-000000000001');
       assert.ok(result.paths.events.startsWith(data));
+    });
+    await t.test('same worktree runs eight independent workers; cancelling one leaves seven recoverable', async () => {
+      const jobs = Array.from({ length: 8 }, (_, n) => broker.start({ prompt: 'CONCURRENT_FIXTURE 中文参数 ' + n, topic: '并发独立任务' + n }));
+      assert.equal(new Set(jobs.map(j => j.topic_id)).size, 8);
+      const active = new Broker(settings).list(20, undefined, true);
+      assert.equal(jobs.filter(j => active.some(a => a.job_id === j.job_id)).length, 8);
+      broker.cancel(jobs[0].job_id);
+      const results = await Promise.all(jobs.map(j => broker.wait(j.job_id)));
+      assert.equal(results[0].status, 'cancelled'); assert.ok(results.slice(1).every(r => r.status === 'completed'));
+      assert.equal(new Set(results.slice(1).map(r => r.session_id)).size, 7);
+      assert.equal(broker.lockOwner(), null);
     });
     await t.test('title metadata failure is recorded without failing or rerunning the task', async () => {
       const result = await broker.wait(broker.start({ prompt: 'TITLE_METADATA_ERROR 中文参数', topic: 'TITLE_METADATA_ERROR 具体任务', sandbox: 'read-only' }).job_id);
@@ -274,7 +286,7 @@ exit 0
       const terminalMessages = () => messages.filter(m => m.text.includes('事件=terminal'));
       try {
         const r = await notices.run({ wait: true, prompt: 'NEEDS_INPUT_FIXTURE', topic: '等待选择', conversation_id: chat });
-        assert.equal(r.status, 'needs_input'); assert.equal(fs.existsSync(notices.lock), false);
+        assert.equal(r.status, 'needs_input'); assert.equal(notices.lockOwner(), null);
         for (let i = 0; i < 40 && !terminalMessages().length; i++) await sleep(50);
         assert.equal(terminalMessages().length, 1); assert.ok(messages.every(m => m.recipient === chat)); assert.match(messages[0].text, /CODEX_EVENT/);
         assert.equal(await deliver(notices, r.job_id, async () => { throw Error('duplicate delivery'); }), false);
@@ -326,13 +338,13 @@ exit 0
       broker.cancel(job.job_id); assert.equal((await broker.wait(job.job_id)).status, 'cancelled');
     });
     await t.test('stale unlock does not remove a newly acquired empty lease', () => {
-      fs.mkdirSync(broker.lock);
+      fs.mkdirSync(broker.lock, { recursive: true });
       broker.unlock('ffffffffffffffffffffffff');
       assert.equal(fs.statSync(broker.lock).isDirectory(), true);
       const id = 'eeeeeeeeeeeeeeeeeeeeeeee';
       fs.writeFileSync(path.join(broker.lock, `${id}.json`), '{}');
       broker.unlock(id);
-      assert.equal(fs.existsSync(broker.lock), false);
+      assert.equal(broker.lockOwner(), null);
     });
     await t.test('cancellation kills only the owned child and releases the lock', async () => {
       const slow = broker.start({ prompt: 'SLOW_FIXTURE' });
@@ -341,7 +353,7 @@ exit 0
       assert.equal(restarted.status(slow.job_id).status, 'running');
       assert.equal(restarted.cancel(slow.job_id).status, 'cancel_requested');
       const result = await finished(restarted, slow.job_id);
-      assert.equal(result.status, 'cancelled'); assert.equal(fs.existsSync(broker.lock), false);
+      assert.equal(result.status, 'cancelled'); assert.equal(broker.lockOwner(), null);
     });
     await t.test('real stdio framing: initialize id=0, notifications and tool discovery', async () => {
       const child = spawn(process.execPath, [path.join(__dirname, '../src/server.cjs')], { windowsHide: true, env: { ...process.env, CODEX_EXECUTOR_PROJECT: project, CODEX_EXECUTOR_DATA: data, CODEX_EXECUTOR_ENTRY: entry }, stdio: ['pipe', 'pipe', 'pipe'] });

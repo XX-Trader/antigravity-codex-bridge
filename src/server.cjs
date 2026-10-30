@@ -278,7 +278,8 @@ class Broker {
     this.metadataCall = metadataCall;
     this.jobs = path.join(settings.data, 'jobs');
     fs.mkdirSync(this.jobs, { recursive: true });
-    this.lock = path.join(settings.data, 'active.lock');
+    this.lock = path.join(settings.data, 'active-tasks');
+    this.legacyLock = path.join(settings.data, 'active.lock');
   }
   jobPath(id) {
     if (typeof id !== 'string' || !/^[a-f0-9]{24}$/.test(id)) throw new Error('Invalid job_id');
@@ -289,8 +290,11 @@ class Broker {
     if (!fs.existsSync(file)) throw new Error('Unknown job_id');
     let job = read(file);
     const crashFile = path.join(path.dirname(file), 'worker-error.txt');
-    if (!terminal.has(job.status) && (fs.existsSync(crashFile) || (Date.now() - Date.parse(job.created_at) > 15000 && !alive(job.worker_pid)))) {
-      // Never unlock an orphaned, still-running Codex process to start a second writer.
+    let workerPid = job.worker_pid;
+    const lease = path.join(this.lock, `${id}.json`);
+    if (!workerPid) try { workerPid = read(lease).worker_pid; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (!terminal.has(job.status) && (fs.existsSync(crashFile) || (Date.now() - Date.parse(job.created_at) > 15000 && !alive(workerPid)))) {
+      // Keep the exact session owned while its child may still run; other matters remain independent.
       if (alive(job.child_pid)) return { ...job, status: 'orphaned', error: 'Worker exited but Codex may still run; inspect this owned job before retrying' };
       job = { ...job, status: 'failed', error: fs.existsSync(crashFile) ? tail(crashFile, 4000) : 'Worker exited before recording completion', ended_at: stamp() };
       save(file, job);
@@ -299,26 +303,29 @@ class Broker {
     return job;
   }
   unlock(id) {
-    try {
-      if (fs.statSync(this.lock).isDirectory()) {
-        // A second completion/cancel path must not remove a newly acquired empty lease.
-        try { fs.unlinkSync(path.join(this.lock, `${id}.json`)); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
-        try { fs.rmdirSync(this.lock); } catch (error) { if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error; }
-      } else if (read(this.lock).job_id === id) {
-        // Compatibility with a completed pre-1.1 file lock; unlink cannot remove a new directory lease.
-        try { fs.unlinkSync(this.lock); } catch (error) { if (!['ENOENT', 'EISDIR'].includes(error.code)) throw error; }
-      }
-    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    for (const lock of [this.lock, this.legacyLock].filter(Boolean)) {
+      try {
+        if (fs.statSync(lock).isDirectory()) {
+          // A second completion/cancel path must not remove a newly acquired empty lease.
+          try { fs.unlinkSync(path.join(lock, `${id}.json`)); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+          // The shared registry is persistent: removing an empty directory races a new admission.
+          if (lock !== this.lock) try { fs.rmdirSync(lock); } catch (error) { if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error; }
+        } else if (read(lock).job_id === id) {
+          // Compatibility with a completed pre-1.1 file lock; unlink cannot remove a new directory lease.
+          try { fs.unlinkSync(lock); } catch (error) { if (!['ENOENT', 'EISDIR'].includes(error.code)) throw error; }
+        }
+      } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
   }
   lockOwner() {
     try {
       if (!fs.statSync(this.lock).isDirectory()) return read(this.lock);
       const owner = fs.readdirSync(this.lock).find(name => /^[a-f0-9]{24}\.json$/.test(name));
-      return owner ? { job_id: owner.slice(0, -5) } : { pending: true };
+      return owner ? { job_id: owner.slice(0, -5) } : null;
     } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
   summary(job) {
-    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title', 'notification_error'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), chat: chatAccess(job.thread_id), notification: job.job_id ? notificationSummary(this.jobPath(job.job_id)) : null, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
+    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title', 'notification_error', 'concurrency'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), chat: chatAccess(job.thread_id), notification: job.job_id ? notificationSummary(this.jobPath(job.job_id)) : null, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
   }
   start(input, resumption = null) {
     if (process.env.CODEX_EXECUTOR_CHILD === '1') throw new Error('Recursive Codex delegation is disabled');
@@ -345,24 +352,22 @@ class Broker {
     if (input.topic_id && !topicParent) throw new Error('Unknown topic_id; omit it to create a new matter');
     if (input.topic && (parent?.topic || topicParent?.topic) && input.topic.trim() !== (parent?.topic || topicParent?.topic)) throw new Error('A different matter needs a new topic, not an existing topic_id/session_id');
     const taskSettings = { ...this.settings, model: input.model !== undefined ? selectedModel(input.model, this.settings.model_aliases) : parent?.settings?.model || this.settings.model, reasoning_effort: input.reasoning_effort || parent?.settings?.reasoning_effort || this.settings.reasoning_effort || 'medium' };
-    const owner = this.lockOwner();
-    if (owner) {
-      if (owner.pending) throw new Error('Project lease is being acquired; no new task submitted');
-      const previous = this.get(owner.job_id);
-      if (!terminal.has(previous.status)) throw new Error(`A task already owns this project: ${previous.job_id} (${previous.status}); query or cancel it, do not submit duplicates`);
-      this.unlock(previous.job_id);
-    }
     const id = crypto.randomBytes(12).toString('hex');
     const dir = path.dirname(this.jobPath(id));
-    fs.mkdirSync(this.lock);
-    try { fs.writeFileSync(path.join(this.lock, `${id}.json`), JSON.stringify({ job_id: id }), { flag: 'wx' }); }
-    catch (error) { this.unlock(id); throw error; }
+    const topicId = parent?.topic_id || input.topic_id || id, sessionId = parent?.thread_id || resumption?.id || null;
+    let release;
+    for (let n = 0; n < 100 && !release; n++) { release = takeFileClaim(path.join(this.settings.data, 'dispatch.claim')); if (!release) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
+    if (!release) throw new Error('Task admission is busy; no task submitted. This is not a running-task limit.');
     try {
+      const duplicate = this.list(Number.MAX_SAFE_INTEGER).find(j => !terminal.has(j.status) && (j.topic_id === topicId || (sessionId && j.thread_id === sessionId)));
+      if (duplicate) throw new Error(`This matter/session is already running: ${duplicate.job_id}; no duplicate turn submitted`);
+      fs.mkdirSync(this.lock, { recursive: true });
+      fs.writeFileSync(path.join(this.lock, `${id}.json`), JSON.stringify({ job_id: id }), { flag: 'wx' });
       fs.mkdirSync(dir);
       const job = {
         job_id: id, status: 'queued', created_at: stamp(), cwd, sandbox,
         prompt: input.prompt, timeout_seconds: input.timeout_seconds || 3600,
-        settings: taskSettings, notification_schema: 2, topic_id: parent?.topic_id || input.topic_id || id, topic: parent?.topic || topicParent?.topic || input.topic?.trim() || taskTitle({ prompt: input.prompt }),
+        settings: taskSettings, concurrency: 'unlimited', notification_schema: 2, topic_id: topicId, topic: parent?.topic || topicParent?.topic || input.topic?.trim() || taskTitle({ prompt: input.prompt }),
         ...(input.conversation_id ? { conversation_id: input.conversation_id } : {}),
         ...(parent ? { parent_job_id: parent.job_id, thread_id: parent.thread_id, ...(parent.chat_title ? { chat_title: parent.chat_title } : {}) } : {}),
         ...(resumption ? { resumed_session: true, thread_id: resumption.id } : {})
@@ -371,6 +376,7 @@ class Broker {
       const worker = spawn(process.execPath, [__filename, '--worker', path.join(dir, 'job.json')], {
         detached: true, windowsHide: true, stdio: 'ignore', env: process.env
       });
+      save(path.join(this.lock, `${id}.json`), { job_id: id, worker_pid: worker.pid });
       worker.on('error', error => {
         save(path.join(dir, 'job.json'), { ...job, status: 'failed', error: error.message, ended_at: stamp() });
         this.unlock(id);
@@ -378,6 +384,7 @@ class Broker {
       worker.unref();
       return { ...this.summary(job), session_id: job.thread_id || null, next: 'Background task accepted; continue normal chat. The native sidecar pushes meaningful progress and a terminal/decision event to this chat. Progress includes the saved chat link: display it briefly without executing or polling. Only a terminal event needs codex_result once. Notification delivery state is distinct from task acceptance; never submit duplicates.' };
     } catch (error) { this.unlock(id); throw error; }
+    finally { release(); }
   }
   status(id) { return this.summary(this.get(id)); }
   async syncTitle(id, diagnostics = false) {
@@ -505,9 +512,9 @@ class Broker {
     fs.writeFileSync(path.join(path.dirname(this.jobPath(id)), 'cancel'), stamp(), 'utf8');
     return { job_id: id, status: 'cancel_requested', next: 'Use codex_wait once only if cancellation confirmation is needed; no polling. Cancellation does not undo file edits.' };
   }
-  list(limit = 20) {
-    return fs.readdirSync(this.jobs).filter(id => /^[a-f0-9]{24}$/.test(id))
-      .map(id => this.status(id)).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, limit);
+  list(limit = 20, _cwd, activeOnly = false) {
+    return fs.readdirSync(this.jobs).filter(id => /^[a-f0-9]{24}$/.test(id) && fs.existsSync(this.jobPath(id)))
+      .map(id => this.status(id)).filter(job => !activeOnly || !terminal.has(job.status)).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, activeOnly ? Number.MAX_SAFE_INTEGER : limit);
   }
 }
 
@@ -615,20 +622,20 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
 const object = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
 const idSchema = { type: 'string', description: 'The exact job_id returned by codex_run or a prior bridge job' };
 const tools = [
-  { name: 'codex_run', description: 'Start one matter in an independent Codex session and return immediately by default, leaving Antigravity free for normal chat. Pass an available model ID or a locally configured alias when needed; otherwise inherit Codex configuration. Reasoning defaults to Medium. Reuse topic_id only for the same matter; another subject needs a new topic. No auto-upgrade, timers or polling. wait=true only if the user explicitly wants to wait.', inputSchema: object({ prompt: { type: 'string' }, topic: { type: 'string', maxLength: 120, description: 'Concrete execution task shown as the native Codex chat title, not a generic executor identity or the whole Antigravity conversation' }, topic_id: { type: 'string', description: 'Returned matter ID for same-topic continuation; omit for a different matter' }, model: { type: 'string', description: 'Available model ID or locally configured alias. Omit to inherit the configured Codex model; same-topic continuation retains an explicit prior choice.' }, reasoning_effort: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Default medium; do not increase automatically' }, wait: { type: 'boolean', default: false, description: 'False returns background acknowledgment. True waits for completion and can occupy this chat turn.' }, cwd: { type: 'string' }, sandbox: { type: 'string', enum: sandboxModes, default: 'danger-full-access', description: 'Full filesystem and command network access by default for these trusted projects. Narrow only when explicitly requested.' }, timeout_seconds: { type: 'integer', minimum: 30, maximum: 14400 }, session_id: { type: 'string', description: 'Exact Codex session ID, separate from Antigravity conversation_id; do not reuse it for an unrelated matter' }, conversation_id: { type: 'string', description: 'Optional actual originating Antigravity UUID. One chat may have many topic IDs; never invent an ID.' } }, ['prompt']) },
+  { name: 'codex_run', description: 'Start one matter in an independent Codex session and return immediately by default, leaving Antigravity free for normal chat. Pass an available model ID or a locally configured alias when needed; otherwise inherit Codex configuration. Reasoning defaults to Medium. Reuse topic_id only for the same matter; another subject needs a new topic. Independent matters may run concurrently in the same worktree without a numeric task cap. Ask the user worktree versus waiting for tightly coupled/overlapping work. No auto-upgrade, timers or polling. wait=true only if the user explicitly wants to wait.', inputSchema: object({ prompt: { type: 'string' }, topic: { type: 'string', maxLength: 120, description: 'Concrete execution task shown as the native Codex chat title, not a generic executor identity or the whole Antigravity conversation' }, topic_id: { type: 'string', description: 'Returned matter ID for same-topic continuation; omit for a different matter' }, model: { type: 'string', description: 'Available model ID or locally configured alias. Omit to inherit the configured Codex model; same-topic continuation retains an explicit prior choice.' }, reasoning_effort: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Default medium; do not increase automatically' }, wait: { type: 'boolean', default: false, description: 'False returns background acknowledgment. True waits for completion and can occupy this chat turn.' }, cwd: { type: 'string' }, sandbox: { type: 'string', enum: sandboxModes, default: 'danger-full-access', description: 'Full filesystem and command network access by default for these trusted projects. Narrow only when explicitly requested.' }, timeout_seconds: { type: 'integer', minimum: 30, maximum: 14400 }, session_id: { type: 'string', description: 'Exact Codex session ID, separate from Antigravity conversation_id; do not reuse it for an unrelated matter' }, conversation_id: { type: 'string', description: 'Optional actual originating Antigravity UUID. One chat may have many topic IDs; never invent an ID.' } }, ['prompt']) },
   { name: 'codex_wait', description: 'Wait for an already submitted job and collect its receipt once. Used after interruption, never submit the task again or schedule polling. Closing this wait does not cancel Codex.', inputSchema: object({ job_id: idSchema }, ['job_id']) },
   { name: 'codex_sessions', description: 'Read a small page of current-project local Codex session IDs and brief titles and clickable native chat links, including exec/app-server tasks, without calling a model or reading full conversations. Select an exact session_id for codex_run; this does not switch, submit or run anything.', inputSchema: object({ cwd: { type: 'string', description: 'Explicit registered project root; required for multi-folder Antigravity projects' }, include_native: { type: 'boolean', default: true }, cursor: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 20, default: 10 } }) },
   { name: 'codex_start', description: 'Delegate a concrete task to the real local Codex CLI. Returns immediately with job_id. Codex performs commands, edits and tests; do not submit duplicate jobs. Local saved Codex login is reused.', inputSchema: object({ prompt: { type: 'string', description: 'Goal, evidence/context, scope, constraints, acceptance checks and authorization boundaries' }, cwd: { type: 'string', description: 'Absolute working directory within the configured project; defaults to project root' }, sandbox: { type: 'string', enum: sandboxModes, default: 'danger-full-access' }, timeout_seconds: { type: 'integer', minimum: 30, maximum: 14400, default: 3600 } }, ['prompt']) },
   { name: 'codex_continue', description: 'Continue the exact Codex session of a finished job. Retains original cwd; the next turn defaults to full access unless explicitly narrowed. Never resumes an arbitrary most-recent thread.', inputSchema: object({ job_id: idSchema, prompt: { type: 'string' }, sandbox: { type: 'string', enum: sandboxModes, description: 'Explicit permission choice for the next turn only; omission defaults to danger-full-access' } }, ['job_id', 'prompt']) },
   { name: 'codex_status', description: 'Read persisted process state without waiting. completed means the CLI turn ended normally, not that acceptance checks passed; inspect codex_result evidence. A running job is not complete.', inputSchema: object({ job_id: idSchema }, ['job_id']) },
   { name: 'codex_result', description: 'Collect the original compact receipt once on a CODEX_EVENT or explicit result request. Return the native Codex chat link to the user for full saved history in VS Code, also after restart. Default codex_run returns only a background acknowledgment. No polling or duplicate reads; diagnostics=true is only for original log tails.', inputSchema: object({ job_id: idSchema, diagnostics: { type: 'boolean', default: false }, sync_title: { type: 'boolean', default: false, description: 'Explicitly repair the task title of a finished bridge-owned session. Preserves user-defined titles and never executes the task again.' } }, ['job_id']) },
-  { name: 'codex_cancel', description: 'Ask the owned worker to terminate only its Codex child process tree. Does not roll back any edits. Wait for a terminal status before starting another job.', inputSchema: object({ job_id: idSchema }, ['job_id']) },
-  { name: 'codex_list', description: 'Recover up to 20 recent jobs and native Codex chat links after restart. Show the returned clickable link to the user so they can view the saved full task in VS Code. Never rerun a job just to view it.', inputSchema: object({ cwd: { type: 'string', description: 'Current project root, to avoid listing unrelated projects' } }) }
+  { name: 'codex_cancel', description: 'Ask the owned worker to terminate only its Codex child process tree. Does not roll back any edits. Wait for a terminal status before continuing the same matter/session; independent jobs are unaffected.', inputSchema: object({ job_id: idSchema }, ['job_id']) },
+  { name: 'codex_list', description: 'Recover recent jobs, or all active jobs with active_only=true, and native Codex chat links after restart. The history display length is not a running-task cap. Show the returned clickable link to the user so they can view the saved full task in VS Code. Never rerun a job just to view it.', inputSchema: object({ cwd: { type: 'string', description: 'Current project root, to avoid listing unrelated projects' }, active_only: { type: 'boolean', default: false, description: 'List all active tasks without the default recent-history display limit; this is not an execution cap.' } }) }
 ];
 
 function dispatch(broker, request, signal) {
   const { method, params = {} } = request;
-  if (method === 'initialize') return { protocolVersion: ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'].includes(params.protocolVersion) ? params.protocolVersion : '2024-11-05', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'codex-executor', version: VERSION }, instructions: `Registered roots: ${(broker.settings?.projects || [broker.settings]).filter(Boolean).map(p => p.project).join(' ; ')}. Trusted-project executions default to danger-full-access and live web search. An explicit sandbox mode may be selected for a new turn, including upgrading a finished same-session continuation; never hot-change or resubmit a running task. Bind cwd to the current Antigravity project; never assume a different registered directory. Use codex_run once with a short topic and an available model ID or configured alias chosen for the task when needed. Default Medium and background acknowledgment; continue normal conversation without a waiting tool. Each unrelated matter gets its own topic/Codex session; reuse topic_id only for the same matter. A project-only identity hook binds the originating chat; a native sidecar pushes durable lifecycle events to that exact chat, each with event_id and sequence. Show progress and the saved chat link briefly without calling tools or executing another task. Only terminal events require codex_result once to review evidence or intervene within authorization. notification_check only acknowledges its exact event ID, with no tools or business execution. Expose notification pending/not_sent/uncertain and service health; API acceptance is not rendered-chat or business acceptance. When a user asks to view a task, show its returned chat.vscode_uri as a clickable Markdown link; codex_list recovers these links after restart. Do not claim exec tasks automatically appear in the extension history list. Opening history does not authorize a new turn. Exact capacity errors resume the same model/thread, at most six starts per rolling hour with no lifetime cap; scripts wait, not models. Same-project tasks remain serialized; busy means not submitted, not queued. No auto-upgrades, schedule/timer/status polling or unrelated-chat messages.` };
+  if (method === 'initialize') return { protocolVersion: ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'].includes(params.protocolVersion) ? params.protocolVersion : '2024-11-05', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'codex-executor', version: VERSION }, instructions: `Registered roots: ${(broker.settings?.projects || [broker.settings]).filter(Boolean).map(p => p.project).join(' ; ')}. Trusted-project executions default to danger-full-access and live web search. An explicit sandbox mode may be selected for a new turn, including upgrading a finished same-session continuation; never hot-change or resubmit a running task. Bind cwd to the current Antigravity project; never assume a different registered directory. Use codex_run once with a short topic and an available model ID or configured alias chosen for the task when needed. Default Medium and background acknowledgment; continue normal conversation without a waiting tool. Each unrelated matter gets its own topic/Codex session; reuse topic_id only for the same matter. A project-only identity hook binds the originating chat; a native sidecar pushes durable lifecycle events to that exact chat, each with event_id and sequence. Show progress and the saved chat link briefly without calling tools or executing another task. Only terminal events require codex_result once to review evidence or intervene within authorization. notification_check only acknowledges its exact event ID, with no tools or business execution. parallel_check is an explicitly user-authorized native acceptance request: actually submit the independent read-only sample tasks it describes; the sample count is not a concurrency cap. Expose notification pending/not_sent/uncertain and service health; API acceptance is not rendered-chat or business acceptance. When a user asks to view a task, show its returned chat.vscode_uri as a clickable Markdown link; codex_list recovers these links after restart. Do not claim exec tasks automatically appear in the extension history list. Opening history does not authorize a new turn. Exact capacity errors resume the same model/thread, at most six starts per rolling hour with no lifetime cap; scripts wait, not models. Independent matters in the same worktree run without a numeric concurrency cap. Only duplicate simultaneous turns for the same topic/session are excluded. Before dispatch, assess file/API dependencies; if tightly coupled, ask the user whether to use separate worktrees or wait for the prerequisite, never create worktrees silently. Coordinate shared Git index, branch changes and final integration serially; switching branches in one shared directory is not isolation. Use codex_list(active_only=true) on explicit progress requests to see all active tasks, not periodic polling. No auto-upgrades, schedule/timer/status polling or unrelated-chat messages.` };
   if (method === 'ping') return {};
   if (method === 'tools/list') return { tools };
   if (method !== 'tools/call') throw Object.assign(new Error(`Unknown method: ${method}`), { code: -32601 });
@@ -650,7 +657,7 @@ function dispatch(broker, request, signal) {
       case 'codex_status': value = broker.status(args.job_id); break;
       case 'codex_result': value = broker.result(args.job_id, args.diagnostics === true); break;
       case 'codex_cancel': value = broker.cancel(args.job_id); break;
-      case 'codex_list': value = broker.list(20, args.cwd); break;
+      case 'codex_list': value = broker.list(20, args.cwd, args.active_only === true); break;
       default: throw new Error(`Unknown tool: ${params.name}`);
     }
     return toolResponse(value);
