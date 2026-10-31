@@ -227,6 +227,30 @@ test('structured decisions survive persistence, include real options and do not 
   assert.match(message, /选工作树还是等待/); assert.match(message, /工作树：隔离修改/); assert.match(message, /不得默认选推荐项/); assert.ok(message.includes('原 topic_id/session_id'));
   assert.equal(finalHandoff('日志中引用 [CODEX_NEEDS_INPUT] 不应暂停'), null);
   assert.equal(finalHandoff('  [CODEX_NEEDS_INPUT] 请确认A或B').kind, 'needs_input');
+  const blocked = finalHandoff('[CODEX_BLOCKED] 执行约束要求保留原文件，原文件未修改；候选完成不代表已经应用。');
+  const blockedMessage = eventMessage(f.job, { ...event, status: 'blocked', handoff: blocked });
+  assert.equal(blocked.kind, 'blocked'); assert.match(blockedMessage, /状态=blocked/); assert.match(blockedMessage, /原文件未修改/);
+});
+
+test('default reconciliation is fifteen seconds and an empty outbox does not send a model heartbeat', t => {
+  const f = fixture(t); let calls = 0;
+  const w = watch(f.broker, async () => { calls++; return {}; });
+  try { assert.equal(read(path.join(f.root, 'notification-health.json')).interval_ms, 15000); assert.equal(calls, 0); }
+  finally { w.close(); }
+});
+
+test('health allows three reconciliation intervals before declaring the notifier stale', t => {
+  const f = fixture(t), previous = process.env.CODEX_EXECUTOR_DATA;
+  process.env.CODEX_EXECUTOR_DATA = f.root;
+  try {
+    save(path.join(f.root, 'notification-host.json'), { pid: process.pid });
+    const health = { interval_ms: 15000, closed: false, checked_at: new Date(Date.now() - 30000).toISOString() };
+    save(path.join(f.root, 'notification-health.json'), health);
+    let service = notificationSummary(f.file).service;
+    assert.equal(service.health_window_ms, 45000); assert.equal(service.online, true);
+    save(path.join(f.root, 'notification-health.json'), { ...health, checked_at: new Date(Date.now() - 46000).toISOString() });
+    service = notificationSummary(f.file).service; assert.equal(service.online, false);
+  } finally { if (previous === undefined) delete process.env.CODEX_EXECUTOR_DATA; else process.env.CODEX_EXECUTOR_DATA = previous; }
 });
 test('a CLI terminal with unfinished commands explicitly reports background uncertainty', t => {
   const f = fixture(t, 'completed'); save(f.file, { ...f.job, execution_state: 'background_unconfirmed', verification_state: 'pending', background_commands: [{ item_id: 'test1', command: 'cargo test -p fixture', state: 'exit_unconfirmed' }] });
@@ -243,4 +267,12 @@ test('an orphaned child is an inspect-only alert, not cancelled or redispatched'
  const f=fixture(t);save(f.file,{...f.job,worker_pid:2147483647,child_pid:process.pid,created_at:new Date(Date.now()-60000).toISOString()});let calls=0;
  const w=watch(f.broker,async(_,text)=>{calls++;assert.match(text,/不重派、不盲目终止PID/);return{}},{reconcileMs:25});t.after(()=>w.close());
  await sleep(180);assert.equal(notificationEvents(f.file).filter(e=>e.kind==='execution_alert').length,1);assert.equal(calls,1);
+});
+
+test('terminal status before terminal publication cannot retire the job from reconciliation', async t => {
+ const f=fixture(t);f.emit('phase','phase_started');dropWatch(t,f.broker.jobs);let release,calls=0;
+ const w=watch(f.broker,async()=>{calls++;if(calls===1)await new Promise(r=>{release=r});return{}},{reconcileMs:25});t.after(()=>w.close());
+ await sleep(40);assert.equal(typeof release,'function');save(f.file,{...f.job,status:'completed'});release();
+ await sleep(180);const terminal=notificationEvents(f.file).find(e=>e.kind==='terminal');assert.ok(terminal);assert.equal(notificationSummary(f.file).latest.state,'accepted');assert.equal(calls,2);
+ f.emit('terminal','terminal');await sleep(80);assert.equal(calls,2);
 });

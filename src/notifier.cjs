@@ -185,7 +185,7 @@ function auditNotifications(broker, ids, options = {}) {
 function watch(broker, send, options = {}) {
   const pending = new Set(), timers = new Map(), offsets = new Map(), known = new Set(), tracked = new Set(); let draining = false, closed = false, interval, watcher;
   const healthFile = path.join(path.dirname(broker.jobs), 'notification-health.json');
-  const health = { pid: process.pid, generation: options.generation || null, interval_ms: options.reconcileMs ?? 5000, last_delivery_at: null, watch_error: null };
+  const health = { pid: process.pid, generation: options.generation || null, interval_ms: options.reconcileMs ?? 15000, last_delivery_at: null, watch_error: null };
   const heartbeat = () => { if (fs.existsSync(path.dirname(healthFile))) save(healthFile, { ...health, checked_at: new Date().toISOString(), tracked_jobs: tracked.size, closed }); };
   const schedule = (id, delay = 300, urgent = false) => {
     if (closed) return;
@@ -225,7 +225,9 @@ function watch(broker, send, options = {}) {
           adaptLegacy(id);
           if (await deliver(broker, id, send, options)) health.last_delivery_at = new Date().toISOString();
           const job = broker.get(id), rows = notificationEvents(broker.jobPath(id));
-          const settled = terminal.has(job.status) && rows.every(e => {
+          // Worker status is saved before its terminal outbox event. Do not retire
+          // that job in the gap, or a lost final callback will bypass reconciliation.
+          const settled = terminal.has(job.status) && (job.notification_schema !== 2 || rows.some(e => e.kind === 'terminal')) && rows.every(e => {
             const f = e.file.replace(/\.json$/, '.delivery.json'); return fs.existsSync(f) && ['sent', 'accepted', 'superseded'].includes(read(f).state);
           });
           if (settled) tracked.delete(id); else tracked.add(id);
@@ -242,7 +244,7 @@ function watch(broker, send, options = {}) {
     if (closed) return;
     if (options.owns && !options.owns()) { close(); return; }
     try {
-      // Read directory names for discovery, not every historical receipt every five seconds.
+      // Read directory names for discovery, not every historical receipt every fifteen seconds.
       for (const id of fs.readdirSync(broker.jobs)) if (/^[a-f0-9]{24}$/.test(id) && !known.has(id)) { known.add(id); tracked.add(id); }
       const ids = new Set(tracked);
       const alertFile = path.join(path.dirname(broker.jobs), 'notification-alerts.json');
