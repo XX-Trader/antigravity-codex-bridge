@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { Broker, save, read, publishNotification, notificationEvents, notificationSummary, commandPhase, dispatch, finalHandoff, takeFileClaim } = require('../src/server.cjs');
-const { deliver, watch, claimHost, recordedReceipt, nativeSend, eventMessage, auditNotifications } = require('../src/notifier.cjs');
+const { deliver, watch, claimHost, recordedReceipt, nativeSend, eventMessage, notificationPolicy, notificationHeading, auditNotifications } = require('../src/notifier.cjs');
 const chat = '11111111-1111-1111-1111-111111111111';
 const id = 'aaaaaaaaaaaaaaaaaaaaaaaa';
 function fixture(t, status = 'running', schema = 2) {
@@ -44,13 +44,13 @@ test('concurrent publishers allocate distinct durable sequence numbers', async t
   assert.deepEqual(notificationEvents(f.file).map(e => e.sequence), [1, 2, 3, 4, 5, 6, 7, 8]);
 });
 test('known pre-send failure retries the exact event; unknown outcome never blindly replays', async t => {
-  const f = fixture(t); f.emit('phase', 'phase_started'); let calls = 0;
+  const f = fixture(t); f.emit('phase', 'execution_alert'); let calls = 0;
   await assert.rejects(deliver(f.broker, id, async () => { calls++; throw Object.assign(new Error('offline before send'), { not_sent: true }); }, { retryDelays: [0, 0, 0] }), /offline/);
   assert.equal(notificationSummary(f.file).latest.state, 'not_sent');
   assert.equal(await deliver(f.broker, id, async () => { calls++; return { exit_code: 0 }; }), true);
   assert.equal(calls, 2); assert.equal(notificationSummary(f.file).latest.state, 'accepted');
   assert.equal(await deliver(f.broker, id, async () => { throw Error('duplicate'); }), false);
-  f.emit('next', 'phase_finished');
+  f.emit('next', 'execution_alert');
   await assert.rejects(deliver(f.broker, id, async () => { calls++; throw Error('unknown after send'); }), /unknown/);
   assert.equal(await deliver(f.broker, id, async () => { calls++; return {}; }), false);
   assert.equal(calls, 3); assert.equal(notificationSummary(f.file).uncertain, 1);
@@ -58,18 +58,18 @@ test('known pre-send failure retries the exact event; unknown outcome never blin
   assert.equal(notificationSummary(f.file).uncertain, 0); assert.equal(notificationSummary(f.file).latest.state, 'accepted');
 });
 test('single event claim serializes concurrent senders', async t => {
-  const f = fixture(t); f.emit('phase', 'phase_started'); let release, calls = 0;
+  const f = fixture(t); f.emit('phase', 'execution_alert'); let release, calls = 0;
   const pending = deliver(f.broker, id, async () => { calls++; await new Promise(r => { release = r; }); return {}; });
   assert.equal(await deliver(f.broker, id, async () => { calls++; return {}; }), false);
   release(); await pending; assert.equal(calls, 1);
 });
 test('positive native receipt reconciles a send error without replay', async t => {
-  const f = fixture(t); f.emit('phase', 'phase_started'); let calls = 0;
+  const f = fixture(t); f.emit('phase', 'execution_alert'); let calls = 0;
   await deliver(f.broker, id, async () => { calls++; throw Error('receipt recording failed'); }, { reconcile: async () => true });
   assert.equal(calls, 1); assert.equal(notificationSummary(f.file).latest.state, 'accepted');
 });
 test('event identity is checked and unrelated conversation receipt cannot acknowledge', async t => {
-  const f = fixture(t), event = f.emit('phase', 'phase_started');
+  const f = fixture(t), event = f.emit('phase', 'execution_alert');
   save(event.file, { ...event, conversation_id: '33333333-3333-3333-3333-333333333333' });
   await assert.rejects(deliver(f.broker, id, async () => { throw Error('must not send'); }), /identity/);
   const receipts = path.join(f.root, 'receipts'); fs.mkdirSync(receipts);
@@ -86,12 +86,12 @@ test('host generation takeover fences the old sender, same generation is not dup
   const next = claimHost(f.root, 'host-two'); assert.equal(first.owns(), false); assert.equal(next.owns(), true);
 });
 test('ownership lost prevents any send; persisted sending is uncertain after a crash', async t => {
-  const f = fixture(t), event = f.emit('phase', 'phase_started'); let calls = 0;
+  const f = fixture(t), event = f.emit('phase', 'execution_alert'); let calls = 0;
   await deliver(f.broker, id, async () => { calls++; return {}; }, { owns: () => false }); assert.equal(calls, 0);
   save(event.file.replace(/\.json$/, '.delivery.json'), { state: 'sending', sender_pid: 0 });
   await deliver(f.broker, id, async () => { calls++; return {}; }); assert.equal(calls, 0); assert.equal(notificationSummary(f.file).latest.state, 'uncertain');
 });
-test('watch pushes progress before terminal and recovery does not resend accepted events', async t => {
+test('watch sends initial chat link and terminal; restart does not resend accepted events', async t => {
   const f = fixture(t); let messages = [];
   const w = watch(f.broker, async (_, text) => { messages.push(text); return {}; }); t.after(() => w.close());
   await changed(f.root, () => f.emit('session', 'session_ready'), () => notificationSummary(f.file).latest?.state === 'accepted');
@@ -103,7 +103,7 @@ test('watch retries only not_sent with bounded backoff, without task/model polli
   const f = fixture(t); let calls = 0;
   const original = process.stderr.write; process.stderr.write = () => true; t.after(() => { process.stderr.write = original; });
   const w = watch(f.broker, async () => { calls++; throw Object.assign(new Error('preflight'), { not_sent: true }); }, { retryDelays: [5, 5, 5] }); t.after(() => w.close());
-  await changed(f.root, () => f.emit('phase', 'phase_started'), () => notificationSummary(f.file).latest?.attempts === 4 && notificationSummary(f.file).latest?.state === 'not_sent');
+  await changed(f.root, () => f.emit('phase', 'execution_alert'), () => notificationSummary(f.file).latest?.attempts === 4 && notificationSummary(f.file).latest?.state === 'not_sent');
   assert.equal(calls, 4);
   for (let n = 0; n < 3; n++) await deliver(f.broker, id, async () => { calls++; throw Error('must remain bounded'); });
   assert.equal(calls, 4);
@@ -112,8 +112,8 @@ test('watch retries only not_sent with bounded backoff, without task/model polli
 });
 test('legacy running job receives catch-up and its later terminal is not lost', async t => {
   const f = fixture(t, 'running', undefined); delete f.job.notification_schema; save(f.file, f.job);
-  const w = watch(f.broker, async () => ({}), { generation: 'new-host' }); t.after(() => w.close());
-  await changed(f.root, () => {}, () => notificationSummary(f.file).latest?.state === 'accepted');
+  const w = watch(f.broker, async () => ({}), { generation: 'new-host', reconcileMs: 25 }); t.after(() => w.close());
+  await changed(f.root, () => {}, () => notificationSummary(f.file).latest?.state === 'suppressed');
   assert.equal(notificationEvents(f.file)[0].kind, 'recovered');
   await changed(f.root, () => save(f.file, { ...f.job, status: 'blocked' }), () => notificationSummary(f.file).latest?.kind === 'terminal' && notificationSummary(f.file).latest?.state === 'accepted');
 });
@@ -183,15 +183,15 @@ test('claim contention is recovered by reconciliation rather than dropping a ter
   await sleep(160); assert.equal(notificationSummary(f.file).latest.state, 'accepted');
 });
 test('local checks cannot bypass persisted retry deadlines or replay uncertain sends', async t => {
-  const f = fixture(t); f.emit('phase', 'phase_started'); let calls = 0;
+  const f = fixture(t); f.emit('phase', 'execution_alert'); let calls = 0;
   await assert.rejects(deliver(f.broker, id, async () => { calls++; throw Object.assign(Error('offline'), { not_sent: true }); }, { retryDelays: [1000, 1000, 1000] }));
   for (let n = 0; n < 4; n++) await deliver(f.broker, id, async () => { calls++; return {}; });
   assert.equal(calls, 1); assert.ok(notificationSummary(f.file).latest.next_attempt_at);
 });
 test('notification alarms coalesce by conversation/root cause, persist and recover once', async t => {
-  const f = fixture(t), e = f.emit('phase', 'phase_started'); const old = Date.now() - 70000; save(e.file, { ...e, created_at: new Date(old).toISOString() });
+  const f = fixture(t), e = f.emit('phase', 'execution_alert'); const old = Date.now() - 70000; save(e.file, { ...e, created_at: new Date(old).toISOString() });
   const next = 'bbbbbbbbbbbbbbbbbbbbbbbb', nf = f.broker.jobPath(next); fs.mkdirSync(path.dirname(nf));
-  const job = { ...f.job, job_id: next, topic_id: next }; save(nf, job); const ne = publishNotification(nf, job, 'phase', 'phase_started'); save(ne.file, { ...ne, created_at: new Date(old).toISOString() });
+  const job = { ...f.job, job_id: next, topic_id: next }; save(nf, job); const ne = publishNotification(nf, job, 'phase', 'execution_alert'); save(ne.file, { ...ne, created_at: new Date(old).toISOString() });
   const ids = new Set([id, next]); auditNotifications(f.broker, ids); auditNotifications(f.broker, ids);
   assert.equal(notificationEvents(f.file).filter(e => e.kind === 'notification_alert').length, 1); assert.equal(notificationEvents(nf).length, 1);
   const group = Object.values(read(path.join(f.root, 'notification-alerts.json')).groups)[0]; assert.equal(group.jobs.length, 2);
@@ -201,10 +201,11 @@ test('notification alarms coalesce by conversation/root cause, persist and recov
   fs.unlinkSync(e.file.replace(/\.json$/, '.delivery.json'));
   await deliver(f.broker, id, async () => ({})); await deliver(f.broker, next, async () => ({}));
   auditNotifications(f.broker, ids); auditNotifications(f.broker, ids);
-  assert.equal(notificationEvents(f.file).filter(e => e.kind === 'notification_recovered').length, 1);
+  assert.equal(notificationEvents(f.file).filter(e => e.kind === 'notification_recovered').length, 0);
+  assert.equal(Object.values(read(path.join(f.root, 'notification-alerts.json')).groups)[0].state, 'resolved');
 });
 test('recovery before an alert was sent suppresses stale model wakeups and does not recurse', async t => {
-  const f = fixture(t), e = f.emit('phase', 'phase_started'); save(e.file, { ...e, created_at: new Date(Date.now() - 70000).toISOString() });
+  const f = fixture(t), e = f.emit('phase', 'execution_alert'); save(e.file, { ...e, created_at: new Date(Date.now() - 70000).toISOString() });
   const ids = new Set([id]); auditNotifications(f.broker, ids);
   const alert = notificationEvents(f.file).find(e => e.kind === 'notification_alert');
   save(e.file.replace(/\.json$/, '.delivery.json'), { state: 'accepted' }); auditNotifications(f.broker, ids);
@@ -212,12 +213,16 @@ test('recovery before an alert was sent suppresses stale model wakeups and does 
   assert.equal(notificationEvents(f.file).filter(e => e.kind === 'notification_recovered').length, 0);
   const ledger = auditNotifications(f.broker, ids); assert.equal(Object.values(ledger.groups)[0].state, 'resolved');
 });
-test('ordinary running work and accepted notices do not create alarms; watch errors close health', async t => {
+test('watch failure retains reconciliation, reattaches and delivers a later terminal', async t => {
   const f = fixture(t); const callback = dropWatch(t, f.broker.jobs); let calls = 0;
   const w = watch(f.broker, async () => { calls++; return {}; }, { reconcileMs: 25 }); t.after(() => w.close());
   await sleep(90); assert.equal(calls, 0); assert.equal(fs.existsSync(path.join(f.root, 'notification-alerts.json')), false);
   callback.fail(new Error('fixture watcher failure'));
-  const health = read(path.join(f.root, 'notification-health.json')); assert.equal(health.closed, true); assert.equal(health.watch_error, 'fixture watcher failure');
+  const health = read(path.join(f.root, 'notification-health.json')); assert.equal(health.closed, false); assert.equal(health.watch_online, false); assert.equal(health.watch_error, 'fixture watcher failure');
+  save(f.file, { ...f.job, status: 'completed' }); f.emit('terminal', 'terminal');
+  await sleep(180); assert.equal(calls, 1); assert.equal(notificationSummary(f.file).latest.state, 'accepted');
+  const recovered = read(path.join(f.root, 'notification-health.json'));
+  assert.equal(recovered.closed, false); assert.equal(recovered.watch_online, true); assert.equal(recovered.watch_error, null); assert.ok(recovered.watch_recovered_at);
 });
 test('structured decisions survive persistence, include real options and do not auto-select', t => {
   const f = fixture(t, 'needs_input');
@@ -270,9 +275,88 @@ test('an orphaned child is an inspect-only alert, not cancelled or redispatched'
 });
 
 test('terminal status before terminal publication cannot retire the job from reconciliation', async t => {
- const f=fixture(t);f.emit('phase','phase_started');dropWatch(t,f.broker.jobs);let release,calls=0;
+ const f=fixture(t);f.emit('phase','execution_alert');dropWatch(t,f.broker.jobs);let release,calls=0;
  const w=watch(f.broker,async()=>{calls++;if(calls===1)await new Promise(r=>{release=r});return{}},{reconcileMs:25});t.after(()=>w.close());
  await sleep(40);assert.equal(typeof release,'function');save(f.file,{...f.job,status:'completed'});release();
  await sleep(180);const terminal=notificationEvents(f.file).find(e=>e.kind==='terminal');assert.ok(terminal);assert.equal(notificationSummary(f.file).latest.state,'accepted');assert.equal(calls,2);
  f.emit('terminal','terminal');await sleep(80);assert.equal(calls,2);
+});
+
+test('routine events stay durable but silent, never trigger alarms, and do not hide decisions', async t => {
+  const f = fixture(t); let calls = 0;
+  for (const kind of ['started', 'files_changed', 'phase_started', 'phase_finished', 'waiting_capacity', 'resumed', 'recovered', 'progress', 'notification_recovered']) {
+    const event = f.emit(kind, kind, 'fixture');
+    save(event.file, { ...event, created_at: new Date(Date.now() - 70000).toISOString() });
+  }
+  auditNotifications(f.broker, new Set([id]));
+  assert.equal(fs.existsSync(path.join(f.root, 'notification-alerts.json')), false);
+  await deliver(f.broker, id, async () => { calls++; return {}; });
+  assert.equal(calls, 0); assert.equal(notificationEvents(f.file).length, 9);
+  assert.equal(notificationSummary(f.file).pending, 0);
+  for (const e of notificationEvents(f.file)) assert.equal(read(e.file.replace(/\.json$/, '.delivery.json')).state, 'suppressed');
+  save(f.file, { ...f.job, status: 'needs_input', handoff: { question: '保留哪一份？', options: ['甲', '乙'] } });
+  f.emit('decision', 'terminal');
+  await deliver(f.broker, id, async (_, text) => { calls++; assert.match(text, /保留哪一份/); assert.match(text, /不得默认选推荐项/); return {}; });
+  assert.equal(calls, 1);
+});
+
+test('continuation and stale startup links are silent; first fresh chat and diagnostics still send', async t => {
+  const f = fixture(t), event = f.emit('session', 'session_ready'); let calls = 0;
+  assert.equal(notificationPolicy(f.job, event), 'send');
+  assert.equal(notificationPolicy({ ...f.job, parent_job_id: id }, event), 'silent');
+  assert.equal(notificationPolicy({ ...f.job, resumed_session: true }, event), 'silent');
+  assert.equal(notificationPolicy(f.job, event, Date.parse(event.created_at) + 120001), 'silent');
+  save(f.file, { ...f.job, parent_job_id: id });
+  await deliver(f.broker, id, async () => { calls++; return {}; });
+  assert.equal(calls, 0);
+  for (const kind of ['notification_check', 'parallel_check', 'subagent_check']) f.emit(kind, kind);
+  await deliver(f.broker, id, async () => { calls++; return {}; });
+  assert.equal(calls, 3);
+});
+
+test('silent policy preserves unknown prior sends and never blindly replays them', async t => {
+  const f = fixture(t), event = f.emit('phase', 'phase_finished'); let calls = 0;
+  save(event.file.replace(/\.json$/, '.delivery.json'), { state: 'sending' });
+  await deliver(f.broker, id, async () => { calls++; return {}; });
+  assert.equal(calls, 0); assert.equal(notificationSummary(f.file).latest.state, 'uncertain');
+  auditNotifications(f.broker, new Set([id]));
+  assert.equal(fs.existsSync(path.join(f.root, 'notification-alerts.json')), false);
+  await deliver(f.broker, id, async () => { calls++; return {}; }, { reconcile: async () => true });
+  assert.equal(calls, 0); assert.equal(notificationSummary(f.file).latest.state, 'accepted');
+});
+
+test('startup watcher creation failure still discovers new terminal jobs through local checks', async t => {
+  const f = fixture(t), original = fs.watch; let calls = 0;
+  fs.watch = () => { throw new Error('watch unavailable'); };
+  t.after(() => { fs.watch = original; });
+  const stderr = process.stderr.write; process.stderr.write = () => true; t.after(() => { process.stderr.write = stderr; });
+  const w = watch(f.broker, async () => { calls++; return {}; }, { reconcileMs: 25 }); t.after(() => w.close());
+  save(f.file, { ...f.job, status: 'completed' }); f.emit('terminal', 'terminal');
+  const next = 'bbbbbbbbbbbbbbbbbbbbbbbb', nextFile = f.broker.jobPath(next); fs.mkdirSync(path.dirname(nextFile));
+  const job = { ...f.job, job_id: next, topic_id: next, status: 'completed' }; save(nextFile, job); publishNotification(nextFile, job, 'terminal', 'terminal');
+  await sleep(180);
+  assert.equal(calls, 2); assert.equal(notificationSummary(nextFile).latest.state, 'accepted');
+  const health = read(path.join(f.root, 'notification-health.json')); assert.equal(health.closed, false); assert.equal(health.watch_online, false);
+});
+
+test('compact notifications use event time, distinguish dates/delay and bound result claims', t => {
+  const f = fixture(t), job = { ...f.job, cwd: path.join(f.root, 'example'), topic: '播放验收', settings: { notification_timezone: 'Asia/Shanghai' } };
+  const now = Date.parse('2026-10-31T12:00:00Z');
+  assert.equal(notificationHeading(job, { created_at: '2026-10-31T11:59:00Z' }, '已启动', now), '19:59 · example · 播放验收 · 已启动');
+  assert.equal(notificationHeading(job, { created_at: '2026-10-30T11:59:00Z' }, '待验收', now), '10-30 19:59 · example · 播放验收 · 待验收（延迟送达）');
+  const message = eventMessage(job, f.emit('terminal', 'terminal'));
+  assert.match(message, /最多三行/); assert.match(message, /单条命令退出0不能扩写成全部测试通过/);
+  assert.match(message, /静默续接/); assert.match(message, /问题和选项/);
+});
+
+test('delivering the original result suppresses an alarm that became stale in the same drain', async t => {
+  const f = fixture(t, 'completed'), event = f.emit('terminal', 'terminal');
+  save(event.file, { ...event, created_at: new Date(Date.now() - 70000).toISOString() });
+  auditNotifications(f.broker, new Set([id])); let calls = 0;
+  await deliver(f.broker, id, async (_, message) => { calls++; assert.match(message, /事件=terminal/); return {}; });
+  assert.equal(calls, 1);
+  const alert = notificationEvents(f.file).find(e => e.kind === 'notification_alert');
+  assert.equal(read(alert.file.replace(/\.json$/, '.delivery.json')).state, 'superseded');
+  auditNotifications(f.broker, new Set([id]));
+  assert.equal(Object.values(read(path.join(f.root, 'notification-alerts.json')).groups)[0].state, 'resolved');
 });

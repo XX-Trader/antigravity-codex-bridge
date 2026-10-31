@@ -61,7 +61,7 @@ pwsh -NoProfile -File scripts/Setup.ps1 --project 'C:/work/my-project' --data 'C
 | `codex_wait` | 一次等待既有任务完成，不重新提交 |
 | `codex_cancel` | 只取消该任务拥有的子进程，不回滚源码改动 |
 
-`topic` 应是“修复播放器切集失败”这样的实际任务，而不是“Codex 执行者”。会话建立事件带有原生聊天链接，不必等到最终回执。把 `chat.vscode_uri` 展示给用户；`chat=null` 不代表失败，也不是重复提交的理由。
+`topic` 应是“修复播放器切集失败”这样的实际任务，而不是“Codex 执行者”。首次新事项的会话建立事件带有原生聊天链接，不必等到最终回执；常规进度、同事项续接和通知恢复只留本地，不反复唤醒模型或刷聊天。通知正文保留本地时间、项目/短事项、具体结果或所需操作和一个详情链接，默认最多三行；用户选择完整展示。把 `chat.vscode_uri` 展示给用户；`chat=null` 不代表失败，也不是重复提交的理由。
 
 通知有持久化事件编号和独立投递状态。`accepted` 仅表示宿主 API 接受，不能冒充用户已看到；发送前已知失败为 `not_sent`，可有限退避和重启补送；结果不明为 `uncertain`，先核对原生收件记录，不盲目重发。`codex_list` / `codex_result` 的 `notification` 显示待投递、未知结果及通知进程状态。
 

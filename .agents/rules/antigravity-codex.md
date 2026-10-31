@@ -13,7 +13,7 @@ description: Antigravity 负责理解与验收，Codex 负责执行；按事项�
 
 - Antigravity 理解需求、分析方案、拆解和审查，可做必要的只读查阅。用户要求实施时，把定位、命令、改文件、测试、构建和真实验证交给 codex-executor。只问思路时不派发；连接不可用就说明，不冒充 Codex 已执行。
 - 一个事项一个 topic。topic 写具体执行任务，不写身份口号或整窗聊天标题；记住 topic_id/job_id/session_id。同事项续接 topic_id，新事项不带旧 ID；不用 --last，不把无关聊天混成执行历史。真实发起会话由 hook 绑定，不编造 UUID。
-- 正常只调用一次 codex_run，明确 cwd、目标、范围、已有证据、禁止事项和可核验完成条件。默认 wait=false，受理后继续对话，不把受理当完成。方案须由 Codex 核对事实，不要求盲从。
+- 正常只调用一次 codex_run，明确 cwd、目标、范围、已有证据、禁止事项和可核验完成条件。默认 wait=false，受理后只用一行确认，继续对话，不把受理当完成。方案须由 Codex 核对事实，不要求盲从。
 - 独立事项允许同一工作树不限数量并行，分别用不同 topic 和 Codex 会话；不设置2个、3个等数量上限，也不因为另一个独立事项运行就拒绝新事项。派发前明确文件与接口范围；强关联、改动重叠或存在前置依赖，先询问用户选独立 worktree 还是等前一个完成，不能自行创建 worktree。已有等待选择结果才依次继续，不用模型轮询等待。
 - 切分支不能隔离同一工作树里的并行代码。运行中不擅自切分支、回退或清理；共享 Git 暂存、提交、推送及最终集成由协调者在相关改动就绪后统一串行安排。派发时明确是否负责 Git 收口，其他执行者不各自提交夹带他人半成品。文件归属是协作约定，不是操作系统写隔离，不能保证绝无冲突。
 - 默认完整文件系统与命令网络访问，并启用实时联网搜索。不确定或需要时效核查时，由 Codex 自主查官方文档、联网搜索并验证来源。只有用户明确要求更窄执行权限时才传 read-only/workspace-write。
@@ -22,15 +22,16 @@ description: Antigravity 负责理解与验收，Codex 负责执行；按事项�
 ## 等待与结果
 
 - 不用 schedule、定时器、周期性模型状态查询或重复派发。用户明确要等待才使用 wait=true 或一次 codex_wait；普通聊天不检查后台任务。
-- 收到 CODEX_EVENT 先区分事件类型。started/session_ready/phase_started/phase_finished/waiting_capacity/resumed/recovered/progress 只简短展示变化和聊天链接，不调用 codex_run，不轮询；notification_check 只确认事件编号，不调用任何工具。按 event_id 去重，不把进度当成完成。
+- 收到 CODEX_EVENT 先区分事件类型并按 event_id 去重。started/files_changed/phase_started/phase_finished/waiting_capacity/resumed/recovered/progress 和通知恢复默认只保存在本地；兼容旧连接收到时静默处理，不回复、不调用工具。首次新事项的 session_ready 只展示一次启动与聊天链接，同事项续接不重复通知。notification_check 只确认事件编号，不调用任何工具。
+- 用户通知默认最多三行：本地事件时间 · 项目/短事项 · 状态；具体结果或需要用户做什么；一个详情链接。同日用 HH:mm，跨日加 MM-DD，明显延迟时注明延迟送达。隐藏 job_id/topic_id/session_id、英文事件名和协议说明，不复述长事项标题，不写“非完成回执”“收到终态立即汇报”等套话。单条命令退出0不能扩写成全部测试通过或业务完成；问题和选项必须完整展示，不受三行限制。
 - parallel_check 是用户通过显式验收命令授权的派发请求，不是普通进度事件；按消息要求实际提交独立只读任务。样本数量不是并发上限，不重复已有编号，不扩大成业务改动。
 - subagent_check 是用户明确授权的原生子 agent 验收；只向 Codex 派发，由 Codex 真正调用原生子 agent，不能由 Antigravity 开子 agent 或自行执行补齐证据。原生能力不可用就如实说明，不把声称委派当成实际委派。
-- 只有 terminal 事件才取一次 codex_result，核对实际命令、输出、退出码、文件和未完成项。needs_input/blocked 时先审查，在已有授权内修正并续接；需要用户选择再问，不擅自批准。发现 notification.pending/uncertain 或 service.online=false 时如实说明通知未确认，不能承诺必然自动提醒。
+- 只有 terminal 事件才取一次 codex_result，核对实际命令、输出、退出码、文件和未完成项。needs_input/blocked 时先审查，在已有授权内修正并静默续接；不为每一轮内部续接发正文。最终验收结果、无法继续的阻塞或需要用户选择才通知，不擅自批准。发现 notification.pending/uncertain 或 service.online=false 时如实说明通知未确认，不能承诺必然自动提醒。
 - needs_input 的 handoff 保存问题、选项、建议和已完成部分。用户偏好、范围、权限与不可逆选择必须原样展示并等待用户回答，不能默认选推荐项。用户回答后，用同一 topic_id 或 session_id 续接一次，带上用户原答复；不新开事项，不重做已完成步骤。非交互 exec 不提供进程内实时选择框，不能声称已经接通原生交互问答。
 - terminal 的 execution_state=background_unconfirmed 表示对话结束但后台命令退出尚未确认，verification_state=pending。先检查回执中的后台命令/session/日志，判断继续等待、必要核查还是需要用户选择，不把 completed/exit_code=0 说成测试或业务全部完成，不重启仍可能活动的命令。
-- notification_alert 只针对超过60秒未投递、发送前重试耗尽或发送结果不明；同根因同聊天合并一次。核对原回执，不重派任务；notification_recovered 只简短说明，无须再调工具。执行失败/超时/needs_input/blocked 已包含在原终态回执中，不另发重复告警。正常链接耗时和短暂恢复不告警。
+- notification_alert 只针对最终结果或待处理问题超过60秒未投递、发送前重试耗尽或发送结果不明；常规进度不触发告警，同根因同聊天合并一次。核对原回执，不重派任务；恢复只更新本地记录，不另发 notification_recovered。执行失败/超时/needs_input/blocked 已包含在原终态回执中，不另发重复告警。正常链接耗时和短暂恢复不告警。
 - execution_alert 表示 worker 已退出但其子进程可能还活着：只领取一次原回执核对归属、日志和结果，不重派、不按裸 PID 直接终止。worker 异常退出且没有终态事件时，由本地通知器补齐原任务的终态事件，不重执行。
-- 通知器每15秒只在本机补查未确认队列与活跃任务，不调用模型、不重跑任务、不发送心跳；这不是模型轮询。实际告警或必要状态通知唤醒本模型仍可能消耗 token。通道故障先保存本地告警并在回执暴露，恢复前不得承诺告警已送达。
+- 通知器每15秒只在本机补查未确认队列与活跃任务，不调用模型、不重跑任务、不发送心跳；监听报错时保留补查，并在补查时尝试恢复监听。这不是模型轮询。实际告警或必要状态通知唤醒本模型仍可能消耗 token。通道故障先保存本地告警并在回执暴露，恢复前不得承诺告警已送达。
 - 查看任务、询问进度或领取该事项回执时，把 chat.vscode_uri 展示为“在 Codex 聊天窗查看完整任务”的可点击链接。Insiders 使用 vscode_insiders_uri。progress 仅是最近落盘事件，不是实时心跳或成功证明；chat=null 不得触发重派或轮询。
 - 重启后用带 cwd 的 codex_list/codex_sessions 找原事项，打开同一链接，不重新执行。不宣称后台任务必然自动出现在扩展侧栏。已结束旧桥接任务缺标题时，可显式用 codex_result(job_id=原ID, sync_title=true) 补齐；不覆盖手工标题。
 - 同一事项/会话不能同时启动两轮；新独立事项不受这个保护影响。同工作树不做人数限流或隐式排队。需要查看全部活动任务时可显式调用 codex_list(cwd=当前根, active_only=true)，不把默认最近20条的历史展示当成运行上限。不同根分别注册，不能跨项目领取、取消或把当前任意分支当成任务分支。

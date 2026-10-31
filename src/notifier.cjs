@@ -44,24 +44,48 @@ function recordedReceipt(directory, event) {
   }
   return false;
 }
+const checks = new Set(['notification_check', 'parallel_check', 'subagent_check']);
+const important = new Set(['terminal', 'execution_alert', 'notification_alert']);
+function notificationPolicy(job, event, now = Date.now()) {
+  if (checks.has(event.kind) || important.has(event.kind) || !event.schema) return 'send';
+  // A continuation already has a saved chat link. Never replay old startup banners.
+  if (event.kind === 'session_ready' && !job.parent_job_id && !job.resumed_session && job.topic_id === job.job_id && now - Date.parse(event.created_at) <= 120000) return 'send';
+  return 'silent';
+}
+function notificationHeading(job, event, label, now = Date.now()) {
+  const date = new Date(event.created_at || job.ended_at || job.created_at);
+  const zone = job.settings?.notification_timezone;
+  const parts = value => Object.fromEntries(new Intl.DateTimeFormat('zh-CN', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(value).map(p => [p.type, p.value]));
+  const at = parts(date), today = parts(new Date(now));
+  const day = at.year === today.year && at.month === today.month && at.day === today.day ? '' : `${at.month}-${at.day} `;
+  const project = job.cwd ? path.basename(job.cwd) : 'Codex';
+  const topic = Array.from((job.topic || '').replace(/\s+/g, ' '));
+  const matter = topic.length ? ` · ${topic.slice(0, 24).join('')}${topic.length > 24 ? '…' : ''}` : '';
+  const delayed = now - date.getTime() >= 120000 ? '（延迟送达）' : '';
+  return `${day}${at.hour}:${at.minute} · ${project}${matter} · ${label}${delayed}`;
+}
 function eventMessage(job, event) {
   const link = event.chat || chatAccess(job.thread_id);
-  if (['notification_alert', 'notification_recovered'].includes(event.kind)) return `[CODEX_EVENT ${job.job_id}] event_id=${event.event_id} sequence=${event.sequence} 事件=${event.kind}。${event.detail}\n${link ? `[在 Codex 聊天窗查看完整任务](${link.vscode_uri})\n` : ''}这是通知链路告警/恢复，不是新的执行任务。核对已有回执与收件记录；不得重新执行任务、轮询模型或盲目重发结果不明的消息。恢复事件仅简短说明，不需调用工具。`;
-  if (event.kind === 'execution_alert') return `[CODEX_EVENT ${job.job_id}] event_id=${event.event_id} sequence=${event.sequence} 事件=execution_alert，状态=${event.status}。${event.detail} 请领取一次原回执核查所属进程；不是新任务，不重派、不盲目终止PID。${link ? `\n[在 Codex 聊天窗查看完整任务](${link.vscode_uri})` : ''}`;
+  const metadata = `[CODEX_EVENT ${job.job_id}] event_id=${event.event_id || job.job_id + ':legacy'} sequence=${event.sequence || 0} 事件=${event.kind || 'terminal'} 状态=${event.status}`;
+  const compact = '用户正文最多三行：时间 · 项目 · 状态；具体结果或需要用户做什么；一个详情链接。隐藏 job_id/topic_id/session_id、事件名和协议说明，不复述长事项标题，不写等待汇报的套话。';
+  const view = link ? `[查看任务](${link.vscode_uri})` : '';
+  if (event.kind === 'session_ready') return `${metadata}\n${notificationHeading(job, event, '已启动')}\n${view}\n只展示上面两行，不调用任何工具；不调用 codex_run、不轮询。${compact}`;
+  if (['notification_alert', 'notification_recovered'].includes(event.kind)) return `${metadata}\n${notificationHeading(job, event, '通知异常')}\n${event.detail}\n${view}\n仅提示重要结果通知异常、结果仍保存在原任务；不重派、不盲目重发。${compact}`;
+  if (event.kind === 'execution_alert') return `${metadata}\n${notificationHeading(job, event, '需要核查')}\n${event.detail}\n${view}\n请领取一次原回执核查所属进程；不重派、不盲目终止PID。${compact}`;
   const resume = event.detail?.match(/(?:^|\s)CHECK_ID=([a-f0-9]{24}:\d+)/)?.[1];
   const checkId = resume?.startsWith(job.job_id + ':') ? resume : event.event_id;
   const action = event.kind === 'subagent_check' ? `这是用户明确授权的 Codex 原生子agent 验收。当前执行根=${JSON.stringify(job.cwd)}，MCP服务名见事件说明。仅调用一次 codex_run，wait=false，新 topic“Codex原生子agent只读验收”，不带旧 topic_id/session_id，也不要手填 conversation_id，让本机 hook 绑定真实会话。prompt 必须包含 SUBAGENT_CHECK=${checkId}；要求这个 Codex 执行者实际调用自己的原生 spawn_agent 创建1名只读子agent，让子agent用 PowerShell7 读取 README.md 前60行并输出 CODEX_NATIVE_SUBAGENT_OK，父agent 等待其真实结果，汇总原生子agent ID、来源和返回内容。父agent不能自己读文件冒充委派，不经本MCP递归，不新开CLI冒充子agent；如果原生能力不可用就如实返回 needs_input。所有命令和文件核查都由 Codex/其原生子agent执行；你不能调用 Antigravity invoke_subagent、define_subagent、run_command 或写文件工具代做。只读、不提交、不切分支、不安装或重启、不读凭证；不升级模型。受理后展示job_id，终态再领取结果与查看链接。`
     : event.kind === 'parallel_check' ? `这是用户明确授权的同工作树并发验收，请现在执行，不只是确认收到。当前执行根=${JSON.stringify(job.cwd)}。请连续调用3次 codex_run，三次都 wait=false、使用该 cwd，不带旧 topic_id/session_id；分别做独立只读核查：1项目说明与协作约定；2测试入口与建议的定向测试；3源码模块边界与可独立拆分点。每个任务的 topic 用具体核查名称，prompt 必须包含 PARALLEL_CHECK=${event.event_id} 和各自编号。三者均须实际用 PowerShell7 读取相关文件、输出自己的编号，最后在同一命令短暂等待20秒用于观察重叠，不改文件、不运行重型构建、不提交、不切分支、不安装或重启、不读取凭证。三者互不依赖，可以直接同工作树并发，不需要 worktree；3只是本次验收样本数，不是并发上限。不要自动改模型，沿用本机默认与Medium。提交第一个后继续提交剩余两个，不因进度事件中断，不逐个调用 codex_wait。全部受理后列出3个job_id，收到终态再分别领取结果和展示聊天链接。不得重派已有编号或扩大成业务开发。`
     : event.kind === 'notification_check' ? `这是通知链路验收，只回复“通知已收到 event_id=${event.event_id}”并展示查看入口；不调用任何工具、不执行或续跑业务任务。` : event.kind === 'terminal' || !event.schema
     ? `请只调用一次 codex_result(job_id=${job.job_id}) 领取原结果并验收；不要重复派发。`
-    : '这是执行中的状态变化，请简短展示进度与查看入口，不调用 codex_run、不轮询、不把进度当成完成。';
+    : '兼容旧连接的过程事件：静默处理，不回复、不调用工具。';
   const handoff = event.handoff || job.handoff;
   const choice = event.kind === 'terminal' && ['needs_input', 'blocked'].includes(event.status)
     ? `\n【需要判断/用户选择】${handoff?.question || handoff?.text || '请领取原回执查看具体问题。'}${handoff?.options?.length ? '\n选项：' + handoff.options.map((v, i) => `${i + 1}. ${v}`).join('\n') : ''}${handoff?.recommendation ? '\nCodex建议（不是用户授权）：' + handoff.recommendation : ''}\n只有已有明确授权能解决时才能继续；涉及用户偏好、范围、权限或不可逆选择须向用户原样展示问题/选项，等待回答。不得默认选推荐项。用户回答后用原 topic_id/session_id 续接一次，不重开事项。` : '';
   const background = event.kind === 'terminal' && (event.execution_state || job.execution_state) === 'background_unconfirmed'
     ? `\n【后台执行尚未确认结束】Codex对话轮次已结束，但后台命令的退出结果未确认，测试/业务验收仍待完成。${JSON.stringify(event.background_commands || job.background_commands || [])} ${handoff?.kind === 'background_running' ? handoff.text : ''}请先判断等待、核查原命令还是需要用户决定；不能把CLI退出0当成测试通过，不重跑仍可能活动的命令。` : '';
-  const abnormal = event.kind === 'terminal' && ['failed', 'timed_out', 'blocked', 'needs_input'].includes(event.status) ? '【执行异常或任务受阻，需要判断】' : '';
-  return `[CODEX_EVENT ${job.job_id}] event_id=${event.event_id || job.job_id + ':legacy'} sequence=${event.sequence || 0} 事项=${JSON.stringify(job.topic || job.topic_id)}，topic_id=${job.topic_id}，状态=${event.status}，事件=${event.kind || 'terminal'}。${abnormal}${event.detail || ''}\n${link ? `[在 Codex 聊天窗查看完整任务](${link.vscode_uri})\n` : ''}${['parallel_check', 'subagent_check'].includes(event.kind) ? '这是用户授权的验收派发。' : '这是后台事件，不是新的用户任务。'}${action}${choice}${background} CLI 执行结束、通知送达与业务验收是不同状态。`;
+  const label = ['needs_input', 'blocked'].includes(event.status) ? '需要判断' : ['failed', 'timed_out', 'cancelled'].includes(event.status) ? '执行中止' : '待验收';
+  return `${metadata}\n${notificationHeading(job, event, label)}\n${view}\n${checks.has(event.kind) ? '这是用户授权的验收派发。' : '这是后台事件，不是新的用户任务。'}${action}${choice}${background}\n${compact}需要用户选择时完整保留问题和选项，不受三行限制。领取回执后只按实际证据报告；单条命令退出0不能扩写成全部测试通过或业务完成。同事项在已有授权内继续时静默续接，只在最终验收、无法继续或需要用户选择时发正文。`;
 }
 function claimHost(data, generation) {
   const file = path.join(data, 'notification-host.json'), release = takeClaim(file + '.claim');
@@ -79,10 +103,13 @@ async function deliverEvent(job, event, deliveryFile, send, options) {
   const release = takeClaim(deliveryFile + '.claim'); if (!release) return false;
   try {
     const previous = fs.existsSync(deliveryFile) ? read(deliveryFile) : null;
-    if (['sent', 'accepted', 'superseded'].includes(previous?.state)) return false;
+    if (['sent', 'accepted', 'superseded', 'suppressed'].includes(previous?.state)) return false;
     if (['sending', 'uncertain'].includes(previous?.state)) {
       if (await options.reconcile?.(event)) { save(deliveryFile, { ...previous, state: 'accepted', reconciled_at: new Date().toISOString() }); return false; }
       save(deliveryFile, { ...previous, state: 'uncertain', action_required: 'No positive host receipt. Inspect recipient history before explicitly replaying; automatic replay is disabled.' }); return false;
+    }
+    if (notificationPolicy(job, event, options.now ?? Date.now()) === 'silent') {
+      save(deliveryFile, { ...previous, state: 'suppressed', event_id: event.event_id, reason: 'Routine event retained locally; no host/model wakeup.' }); return false;
     }
     if (options.owns && !options.owns()) return false;
     const generation = options.generation || null;
@@ -126,6 +153,26 @@ async function deliver(broker, id, send, options = {}) {
   const last = events.at(-1);
   for (const event of events) {
     const file = event.file.replace(/\.json$/, '.delivery.json');
+    if (event.kind === 'notification_alert') {
+      const ledgerFile = path.join(path.dirname(broker.jobs), 'notification-alerts.json');
+      const group = fs.existsSync(ledgerFile) && Object.values(read(ledgerFile).groups).find(g => g.alert_event === event.file);
+      const outstanding = group && group.jobs.some(jobId => notificationEvents(broker.jobPath(jobId)).some(e => {
+        if (!['terminal', 'execution_alert'].includes(e.kind)) return false;
+        const delivery = e.file.replace(/\.json$/, '.delivery.json');
+        return !fs.existsSync(delivery) || !['accepted', 'sent', 'superseded', 'suppressed'].includes(read(delivery).state);
+      }));
+      if (group && !outstanding) {
+        // The original result may have been delivered earlier in this very drain.
+        const release = takeClaim(file + '.claim');
+        if (release) try {
+          const prior = fs.existsSync(file) ? read(file) : null;
+          if (!prior || prior.state === 'not_sent') save(file, { state: 'superseded', event_id: event.event_id, reason: 'Original results delivered before this alarm; no stale wakeup.' });
+        } finally { release(); }
+        // Unknown sends still require positive receipt reconciliation, never suppression/replay.
+        sent = await deliverEvent(job, event, file, send, options) || sent;
+        continue;
+      }
+    }
     // A quick task can finish before the debounce; show one final receipt, not stale running alerts.
     if (event !== last && !['notification_check', 'parallel_check', 'subagent_check'].includes(event.kind) && (last.kind === 'terminal' || (event.kind === 'started' && last.kind === 'session_ready')) && (!fs.existsSync(file) || read(file).state === 'not_sent')) { save(file, { state: 'superseded', event_id: event.event_id, superseded_by: last.event_id }); continue; }
     sent = await deliverEvent(job, event, file, send, options) || sent;
@@ -139,7 +186,8 @@ function auditNotifications(broker, ids, options = {}) {
   for (const id of ids) {
     let job; try { job = broker.get(id); } catch { continue; }
     for (const event of notificationEvents(broker.jobPath(id))) {
-      if (['notification_alert', 'notification_recovered', 'notification_check', 'parallel_check', 'subagent_check'].includes(event.kind)) continue;
+      // Alarms protect results and decisions, never routine progress or an alarm itself.
+      if (!['terminal', 'execution_alert'].includes(event.kind)) continue;
       const dfile = event.file.replace(/\.json$/, '.delivery.json'), d = fs.existsSync(dfile) ? read(dfile) : { state: 'pending' };
       const age = now - Date.parse(event.created_at);
       const reason = d.state === 'uncertain' || (d.state === 'sending' && now - Date.parse(d.created_at) >= 90000) ? 'outcome_unknown' : d.state === 'not_sent' && d.attempts >= 4 ? 'retry_exhausted' : ['pending', 'not_sent'].includes(d.state) && age >= threshold ? 'delivery_overdue' : null;
@@ -172,10 +220,8 @@ function auditNotifications(broker, ids, options = {}) {
     const dfile = group.alert_event.replace(/\.json$/, '.delivery.json'), delivery = fs.existsSync(dfile) ? read(dfile) : { state: 'pending' };
     if (['sending', 'uncertain'].includes(delivery.state)) continue; // Unknown alert receipt also needs reconciliation.
     group.state = 'resolved'; group.resolved_at = new Date(now).toISOString(); changed = true;
-    if (['sent', 'accepted'].includes(delivery.state)) {
-      const job = broker.get(group.alert_job_id);
-      publishNotification(broker.jobPath(job.job_id), job, `recovered-${path.basename(group.alert_event)}-${group.episode}`, 'notification_recovered', `通知链路恢复：${group.reason}，涉及${group.jobs.length}个任务。原任务未重跑，请以原回执为准。`);
-    } else if (!['superseded'].includes(delivery.state)) {
+    // The delayed original result is the recovery notification; keep health recovery local.
+    if (!['sent', 'accepted', 'superseded', 'suppressed'].includes(delivery.state)) {
       save(dfile, { ...delivery, state: 'superseded', reason: 'Recovered before this alert was sent; no extra model wakeup.' });
     }
   }
@@ -227,8 +273,8 @@ function watch(broker, send, options = {}) {
           const job = broker.get(id), rows = notificationEvents(broker.jobPath(id));
           // Worker status is saved before its terminal outbox event. Do not retire
           // that job in the gap, or a lost final callback will bypass reconciliation.
-          const settled = terminal.has(job.status) && (job.notification_schema !== 2 || rows.some(e => e.kind === 'terminal')) && rows.every(e => {
-            const f = e.file.replace(/\.json$/, '.delivery.json'); return fs.existsSync(f) && ['sent', 'accepted', 'superseded'].includes(read(f).state);
+          const settled = terminal.has(job.status) && ((job.notification_schema !== 2 && rows.length === 0) || rows.some(e => e.kind === 'terminal')) && rows.every(e => {
+            const f = e.file.replace(/\.json$/, '.delivery.json'); return fs.existsSync(f) && ['sent', 'accepted', 'superseded', 'suppressed'].includes(read(f).state);
           });
           if (settled) tracked.delete(id); else tracked.add(id);
         }
@@ -244,6 +290,7 @@ function watch(broker, send, options = {}) {
     if (closed) return;
     if (options.owns && !options.owns()) { close(); return; }
     try {
+      if (!watcher) attachWatch();
       // Read directory names for discovery, not every historical receipt every fifteen seconds.
       for (const id of fs.readdirSync(broker.jobs)) if (/^[a-f0-9]{24}$/.test(id) && !known.has(id)) { known.add(id); tracked.add(id); }
       const ids = new Set(tracked);
@@ -255,7 +302,7 @@ function watch(broker, send, options = {}) {
       heartbeat(); void drain();
     } catch (error) { health.watch_error = error.message; heartbeat(); process.stderr.write(`Local reconciliation: ${error.message}\n`); }
   };
-  watcher = fs.watch(broker.jobs, { recursive: true }, (_event, name) => {
+  const onChange = (_event, name) => {
     if (!name) { reconcile(); return; }
     const parts = String(name).split(/[\\/]/);
     if (/^[a-f0-9]{24}$/.test(parts[0]) && ((parts.length === 2 && ['notice.json', 'job.json', 'events.jsonl'].includes(parts[1])) || (parts.length === 3 && parts[1] === 'notifications' && /^\d{8}\.json$/.test(parts[2])))) {
@@ -264,15 +311,30 @@ function watch(broker, send, options = {}) {
       if (parts[1] === 'notifications') { try { urgent = read(path.join(broker.jobs, String(name))).kind === 'terminal'; } catch {} }
       schedule(parts[0], urgent ? 0 : 300, urgent);
     }
-  });
+  };
+  const watchFailed = error => {
+    const changed = health.watch_error !== error.message;
+    health.watch_error = error.message; health.watch_online = false;
+    watcher?.close(); watcher = null;
+    heartbeat(); // Local reconciliation remains alive, even if reattachment also fails.
+    if (changed) process.stderr.write(`File watcher degraded; local reconciliation continues: ${error.message}\n`);
+  };
+  const attachWatch = () => {
+    try {
+      watcher = fs.watch(broker.jobs, { recursive: true }, onChange);
+      watcher.on('error', watchFailed);
+      if (health.watch_error) health.watch_recovered_at = new Date().toISOString();
+      health.watch_error = null; health.watch_online = true;
+    } catch (error) { watchFailed(error); }
+  };
+  attachWatch();
   // Subscribe before recovery scan, so completion during startup cannot be missed.
   for (const name of fs.readdirSync(broker.jobs)) if (/^[a-f0-9]{24}$/.test(name)) { known.add(name); tracked.add(name); pending.add(name); }
-  const close = () => { if (closed) return; closed = true; watcher.close(); clearInterval(interval); for (const timer of timers.values()) clearTimeout(timer); timers.clear(); heartbeat(); };
-  watcher.on('error', error => { health.watch_error = error.message; close(); });
+  const close = () => { if (closed) return; closed = true; watcher?.close(); watcher = null; clearInterval(interval); for (const timer of timers.values()) clearTimeout(timer); timers.clear(); heartbeat(); };
   interval = setInterval(reconcile, health.interval_ms);
-  heartbeat(); void drain(); return { close, reconcile, on: (...args) => { watcher.on(...args); } };
+  heartbeat(); void drain(); return { close, reconcile };
 }
-module.exports = { originHook, deliver, watch, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, auditNotifications };
+module.exports = { originHook, deliver, watch, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
 if (require.main === module) {
   if (process.argv[2] === '--origin-hook') {
     let input = '';
@@ -300,7 +362,7 @@ if (require.main === module) {
       const watchers = projects.map(p => watch(new Broker(p), (recipient, message) => nativeSend(executable, recipient, message), { generation, owns: owner.owns, reconcile: event => recordedReceipt(eventDirectory, event) }));
       save(path.join(settings.data, 'notification-host.json'), { ...owner.host, projects: projects.map(p => p.project), watcher_count: watchers.length });
       const ownership = fs.watch(settings.data, (_event, name) => { if (String(name) === 'notification-host.json' && !owner.owns()) { for (const w of watchers) w.close(); ownership.close(); } });
-      for (const watcher of watchers) watcher.on('error', error => { process.stderr.write(error.stack + '\n'); process.exitCode = 1; for (const w of watchers) w.close(); ownership.close(); });
+      ownership.on('error', error => { process.stderr.write(`Ownership watcher degraded; periodic fencing remains active: ${error.message}\n`); ownership.close(); });
       for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { for (const w of watchers) w.close(); ownership.close(); });
     } catch (error) { process.stderr.write(error.message + '\n'); process.exitCode = error.duplicate ? 0 : 1; }
   }
