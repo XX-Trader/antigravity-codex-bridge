@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
-const { Broker, inside, terminal } = require('./server.cjs');
+const { Broker, inside, terminal, executionSandbox } = require('./server.cjs');
 const real = p => fs.realpathSync(p);
 const same = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
 const executionTools = ['run_command', 'manage_task', 'send_command_input', 'command_status', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'apply_patch', 'edit_file', 'write_file', 'invoke_subagent', 'define_subagent', 'manage_subagents', 'spawn_agent', 'spawn_subagent', 'delegate_task', 'send_message', 'schedule'];
@@ -42,6 +42,8 @@ function bindOrigin(payload, projects) {
   cwd ||= scopes[0].project;
   const overwrite = { cwd };
   if (tool === 'codex_run') {
+    try { executionSandbox(args, scopes.find(p => inside(p.project, cwd))); }
+    catch (error) { return { decision: 'deny', reason: error.message }; }
     if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(payload.conversationId || '')) return { decision: 'deny', reason: '缺少真实发起会话 ID。' };
     overwrite.conversation_id = payload.conversationId;
   }

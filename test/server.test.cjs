@@ -102,7 +102,9 @@ if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { '{"type":"item.started","i
 if ($prompt.Contains('LATE_ERROR_FIXTURE')) { '{"type":"turn.failed","error":{"message":"final failure"}}' }
 exit 0
 `, 'utf8');
-  const settings = config({ CODEX_EXECUTOR_PROJECT: project, CODEX_EXECUTOR_DATA: data, CODEX_EXECUTOR_ENTRY: entry, CODEX_EXECUTOR_PWSH: process.env.CODEX_EXECUTOR_PWSH });
+  // Legacy isolation coverage opts in locally; production defaults are tested separately below.
+  const baseEnv = { CODEX_EXECUTOR_PROJECT: project, CODEX_EXECUTOR_DATA: data, CODEX_EXECUTOR_ENTRY: entry, CODEX_EXECUTOR_PWSH: process.env.CODEX_EXECUTOR_PWSH };
+  const settings = config({ ...baseEnv, CODEX_EXECUTOR_ALLOW_SANDBOX: '1' });
   const broker = new Broker(settings);
   try {
     await t.test('schema and project/sandbox/input boundaries', () => {
@@ -145,6 +147,36 @@ exit 0
       assert.equal(new Broker(settings).status(first.job_id).thread_id, '00000000-0000-0000-0000-000000000001');
       assert.ok(result.paths.events.startsWith(data));
     });
+    await t.test('host-only dispatch rejects sandbox overrides before admission, including native and legacy continuations', async () => {
+      const hostSettings = config(baseEnv), host = new Broker(hostSettings);
+      assert.equal(hostSettings.allow_sandbox, false);
+      assert.throws(() => config({ ...baseEnv, CODEX_EXECUTOR_ALLOW_SANDBOX: 'true' }), /ALLOW_SANDBOX/);
+      assert.equal(config({ ...baseEnv, CODEX_EXECUTOR_ALLOW_SANDBOX: '0' }).allow_sandbox, false);
+      for (const tool of dispatch(host, { method: 'tools/list' }).tools.filter(t => ['codex_run', 'codex_start', 'codex_continue'].includes(t.name))) {
+        assert.equal(tool.inputSchema.properties.sandbox, undefined);
+      }
+      const before = host.list().length;
+      let lookups = 0; host.metadataCall = async () => { lookups++; throw Error('Unexpected metadata lookup'); };
+      for (const sandbox of ['read-only', 'workspace-write']) {
+        assert.throws(() => host.start({ prompt: '只读诊断，不重启客户端', sandbox }), /宿主机/);
+        for (const identity of [{}, { topic_id: first.topic_id }, { session_id: '00000000-0000-0000-0000-000000000099' }]) {
+          const reply = await dispatch(host, { method: 'tools/call', params: { name: 'codex_run', arguments: { prompt: '只读诊断，不重启客户端', sandbox, ...identity } } });
+          assert.equal(reply.isError, true); assert.match(reply.content[0].text, /宿主机/);
+        }
+        for (const name of ['codex_start', 'codex_continue']) {
+          const reply = dispatch(host, { method: 'tools/call', params: { name, arguments: { job_id: first.job_id, prompt: '只读诊断', sandbox } } });
+          assert.equal(reply.isError, true); assert.match(reply.content[0].text, /宿主机/);
+        }
+      }
+      assert.equal(lookups, 0); assert.equal(host.list().length, before);
+      // An old isolated session resumes on the host without inheriting its previous sandbox.
+      const result = await host.run({ wait: true, prompt: '只读诊断，不改文件，不重启客户端。中文参数', topic_id: first.topic_id });
+      assert.equal(result.status, 'completed'); assert.equal(result.sandbox, 'danger-full-access');
+      assert.equal(result.execution_environment, 'host'); assert.equal(result.session_id, host.get(first.job_id).thread_id);
+      assert.match(result.final_response, /sandbox=danger-full-access/);
+      assert.equal(host.status(first.job_id).execution_environment, 'sandbox');
+      assert.equal(host.get(first.job_id).sandbox, 'read-only');
+    });
     await t.test('same worktree runs eight independent workers; cancelling one leaves seven recoverable', async () => {
       const jobs = Array.from({ length: 8 }, (_, n) => broker.start({ prompt: 'CONCURRENT_FIXTURE 中文参数 ' + n, topic: '并发独立任务' + n }));
       assert.equal(new Set(jobs.map(j => j.topic_id)).size, 8);
@@ -172,9 +204,11 @@ exit 0
     await t.test('full access and live search are the unattended default, explicit narrowing remains available', async () => {
       const full = await broker.run({ wait: true, prompt: '中文参数' });
       assert.equal(full.sandbox, 'danger-full-access'); assert.equal(full.web_search, 'live');
+      assert.equal(full.execution_environment, 'host');
       assert.match(full.final_response, /sandbox=danger-full-access web_live=True/);
       const narrow = await broker.run({ wait: true, prompt: '中文参数', session_id: full.session_id, sandbox: 'read-only' });
       assert.equal(narrow.sandbox, 'read-only'); assert.equal(narrow.session_id, full.session_id);
+      assert.equal(narrow.execution_environment, 'sandbox');
       assert.match(narrow.final_response, /sandbox=read-only web_live=True/);
       const continued = await broker.run({ wait: true, prompt: '中文参数', topic_id: narrow.topic_id });
       assert.equal(continued.sandbox, 'danger-full-access'); assert.equal(continued.session_id, full.session_id);

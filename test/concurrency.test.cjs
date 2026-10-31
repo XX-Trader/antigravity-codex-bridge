@@ -73,6 +73,14 @@ test('wrapped native MCP calls preserve arguments and bind the real originating 
   assert.equal(result.overwrite.Arguments.prompt, 'keep me'); assert.equal(result.overwrite.Arguments.wait, false);
   assert.equal(result.overwrite.Arguments.conversation_id, conversationId); assert.equal(result.overwrite.Arguments.cwd, f.project);
   assert.equal(result.overwrite.ServerName, undefined); assert.equal(result.decision, 'allow');
+  assert.equal(result.overwrite.Arguments.sandbox, undefined);
+  for (const sandbox of ['read-only', 'workspace-write']) {
+    const restricted = { ...payload, toolCall: { ...payload.toolCall, args: { ...payload.toolCall.args, Arguments: { prompt: '只读诊断，不改文件', sandbox } } } };
+    const denied = bindOrigin(restricted, [{ project: f.project, data: f.data }]);
+    assert.equal(denied.decision, 'deny'); assert.match(denied.reason, /宿主机/);
+    const allowed = bindOrigin(restricted, [{ project: f.project, data: f.data, allow_sandbox: true }]);
+    assert.equal(allowed.decision, 'allow'); assert.equal(allowed.overwrite.Arguments.sandbox, sandbox);
+  }
   assert.equal(bindOrigin({ ...payload, toolCall: { name: 'mcp_codex-subagent_codex_run', args: { prompt: 'legitimate Codex dispatch' } } }, [{ project: f.project, data: f.data }]).decision, 'allow');
 });
 test('Antigravity native execution/subagents are denied only in registered projects, Codex dispatch is allowed', t => {
