@@ -16,6 +16,47 @@ function fixture(t) {
   const settings = { project, data, entry: process.execPath, pwsh: process.execPath, model_aliases: {} };
   return { root, project, data, settings, broker: new Broker(settings) };
 }
+test('verbatim user text is distinct from the plan, immutable and retained across old-parent continuation', t => {
+  const f = fixture(t), raw = '  用户原文\r\n必须用原方案，不要换成省事方案。\n';
+  const first = f.broker.start({ prompt: '规划摘要 A', user_request: raw });
+  const finish = id => { const job = f.broker.get(id); save(f.broker.jobPath(id), { ...job, status: 'completed', thread_id: '12345678-1234-1234-1234-123456789abc' }); f.broker.unlock(id); };
+  finish(first.job_id);
+  assert.equal(f.broker.get(first.job_id).request_context.original_text, raw);
+  assert.equal(first.request_context.original_sha256, require('node:crypto').createHash('sha256').update(raw).digest('hex'));
+  assert.equal(JSON.stringify(first).includes('必须用原方案'), false, 'Summary must not repeat private source text');
+  const second = f.broker.start({ prompt: '规划摘要 B', parent_job_id: first.job_id, user_followup: ' 用户确认：先做 A。\n' }); finish(second.job_id);
+  const restarted = new Broker(f.settings), count = restarted.list().length;
+  assert.throws(() => restarted.start({ prompt: '改成省事方案', parent_job_id: first.job_id, user_request: '偷偷换目标' }), /Cannot replace user_request/);
+  assert.equal(restarted.list().length, count);
+  const response = dispatch(restarted, { method: 'tools/call', params: { name: 'codex_continue', arguments: { job_id: first.job_id, prompt: '摘要 C', user_request: raw, user_followup: '第二次补充' } } });
+  assert.notEqual(response.isError, true);
+  const third = JSON.parse(response.content[0].text), saved = restarted.get(third.job_id);
+  assert.equal(saved.request_context.original_text, raw);
+  assert.deepEqual(saved.request_context.followups.map(row => row.text), [' 用户确认：先做 A。\n', '第二次补充']);
+  assert.equal(saved.request_context.original_job_id, first.job_id);
+  assert.equal(restarted.result(first.job_id).request_context.followup_count, 0, 'Earlier receipts stay historical');
+  assert.equal(restarted.status(third.job_id).request_context.followup_count, 2);
+});
+test('missing originals are not invented; invalid or oversized source text is rejected, never truncated', t => {
+  const f = fixture(t);
+  for (const key of ['user_request', 'user_followup']) for (const value of [null, 1, '', '   ', 'x'.repeat(60001)]) assert.throws(() => f.broker.start({ prompt: '摘要', [key]: value }), /1..60000/);
+  assert.equal(f.broker.list().length, 0);
+  const legacy = f.broker.start({ prompt: '仅旧摘要' });
+  assert.equal(legacy.request_context.source, 'not_provided');
+  assert.equal(f.broker.get(legacy.job_id).request_context.original_text, null);
+  const large = f.broker.start({ prompt: '摘要', user_request: 'a'.repeat(60000), user_followup: 'b'.repeat(60000) });
+  save(f.broker.jobPath(large.job_id), { ...f.broker.get(large.job_id), status: 'completed' }); f.broker.unlock(large.job_id);
+  assert.throws(() => f.broker.start({ prompt: '新摘要', topic_id: large.topic_id, user_followup: 'c' }), /120000/);
+  assert.equal(f.broker.get(large.job_id).request_context.followups[0].text.length, 60000);
+});
+test('all execution entry schemas expose original and followup separately from the plan', t => {
+  const f = fixture(t), schema = dispatch(f.broker, { method: 'tools/list' });
+  for (const name of ['codex_run', 'codex_start', 'codex_continue']) {
+    const properties = schema.tools.find(tool => tool.name === name).inputSchema.properties;
+    assert.equal(properties.user_request.type, 'string'); assert.equal(properties.user_followup.type, 'string');
+    assert.equal(properties.prompt.type, 'string');
+  }
+});
 test('same-worktree admission has no numeric running-task cap, active listing exceeds twenty', t => {
   const f = fixture(t), jobs = Array.from({ length: 64 }, (_, n) => f.broker.start({ prompt: 'independent task ' + n }));
   assert.equal(new Set(jobs.map(j => j.job_id)).size, 64); assert.equal(new Set(jobs.map(j => j.topic_id)).size, 64);

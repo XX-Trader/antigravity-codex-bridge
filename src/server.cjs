@@ -49,6 +49,27 @@ function capacityDelay(until, dir) {
 }
 const stamp = () => new Date().toISOString();
 const read = file => JSON.parse(fs.readFileSync(file, 'utf8'));
+function requestContext(input, parent, id) {
+  for (const key of ['user_request', 'user_followup']) {
+    if (input[key] !== undefined && (typeof input[key] !== 'string' || !input[key].trim() || input[key].length > 60000)) throw new Error(key + ' must contain 1..60000 characters; preserve the text verbatim');
+  }
+  const previous = parent?.request_context;
+  const original = previous?.original_text ?? null;
+  if (original !== null && input.user_request !== undefined && input.user_request !== original) throw new Error('Cannot replace user_request for the same matter/session; append the user\'s actual new words in user_followup, not a rewritten goal');
+  const text = original ?? input.user_request ?? null;
+  const followups = (previous?.followups || []).map(row => ({ ...row }));
+  if (input.user_followup !== undefined) followups.push({ job_id: id, text: input.user_followup });
+  if ((text?.length || 0) + followups.reduce((n, row) => n + row.text.length, 0) > 120000) throw new Error('User request history exceeds 120000 characters; do not silently truncate or replace it');
+  return { source: text === null ? 'not_provided' : 'caller_supplied', original_text: text,
+    original_job_id: original !== null ? previous.original_job_id : text === null ? null : id,
+    original_sha256: text === null ? null : crypto.createHash('sha256').update(text, 'utf8').digest('hex'), followups };
+}
+function requestContextSummary(job) {
+  const context = job.request_context;
+  return { source: context?.source || 'not_provided', original_job_id: context?.original_job_id || null,
+    original_sha256: context?.original_sha256 || null, followup_count: context?.followups?.length || 0,
+    note: 'Caller-supplied text is preserved separately from the plan; this is not independent proof of human authorship or approval. Read paths.job for exact text.' };
+}
 function finalHandoff(text = '') {
   const match = text.trimStart().match(/^\[CODEX_(NEEDS_INPUT|BLOCKED|BACKGROUND_RUNNING)\]\s*([\s\S]*)$/);
   if (!match) return null;
@@ -352,7 +373,7 @@ class Broker {
     } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
   summary(job) {
-    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title', 'notification_error', 'concurrency', 'handoff', 'execution_state', 'verification_state', 'background_commands'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), execution_environment: job.sandbox === 'danger-full-access' ? 'host' : 'sandbox', chat: chatAccess(job.thread_id), notification: job.job_id ? notificationSummary(this.jobPath(job.job_id)) : null, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
+    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title', 'notification_error', 'concurrency', 'handoff', 'execution_state', 'verification_state', 'background_commands'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), request_context: requestContextSummary(job), execution_environment: job.sandbox === 'danger-full-access' ? 'host' : 'sandbox', chat: chatAccess(job.thread_id), notification: job.job_id ? notificationSummary(this.jobPath(job.job_id)) : null, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
   }
   start(input, resumption = null) {
     if (process.env.CODEX_EXECUTOR_CHILD === '1') throw new Error('Recursive Codex delegation is disabled');
@@ -385,14 +406,20 @@ class Broker {
     for (let n = 0; n < 100 && !release; n++) { release = takeFileClaim(path.join(this.settings.data, 'dispatch.claim')); if (!release) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
     if (!release) throw new Error('Task admission is busy; no task submitted. This is not a running-task limit.');
     try {
-      const duplicate = this.list(Number.MAX_SAFE_INTEGER).find(j => !terminal.has(j.status) && (j.topic_id === topicId || (sessionId && j.thread_id === sessionId)));
+      const jobs = this.list(Number.MAX_SAFE_INTEGER);
+      const duplicate = jobs.find(j => !terminal.has(j.status) && (j.topic_id === topicId || (sessionId && j.thread_id === sessionId)));
       if (duplicate) throw new Error(`This matter/session is already running: ${duplicate.job_id}; no duplicate turn submitted`);
+      const contextHead = jobs.filter(j => j.topic_id === topicId || (sessionId && j.thread_id === sessionId)).sort((a, b) =>
+        Number(b.request_context?.source === 'caller_supplied') - Number(a.request_context?.source === 'caller_supplied') ||
+        (b.request_context?.followup_count || 0) - (a.request_context?.followup_count || 0))[0];
+      const contextParent = contextHead ? this.get(contextHead.job_id) : parent || topicParent;
+      const request_context = requestContext(input, contextParent, id);
       fs.mkdirSync(this.lock, { recursive: true });
       fs.writeFileSync(path.join(this.lock, `${id}.json`), JSON.stringify({ job_id: id }), { flag: 'wx' });
       fs.mkdirSync(dir);
       const job = {
         job_id: id, status: 'queued', created_at: stamp(), cwd, sandbox,
-        prompt: input.prompt, timeout_seconds: input.timeout_seconds || 3600,
+        prompt: input.prompt, request_context, timeout_seconds: input.timeout_seconds || 3600,
         settings: taskSettings, concurrency: 'unlimited', notification_schema: 2, topic_id: topicId, topic: parent?.topic || topicParent?.topic || input.topic?.trim() || taskTitle({ prompt: input.prompt }),
         ...(input.conversation_id ? { conversation_id: input.conversation_id } : {}),
         ...(parent ? { parent_job_id: parent.job_id, thread_id: parent.thread_id, ...(parent.chat_title ? { chat_title: parent.chat_title } : {}) } : {}),
@@ -447,7 +474,7 @@ class Broker {
       model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6), ...(job.capacity_retry_at ? { capacity_retry_at: job.capacity_retry_at } : {}),
       ...(job.conversation_id ? { conversation_id: job.conversation_id } : {}),
       exit_code: job.exit_code ?? null, ...(job.error ? { error: job.error } : {}),
-      handoff: job.handoff || null, execution_state: job.execution_state || (terminal.has(job.status) ? 'cli_finished' : 'running'), verification_state: job.verification_state || 'not_verified', background_commands: job.background_commands || [],
+      request_context: requestContextSummary(job), handoff: job.handoff || null, execution_state: job.execution_state || (terminal.has(job.status) ? 'cli_finished' : 'running'), verification_state: job.verification_state || 'not_verified', background_commands: job.background_commands || [],
       final_response: tail(resultFile, 8000), result_truncated: size > 8000,
       progress: latestProgress(path.join(dir, 'events.jsonl')), notification: notificationSummary(this.jobPath(id)),
       ...(usage ? { usage } : {}),
@@ -657,12 +684,16 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
 
 const object = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
 const idSchema = { type: 'string', description: 'The exact job_id returned by codex_run or a prior bridge job' };
+const requestFields = {
+  user_request: { type: 'string', minLength: 1, maxLength: 60000, description: 'Verbatim human request, separate from prompt (the planner summary/implementation advice). Supply on new matters. Immutable once captured; omit or repeat exactly on continuation. Never invent missing original text.' },
+  user_followup: { type: 'string', minLength: 1, maxLength: 60000, description: 'Verbatim new human clarification/decision, appended to the saved request history. Not a replacement summary or evidence of approval by itself.' }
+};
 const tools = [
-  { name: 'codex_run', description: 'Start one matter in the host current-user environment and return immediately by default, leaving Antigravity free for normal chat. Read-only diagnostics are prompt constraints, not a sandbox choice. Antigravity plans/reviews only: commands, edits, tests and execution belong to Codex. If subagents are needed, request Codex-native subagents in the prompt, never Antigravity native subagents. Pass an available model ID or a locally configured alias when needed; otherwise inherit Codex configuration. Reasoning defaults to Medium. Reuse topic_id only for the same matter; another subject needs a new topic. Independent matters may run concurrently in the same worktree without a numeric task cap. Ask the user worktree versus waiting for tightly coupled/overlapping work. No auto-upgrade, timers or polling. wait=true only if the user explicitly wants to wait.', inputSchema: object({ prompt: { type: 'string' }, topic: { type: 'string', maxLength: 120, description: 'Concrete execution task shown as the native Codex chat title, not a generic executor identity or the whole Antigravity conversation' }, topic_id: { type: 'string', description: 'Returned matter ID for same-topic continuation; omit for a different matter' }, model: { type: 'string', description: 'Available model ID or locally configured alias. Omit to inherit the configured Codex model; same-topic continuation retains an explicit prior choice.' }, reasoning_effort: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Default medium; do not increase automatically' }, wait: { type: 'boolean', default: false, description: 'False returns background acknowledgment. True waits for completion and can occupy this chat turn.' }, cwd: { type: 'string' }, sandbox: { type: 'string', enum: sandboxModes, default: 'danger-full-access', description: 'Available only after local CODEX_EXECUTOR_ALLOW_SANDBOX=1 opt-in for user-requested isolation. Omit for host execution; read-only task constraints belong in prompt.' }, timeout_seconds: { type: 'integer', minimum: 30, maximum: 14400 }, session_id: { type: 'string', description: 'Exact Codex session ID, separate from Antigravity conversation_id; do not reuse it for an unrelated matter' }, conversation_id: { type: 'string', description: 'Optional actual originating Antigravity UUID. One chat may have many topic IDs; never invent an ID.' } }, ['prompt']) },
+  { name: 'codex_run', description: 'Start one matter in the host current-user environment and return immediately by default, leaving Antigravity free for normal chat. Read-only diagnostics are prompt constraints, not a sandbox choice. Antigravity plans/reviews only: commands, edits, tests and execution belong to Codex. If subagents are needed, request Codex-native subagents in the prompt, never Antigravity native subagents. Pass an available model ID or a locally configured alias when needed; otherwise inherit Codex configuration. Reasoning defaults to Medium. Reuse topic_id only for the same matter; another subject needs a new topic. Independent matters may run concurrently in the same worktree without a numeric task cap. Ask the user worktree versus waiting for tightly coupled/overlapping work. No auto-upgrade, timers or polling. wait=true only if the user explicitly wants to wait.', inputSchema: object({ ...requestFields, prompt: { type: 'string' }, topic: { type: 'string', maxLength: 120, description: 'Concrete execution task shown as the native Codex chat title, not a generic executor identity or the whole Antigravity conversation' }, topic_id: { type: 'string', description: 'Returned matter ID for same-topic continuation; omit for a different matter' }, model: { type: 'string', description: 'Available model ID or locally configured alias. Omit to inherit the configured Codex model; same-topic continuation retains an explicit prior choice.' }, reasoning_effort: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Default medium; do not increase automatically' }, wait: { type: 'boolean', default: false, description: 'False returns background acknowledgment. True waits for completion and can occupy this chat turn.' }, cwd: { type: 'string' }, sandbox: { type: 'string', enum: sandboxModes, default: 'danger-full-access', description: 'Available only after local CODEX_EXECUTOR_ALLOW_SANDBOX=1 opt-in for user-requested isolation. Omit for host execution; read-only task constraints belong in prompt.' }, timeout_seconds: { type: 'integer', minimum: 30, maximum: 14400 }, session_id: { type: 'string', description: 'Exact Codex session ID, separate from Antigravity conversation_id; do not reuse it for an unrelated matter' }, conversation_id: { type: 'string', description: 'Optional actual originating Antigravity UUID. One chat may have many topic IDs; never invent an ID.' } }, ['prompt']) },
   { name: 'codex_wait', description: 'Wait for an already submitted job and collect its receipt once. Used after interruption, never submit the task again or schedule polling. Closing this wait does not cancel Codex.', inputSchema: object({ job_id: idSchema }, ['job_id']) },
   { name: 'codex_sessions', description: 'Read a small page of current-project local Codex session IDs and brief titles and clickable native chat links, including exec/app-server tasks, without calling a model or reading full conversations. Select an exact session_id for codex_run; this does not switch, submit or run anything.', inputSchema: object({ cwd: { type: 'string', description: 'Explicit registered project root; required for multi-folder Antigravity projects' }, include_native: { type: 'boolean', default: true }, cursor: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 20, default: 10 } }) },
-  { name: 'codex_start', description: 'Delegate a concrete task to the real local Codex CLI in the host current-user environment. Returns immediately with job_id. Codex performs commands, edits and tests; do not submit duplicate jobs. Local saved Codex login is reused.', inputSchema: object({ prompt: { type: 'string', description: 'Goal, evidence/context, scope, constraints, acceptance checks and authorization boundaries' }, cwd: { type: 'string', description: 'Absolute working directory within the configured project; defaults to project root' }, sandbox: { type: 'string', enum: sandboxModes, default: 'danger-full-access' }, timeout_seconds: { type: 'integer', minimum: 30, maximum: 14400, default: 3600 } }, ['prompt']) },
-  { name: 'codex_continue', description: 'Continue the exact Codex session of a finished job. Retains original cwd; the next turn uses the host environment by default; isolation requires local configuration opt-in. Never resumes an arbitrary most-recent thread.', inputSchema: object({ job_id: idSchema, prompt: { type: 'string' }, sandbox: { type: 'string', enum: sandboxModes, description: 'User-requested isolation only after local CODEX_EXECUTOR_ALLOW_SANDBOX=1 opt-in; omission uses the host environment' } }, ['job_id', 'prompt']) },
+  { name: 'codex_start', description: 'Delegate a concrete task to the real local Codex CLI in the host current-user environment. Returns immediately with job_id. Codex performs commands, edits and tests; do not submit duplicate jobs. Local saved Codex login is reused.', inputSchema: object({ ...requestFields, prompt: { type: 'string', description: 'Goal, evidence/context, scope, constraints, acceptance checks and authorization boundaries' }, cwd: { type: 'string', description: 'Absolute working directory within the configured project; defaults to project root' }, sandbox: { type: 'string', enum: sandboxModes, default: 'danger-full-access' }, timeout_seconds: { type: 'integer', minimum: 30, maximum: 14400, default: 3600 } }, ['prompt']) },
+  { name: 'codex_continue', description: 'Continue the exact Codex session of a finished job. Retains original cwd; the next turn uses the host environment by default; isolation requires local configuration opt-in. Never resumes an arbitrary most-recent thread.', inputSchema: object({ ...requestFields, job_id: idSchema, prompt: { type: 'string' }, sandbox: { type: 'string', enum: sandboxModes, description: 'User-requested isolation only after local CODEX_EXECUTOR_ALLOW_SANDBOX=1 opt-in; omission uses the host environment' } }, ['job_id', 'prompt']) },
   { name: 'codex_status', description: 'Read persisted process state without waiting. completed means the CLI turn ended normally, not that acceptance checks passed; inspect codex_result evidence. A running job is not complete.', inputSchema: object({ job_id: idSchema }, ['job_id']) },
   { name: 'codex_result', description: 'Collect the original compact receipt once on a CODEX_EVENT or explicit result request. Return the native Codex chat link to the user for full saved history in VS Code, also after restart. Default codex_run returns only a background acknowledgment. No polling or duplicate reads; diagnostics=true is only for original log tails.', inputSchema: object({ job_id: idSchema, diagnostics: { type: 'boolean', default: false }, sync_title: { type: 'boolean', default: false, description: 'Explicitly repair the task title of a finished bridge-owned session. Preserves user-defined titles and never executes the task again.' } }, ['job_id']) },
   { name: 'codex_cancel', description: 'Ask the owned worker to terminate only its Codex child process tree. Does not roll back any edits. Wait for a terminal status before continuing the same matter/session; independent jobs are unaffected.', inputSchema: object({ job_id: idSchema }, ['job_id']) },
@@ -692,7 +723,7 @@ function dispatch(broker, request, signal) {
       case 'codex_start': value = broker.start(args); break;
       case 'codex_continue': {
         const parent = broker.get(args.job_id);
-        value = broker.start({ prompt: args.prompt, cwd: parent.cwd, sandbox: args.sandbox, parent_job_id: args.job_id }); break;
+        value = broker.start({ prompt: args.prompt, user_request: args.user_request, user_followup: args.user_followup, cwd: parent.cwd, sandbox: args.sandbox, parent_job_id: args.job_id }); break;
       }
       case 'codex_status': value = broker.status(args.job_id); break;
       case 'codex_result': value = broker.result(args.job_id, args.diagnostics === true); break;

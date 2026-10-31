@@ -77,7 +77,10 @@ $fast = ($argv -contains 'service_tier="fast"') -and ($argv -contains 'features.
 $si = [Array]::IndexOf($argv, '--sandbox')
 $liveWeb = $argv -contains 'web_search="live"'
 $nativeAgents = $argv -contains 'features.multi_agent=true'
+$acceptanceContract = $prompt.Contains('逐项验收') -and $prompt.Contains('假设与证实根因分开报告') -and $prompt.Contains('一次只提出一个阻塞问题') -and $prompt.Contains('普通追问、补充信息或另一个独立任务不表示取消本事项')
 $text = 'FAKE_OK resume=' + ($argv -contains 'resume') + ' unicode=' + $prompt.Contains('中文参数') + ' model=' + $argv[$mi+1] + ' effort=' + ($ec -join ',') + ' fast=' + $fast + ' sandbox=' + $argv[$si+1] + ' web_live=' + $liveWeb + ' native_subagents=' + $nativeAgents
+$text += ' acceptance_contract=' + $acceptanceContract
+$text += ' original_request=' + $prompt.Contains('USER_ORIGINAL_SENTINEL') + ' user_followup=' + $prompt.Contains('USER_FOLLOWUP_SENTINEL')
 if ($prompt.Contains('NEEDS_INPUT_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT] 请确认选择A还是B' }
 if ($prompt.Contains('STRUCTURED_QUESTION_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT]' + [Environment]::NewLine + '{"question":"选择工作树还是等待？","options":["工作树：隔离修改","等待：复用目录"],"recommendation":"等待","completed":"已定位文件范围"}' }
 if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { $text = '[CODEX_BACKGROUND_RUNNING] 测试命令 test-pending 退出结果未确认，请勿重跑。' }
@@ -136,12 +139,15 @@ exit 0
     });
     let first;
     await t.test('background completion, UTF-8 and restart-safe reads', async () => {
-      first = broker.start({ prompt: '中文参数', sandbox: 'read-only' });
+      first = broker.start({ prompt: '中文参数', user_request: 'USER_ORIGINAL_SENTINEL 原文：不要偷偷换路线。', sandbox: 'read-only' });
       await assert.rejects(broker.run({ prompt: 'duplicate', topic_id: first.topic_id }), /still running/);
       const result = await finished(broker, first.job_id);
       assert.equal(result.status, 'completed'); assert.equal(result.exit_code, 0);
       assert.match(result.final_response, /resume=False unicode=True/);
       assert.match(result.final_response, /native_subagents=True/);
+      assert.match(result.final_response, /acceptance_contract=True/);
+      assert.match(result.final_response, /original_request=True user_followup=False/);
+      assert.equal(result.request_context.source, 'caller_supplied');
       assert.equal(result.chat_title.status, 'set'); assert.equal(result.chat_title.name, '中文参数');
       assert.equal(fs.readFileSync(path.join(project, '.fake-title-' + result.session_id + '.txt'), 'utf8'), '中文参数');
       assert.equal(new Broker(settings).status(first.job_id).thread_id, '00000000-0000-0000-0000-000000000001');
@@ -170,10 +176,13 @@ exit 0
       }
       assert.equal(lookups, 0); assert.equal(host.list().length, before);
       // An old isolated session resumes on the host without inheriting its previous sandbox.
-      const result = await host.run({ wait: true, prompt: '只读诊断，不改文件，不重启客户端。中文参数', topic_id: first.topic_id });
+      const result = await host.run({ wait: true, prompt: '只读诊断，不改文件，不重启客户端。中文参数', user_followup: 'USER_FOLLOWUP_SENTINEL 我确认只读诊断。', topic_id: first.topic_id });
       assert.equal(result.status, 'completed'); assert.equal(result.sandbox, 'danger-full-access');
       assert.equal(result.execution_environment, 'host'); assert.equal(result.session_id, host.get(first.job_id).thread_id);
       assert.match(result.final_response, /sandbox=danger-full-access/);
+      assert.match(result.final_response, /acceptance_contract=True/);
+      assert.match(result.final_response, /original_request=True user_followup=True/);
+      assert.equal(result.request_context.followup_count, 1);
       assert.equal(host.status(first.job_id).execution_environment, 'sandbox');
       assert.equal(host.get(first.job_id).sandbox, 'read-only');
     });
