@@ -85,11 +85,13 @@ if ($prompt.Contains('NEEDS_INPUT_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT] 请�
 if ($prompt.Contains('STRUCTURED_QUESTION_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT]' + [Environment]::NewLine + '{"question":"选择工作树还是等待？","options":["工作树：隔离修改","等待：复用目录"],"recommendation":"等待","completed":"已定位文件范围"}' }
 if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { $text = '[CODEX_BACKGROUND_RUNNING] 测试命令 test-pending 退出结果未确认，请勿重跑。' }
 if ($prompt.Contains('BLOCKED_FIXTURE')) { $text = '[CODEX_BLOCKED] 方案与当前代码矛盾' }
+if ($prompt.Contains('PLAN_REJECTED_FIXTURE')) { $text = '[CODEX_PLAN_REJECTED]' + [Environment]::NewLine + '{"original_plan":"直接播放","reason":"缺少画面显示通路","impact":"原目标未完成","question":"补齐还是改方案？","options":["补齐原方案","修改目标"]}' }
 [IO.File]::WriteAllText($argv[$i+1], $text, [Text.UTF8Encoding]::new($false))
 $tid = '00000000-0000-0000-0000-000000000001'
 if ($argv -contains 'resume') { $tid = $argv[[Array]::IndexOf($argv, 'resume')+1] }
 elseif ($prompt.Contains('SECOND_SESSION')) { $tid = '00000000-0000-0000-0000-000000000002' }
 elseif ($prompt.Contains('TITLE_METADATA_ERROR')) { $tid = '00000000-0000-0000-0000-000000000004' }
+elseif ($prompt.Contains('PLAN_REJECTED_FIXTURE')) { $tid = '00000000-0000-0000-0000-000000000005' }
 elseif ($prompt.Contains('CONCURRENT_FIXTURE')) { $tid = [guid]::NewGuid().ToString() }
 '{"type":"thread.started","thread_id":"' + $tid + '"}'
 if ($prompt.Contains('RECOVERED_ERROR_FIXTURE')) { '{"type":"error","message":"Reconnecting... 2/5 (request timed out)"}' }
@@ -103,6 +105,7 @@ if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { '{"type":"item.started","i
 '{"type":"item.completed","item":{"type":"agent_message","text":"FAKE_OK"}}'
 '{"type":"turn.completed"}'
 if ($prompt.Contains('LATE_ERROR_FIXTURE')) { '{"type":"turn.failed","error":{"message":"final failure"}}' }
+if ($prompt.Contains('NONZERO_REFUSAL_FIXTURE')) { exit 1 }
 exit 0
 `, 'utf8');
   // Legacy isolation coverage opts in locally; production defaults are tested separately below.
@@ -349,6 +352,20 @@ exit 0
         const kinds = notificationEvents(notices.jobPath(progress.job_id)).map(e => e.kind);
         assert.ok(kinds.includes('started')); assert.ok(kinds.includes('session_ready')); assert.ok(kinds.includes('phase_started')); assert.ok(kinds.includes('phase_finished'));
       } finally { watcher.close(); }
+    });
+    await t.test('real worker preserves plan refusal even on nonzero exit, gates continuation and accepts the saved human reply', async () => {
+      const refusalData = path.join(root, 'refusal-runtime'); fs.mkdirSync(refusalData);
+      const refused = new Broker({ ...settings, data: refusalData });
+      const result = await refused.run({ wait: true, prompt: 'PLAN_REJECTED_FIXTURE', topic: '方案拒绝交接', user_request: '不做整集转码' });
+      assert.equal(result.status, 'blocked'); assert.equal(result.handoff.requires_user_decision, true);
+      assert.equal(result.handoff.reason, '缺少画面显示通路');
+      await assert.rejects(new Broker(refused.settings).run({ prompt: '自行换方案', topic_id: result.topic_id }), /CODEX_USER_DECISION_REQUIRED/);
+      const continued = await refused.run({ wait: true, prompt: '继续补齐原方案', topic_id: result.topic_id, plan_decision: { refusal_job_id: result.job_id }, user_followup: '我选补齐，不要转码。' });
+      assert.equal(continued.status, 'completed'); assert.equal(continued.session_id, result.session_id);
+      assert.equal(continued.plan_decision.refusal_job_id, result.job_id);
+      const failed = await refused.run({ wait: true, prompt: 'PLAN_REJECTED_FIXTURE NONZERO_REFUSAL_FIXTURE', topic: '拒绝伴随退出错误' });
+      assert.equal(failed.exit_code, 1); assert.equal(failed.status, 'blocked'); assert.equal(failed.handoff.requires_user_decision, true);
+      assert.equal(failed.handoff.reason, '缺少画面显示通路');
     });
     await t.test('structured question resumes exact topic/session with user answer; background command is not verified', async () => {
       const paused = await broker.run({ wait: true, prompt: 'STRUCTURED_QUESTION_FIXTURE', topic: '选择题交接' });

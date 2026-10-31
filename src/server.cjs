@@ -71,16 +71,19 @@ function requestContextSummary(job) {
     note: 'Caller-supplied text is preserved separately from the plan; this is not independent proof of human authorship or approval. Read paths.job for exact text.' };
 }
 function finalHandoff(text = '') {
-  const match = text.trimStart().match(/^\[CODEX_(NEEDS_INPUT|BLOCKED|BACKGROUND_RUNNING)\]\s*([\s\S]*)$/);
+  const match = text.trimStart().match(/^\[CODEX_(NEEDS_INPUT|BLOCKED|PLAN_REJECTED|BACKGROUND_RUNNING)\]\s*([\s\S]*)$/);
   if (!match) return null;
-  const kind = { NEEDS_INPUT: 'needs_input', BLOCKED: 'blocked', BACKGROUND_RUNNING: 'background_running' }[match[1]];
+  const kind = { NEEDS_INPUT: 'needs_input', BLOCKED: 'blocked', PLAN_REJECTED: 'blocked', BACKGROUND_RUNNING: 'background_running' }[match[1]];
   const body = match[2].trim(); let structured;
   try { structured = JSON.parse(body.replace(/^```(?:json)?\s*|\s*```$/g, '')); } catch { /* Older workers return plain text; preserve it verbatim. */ }
   const handoff = { kind, text: body.slice(0, 8000) };
   if (structured && typeof structured === 'object' && !Array.isArray(structured)) {
-    for (const key of ['question', 'recommendation', 'completed', 'reason']) if (typeof structured[key] === 'string') handoff[key] = structured[key].slice(0, 3000);
+    for (const key of ['question', 'recommendation', 'completed', 'reason', 'original_plan', 'impact']) if (typeof structured[key] === 'string') handoff[key] = structured[key].slice(0, 3000);
     if (Array.isArray(structured.options)) handoff.options = structured.options.filter(v => typeof v === 'string').slice(0, 12).map(v => v.slice(0, 1000));
   }
+  // Explicit refusal is not an implementation error the planner may silently repair.
+  // Older plain-text BLOCKED output is conservative; the full result remains on disk.
+  if (kind === 'blocked' || structured?.decision_scope === 'plan') handoff.requires_user_decision = true;
   return handoff;
 }
 function save(file, value) {
@@ -373,7 +376,7 @@ class Broker {
     } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
   summary(job) {
-    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title', 'notification_error', 'concurrency', 'handoff', 'execution_state', 'verification_state', 'background_commands'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), request_context: requestContextSummary(job), execution_environment: job.sandbox === 'danger-full-access' ? 'host' : 'sandbox', chat: chatAccess(job.thread_id), notification: job.job_id ? notificationSummary(this.jobPath(job.job_id)) : null, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
+    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title', 'notification_error', 'concurrency', 'handoff', 'plan_decision', 'execution_state', 'verification_state', 'background_commands'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), request_context: requestContextSummary(job), execution_environment: job.sandbox === 'danger-full-access' ? 'host' : 'sandbox', chat: chatAccess(job.thread_id), notification: job.job_id ? notificationSummary(this.jobPath(job.job_id)) : null, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
   }
   start(input, resumption = null) {
     if (process.env.CODEX_EXECUTOR_CHILD === '1') throw new Error('Recursive Codex delegation is disabled');
@@ -409,7 +412,20 @@ class Broker {
       const jobs = this.list(Number.MAX_SAFE_INTEGER);
       const duplicate = jobs.find(j => !terminal.has(j.status) && (j.topic_id === topicId || (sessionId && j.thread_id === sessionId)));
       if (duplicate) throw new Error(`This matter/session is already running: ${duplicate.job_id}; no duplicate turn submitted`);
-      const contextHead = jobs.filter(j => j.topic_id === topicId || (sessionId && j.thread_id === sessionId)).sort((a, b) =>
+      const matterJobs = jobs.filter(j => j.topic_id === topicId || (sessionId && j.thread_id === sessionId));
+      const decided = new Set(matterJobs.map(j => j.plan_decision?.refusal_job_id).filter(Boolean));
+      const pending = matterJobs.filter(j => j.handoff?.requires_user_decision && !decided.has(j.job_id));
+      let plan_decision;
+      if (input.plan_decision !== undefined) {
+        const decision = input.plan_decision;
+        if (!decision || typeof decision !== 'object' || Array.isArray(decision) || Object.keys(decision).some(k => k !== 'refusal_job_id') || !/^[a-f0-9]{24}$/.test(decision.refusal_job_id || '')) throw new Error('plan_decision must identify one refusal_job_id');
+        if (!pending.some(j => j.job_id === decision.refusal_job_id)) throw new Error('plan_decision does not match an unresolved refusal in this matter/session');
+        if (typeof input.user_followup !== 'string' || !input.user_followup.trim()) throw new Error('plan_decision requires the actual human reply verbatim in user_followup; a planner summary is not approval');
+        plan_decision = { refusal_job_id: decision.refusal_job_id, reply_job_id: id };
+      }
+      const unresolved = pending.find(j => j.job_id !== plan_decision?.refusal_job_id);
+      if (unresolved) throw new Error(`[CODEX_USER_DECISION_REQUIRED] 执行端已明确拒绝/阻塞方案，必须先向用户反馈原计划、理由、影响和选择，不得静默换方案。refusal_job_id=${unresolved.job_id}; read codex_result once; after the user's reply pass plan_decision.refusal_job_id and verbatim user_followup. No task submitted.`);
+      const contextHead = matterJobs.sort((a, b) =>
         Number(b.request_context?.source === 'caller_supplied') - Number(a.request_context?.source === 'caller_supplied') ||
         (b.request_context?.followup_count || 0) - (a.request_context?.followup_count || 0))[0];
       const contextParent = contextHead ? this.get(contextHead.job_id) : parent || topicParent;
@@ -419,7 +435,7 @@ class Broker {
       fs.mkdirSync(dir);
       const job = {
         job_id: id, status: 'queued', created_at: stamp(), cwd, sandbox,
-        prompt: input.prompt, request_context, timeout_seconds: input.timeout_seconds || 3600,
+        prompt: input.prompt, request_context, ...(plan_decision ? { plan_decision } : {}), timeout_seconds: input.timeout_seconds || 3600,
         settings: taskSettings, concurrency: 'unlimited', notification_schema: 2, topic_id: topicId, topic: parent?.topic || topicParent?.topic || input.topic?.trim() || taskTitle({ prompt: input.prompt }),
         ...(input.conversation_id ? { conversation_id: input.conversation_id } : {}),
         ...(parent ? { parent_job_id: parent.job_id, thread_id: parent.thread_id, ...(parent.chat_title ? { chat_title: parent.chat_title } : {}) } : {}),
@@ -474,7 +490,7 @@ class Broker {
       model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6), ...(job.capacity_retry_at ? { capacity_retry_at: job.capacity_retry_at } : {}),
       ...(job.conversation_id ? { conversation_id: job.conversation_id } : {}),
       exit_code: job.exit_code ?? null, ...(job.error ? { error: job.error } : {}),
-      request_context: requestContextSummary(job), handoff: job.handoff || null, execution_state: job.execution_state || (terminal.has(job.status) ? 'cli_finished' : 'running'), verification_state: job.verification_state || 'not_verified', background_commands: job.background_commands || [],
+      request_context: requestContextSummary(job), handoff: job.handoff || null, plan_decision: job.plan_decision || null, execution_state: job.execution_state || (terminal.has(job.status) ? 'cli_finished' : 'running'), verification_state: job.verification_state || 'not_verified', background_commands: job.background_commands || [],
       final_response: tail(resultFile, 8000), result_truncated: size > 8000,
       progress: latestProgress(path.join(dir, 'events.jsonl')), notification: notificationSummary(this.jobPath(id)),
       ...(usage ? { usage } : {}),
@@ -662,7 +678,8 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       // The handoff marker is at the beginning, not in the UI's truncated tail.
       const finalFile = path.join(dir, 'result.txt');
       const final = fs.existsSync(finalFile) ? fs.readFileSync(finalFile, 'utf8') : '';
-      const handoff = successful ? finalHandoff(final) : null;
+      // A nonzero CLI exit must not hide an explicit refusal already written to the result.
+      const handoff = finalHandoff(final);
       const background = [...openCommands.values()].slice(0, 20), pendingBackground = background.length > 0 || handoff?.kind === 'background_running';
       finish({ status: stopReason || (['needs_input', 'blocked'].includes(handoff?.kind) ? handoff.kind : null) || (successful ? 'completed' : 'failed'), handoff, execution_state: pendingBackground ? 'background_unconfirmed' : 'cli_finished', verification_state: pendingBackground ? 'pending' : 'not_verified', background_commands: background, execution_used_ms: executionUsed, exit_code: outcome.code, ended_at: stamp(), retrying_capacity: false,
         ...(!successful && !stopReason ? { error: lastError || 'Codex did not emit a successful turn.completed event' } : {}) });
@@ -686,7 +703,8 @@ const object = (properties, required = []) => ({ type: 'object', properties, req
 const idSchema = { type: 'string', description: 'The exact job_id returned by codex_run or a prior bridge job' };
 const requestFields = {
   user_request: { type: 'string', minLength: 1, maxLength: 60000, description: 'Verbatim human request, separate from prompt (the planner summary/implementation advice). Supply on new matters. Immutable once captured; omit or repeat exactly on continuation. Never invent missing original text.' },
-  user_followup: { type: 'string', minLength: 1, maxLength: 60000, description: 'Verbatim new human clarification/decision, appended to the saved request history. Not a replacement summary or evidence of approval by itself.' }
+  user_followup: { type: 'string', minLength: 1, maxLength: 60000, description: 'Verbatim new human clarification/decision, appended to the saved request history. Not a replacement summary or evidence of approval by itself.' },
+  plan_decision: { ...object({ refusal_job_id: idSchema }, ['refusal_job_id']), description: 'Only after showing an explicit executor refusal to the user: identify that refusal job and include the actual human answer verbatim in user_followup. A planner claim or recommendation is not approval.' }
 };
 const tools = [
   { name: 'codex_run', description: 'Start one matter in the host current-user environment and return immediately by default, leaving Antigravity free for normal chat. Read-only diagnostics are prompt constraints, not a sandbox choice. Antigravity plans/reviews only: commands, edits, tests and execution belong to Codex. If subagents are needed, request Codex-native subagents in the prompt, never Antigravity native subagents. Pass an available model ID or a locally configured alias when needed; otherwise inherit Codex configuration. Reasoning defaults to Medium. Reuse topic_id only for the same matter; another subject needs a new topic. Independent matters may run concurrently in the same worktree without a numeric task cap. Ask the user worktree versus waiting for tightly coupled/overlapping work. No auto-upgrade, timers or polling. wait=true only if the user explicitly wants to wait.', inputSchema: object({ ...requestFields, prompt: { type: 'string' }, topic: { type: 'string', maxLength: 120, description: 'Concrete execution task shown as the native Codex chat title, not a generic executor identity or the whole Antigravity conversation' }, topic_id: { type: 'string', description: 'Returned matter ID for same-topic continuation; omit for a different matter' }, model: { type: 'string', description: 'Available model ID or locally configured alias. Omit to inherit the configured Codex model; same-topic continuation retains an explicit prior choice.' }, reasoning_effort: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Default medium; do not increase automatically' }, wait: { type: 'boolean', default: false, description: 'False returns background acknowledgment. True waits for completion and can occupy this chat turn.' }, cwd: { type: 'string' }, sandbox: { type: 'string', enum: sandboxModes, default: 'danger-full-access', description: 'Available only after local CODEX_EXECUTOR_ALLOW_SANDBOX=1 opt-in for user-requested isolation. Omit for host execution; read-only task constraints belong in prompt.' }, timeout_seconds: { type: 'integer', minimum: 30, maximum: 14400 }, session_id: { type: 'string', description: 'Exact Codex session ID, separate from Antigravity conversation_id; do not reuse it for an unrelated matter' }, conversation_id: { type: 'string', description: 'Optional actual originating Antigravity UUID. One chat may have many topic IDs; never invent an ID.' } }, ['prompt']) },
@@ -723,7 +741,7 @@ function dispatch(broker, request, signal) {
       case 'codex_start': value = broker.start(args); break;
       case 'codex_continue': {
         const parent = broker.get(args.job_id);
-        value = broker.start({ prompt: args.prompt, user_request: args.user_request, user_followup: args.user_followup, cwd: parent.cwd, sandbox: args.sandbox, parent_job_id: args.job_id }); break;
+        value = broker.start({ prompt: args.prompt, user_request: args.user_request, user_followup: args.user_followup, plan_decision: args.plan_decision, cwd: parent.cwd, sandbox: args.sandbox, parent_job_id: args.job_id }); break;
       }
       case 'codex_status': value = broker.status(args.job_id); break;
       case 'codex_result': value = broker.result(args.job_id, args.diagnostics === true); break;

@@ -90,17 +90,21 @@ function eventMessage(job, event) {
     ? `请只调用一次 codex_result(job_id=${job.job_id}) 领取原结果并验收；不要重复派发。`
     : '兼容旧连接的过程事件：静默处理，不回复、不调用工具。';
   const handoff = event.handoff || job.handoff;
-  const choice = event.kind === 'terminal' && ['needs_input', 'blocked'].includes(event.status)
+  const refusal = event.kind === 'terminal' && handoff?.requires_user_decision;
+  const choice = event.kind === 'terminal' && !refusal && ['needs_input', 'blocked'].includes(event.status)
     ? `\n【需要判断/用户选择】${handoff?.question || handoff?.text || '请领取原回执查看具体问题。'}${handoff?.options?.length ? '\n选项：' + handoff.options.map((v, i) => `${i + 1}. ${v}`).join('\n') : ''}${handoff?.recommendation ? '\nCodex建议（不是用户授权）：' + handoff.recommendation : ''}\n只有已有明确授权能解决时才能继续；涉及用户偏好、范围、权限或不可逆选择须向用户原样展示问题/选项，等待回答。不得默认选推荐项。用户回答后用原 topic_id/session_id 续接一次，不重开事项。` : '';
   const background = event.kind === 'terminal' && (event.execution_state || job.execution_state) === 'background_unconfirmed'
     ? `\n【后台执行尚未确认结束】Codex对话轮次已结束，但后台命令的退出结果未确认，测试/业务验收仍待完成。${JSON.stringify(event.background_commands || job.background_commands || [])} ${handoff?.kind === 'background_running' ? handoff.text : ''}请先判断等待、核查原命令还是需要用户决定；不能把CLI退出0当成测试通过，不重跑仍可能活动的命令。` : '';
-  const label = ['needs_input', 'blocked'].includes(event.status) ? '需要判断' : ['failed', 'timed_out', 'cancelled'].includes(event.status) ? '执行未完成' : '执行结果';
-  const content = ['needs_input', 'blocked'].includes(event.status)
+  const refusalControl = refusal ? `\n【方案被执行端拒绝，必须反馈用户】分别说明原计划、Codex拒绝理由、影响及你的建议；默认不用代码、文件名或底层日志解释，原回执保留为详情。不得掩盖拒绝、替用户批准、静默改方案或报告已解决。先等待用户决定，再用原 topic_id/session_id、plan_decision.refusal_job_id=${job.job_id} 和逐字 user_followup 续接。桥接器只记录调用方转交的答复，不独立认证用户身份或批准。` : '';
+  const label = refusal ? '方案被执行端拒绝' : ['needs_input', 'blocked'].includes(event.status) ? '需要判断' : ['failed', 'timed_out', 'cancelled'].includes(event.status) ? '执行未完成' : '执行结果';
+  const content = refusal
+    ? `${handoff.original_plan ? '原计划：' + handoff.original_plan + '\n' : ''}执行端反馈：${handoff.reason || handoff.text}\n${handoff.impact ? '影响：' + handoff.impact + '\n' : ''}${handoff.question || '需要你决定是否修改方案；目前尚未解决。'}${handoff.options?.length ? '\n' + handoff.options.map((v, i) => `${i + 1}. ${v}`).join('\n') : ''}`
+    : ['needs_input', 'blocked'].includes(event.status)
     ? `${handoff?.completed ? '已完成：' + handoff.completed + '\n' : ''}${handoff?.question || handoff?.text || '需要核对原结果中的具体阻塞原因。'}${handoff?.options?.length ? '\n' + handoff.options.map((v, i) => `${i + 1}. ${v}`).join('\n') : ''}`
     : (event.execution_state || job.execution_state) === 'background_unconfirmed'
       ? `${handoff?.completed ? '已完成：' + handoff.completed + '\n' : ''}后台命令是否结束尚未确认，最终测试或运行验收还没有结论。`
     : noticeResult(event.result_text || job.error || event.detail) || '尚未取得具体结果说明，需要核对原任务回执。';
-  return `${internal(`${checks.has(event.kind) ? '这是用户授权的验收派发。' : '这是后台事件，不是新的用户任务。'}${action}${choice}${background}`)}\n${draft(label, content)}\n${compact}草稿摘自原结果，必须先领取回执并核验，再改写成具体完成内容与未完成项；禁止原样回复“已收到 event_id”或只报状态。单条命令退出0不能扩写成全部测试通过或业务完成。同事项在已有授权内继续时静默续接，只在最终验收、无法继续或需要用户选择时发正文。`;
+  return `${internal(`${checks.has(event.kind) ? '这是用户授权的验收派发。' : '这是后台事件，不是新的用户任务。'}${action}${choice}${refusalControl}${background}`)}\n${draft(label, content)}\n${compact}草稿摘自原结果，必须先领取回执并核验，再改写成具体完成内容与未完成项；禁止原样回复“已收到 event_id”或只报状态。单条命令退出0不能扩写成全部测试通过或业务完成。同事项在已有授权内继续时静默续接，只在最终验收、无法继续或需要用户选择时发正文。`;
 }
 function claimHost(data, generation) {
   const file = path.join(data, 'notification-host.json'), release = takeClaim(file + '.claim');
@@ -156,7 +160,11 @@ async function deliver(broker, id, send, options = {}) {
   const newer = fs.readdirSync(broker.jobs).filter(n => /^[a-f0-9]{24}$/.test(n) && n !== id).some(n => {
     try { const next = read(broker.jobPath(n)); return next.topic_id === job.topic_id && next.conversation_id === job.conversation_id && next.created_at > job.created_at; } catch { return false; }
   });
-  if (newer) {
+  // An unacknowledged refusal cannot disappear merely because a later job exists.
+  const decisionRecorded = job.handoff?.requires_user_decision && fs.readdirSync(broker.jobs).filter(n => /^[a-f0-9]{24}$/.test(n)).some(n => {
+    try { const next = read(broker.jobPath(n)); return next.topic_id === job.topic_id && next.plan_decision?.refusal_job_id === id; } catch { return false; }
+  });
+  if (newer && (!job.handoff?.requires_user_decision || decisionRecorded)) {
     for (const event of events.filter(e => !['notification_check', 'parallel_check', 'subagent_check'].includes(e.kind))) {
       const file = event.file.replace(/\.json$/, '.delivery.json');
       if (!fs.existsSync(file) || read(file).state === 'not_sent') save(file, { state: 'superseded', event_id: event.event_id, reason: 'A newer job continued this matter.' });

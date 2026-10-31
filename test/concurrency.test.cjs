@@ -7,7 +7,7 @@ const cp = require('node:child_process');
 // Admission-only tests do not start Codex or a worker. Native worker isolation is tested separately.
 const originalSpawn = cp.spawn;
 cp.spawn = () => ({ pid: process.pid, on() {}, unref() {} });
-const { Broker, save, dispatch } = require('../src/server.cjs');
+const { Broker, save, dispatch, finalHandoff } = require('../src/server.cjs');
 cp.spawn = originalSpawn;
 function fixture(t) {
   const base = fs.realpathSync(process.env.CODEX_EXECUTOR_TEST_ROOT), root = fs.mkdtempSync(path.join(base, 'concurrency-'));
@@ -55,7 +55,48 @@ test('all execution entry schemas expose original and followup separately from t
     const properties = schema.tools.find(tool => tool.name === name).inputSchema.properties;
     assert.equal(properties.user_request.type, 'string'); assert.equal(properties.user_followup.type, 'string');
     assert.equal(properties.prompt.type, 'string');
+    assert.deepEqual(properties.plan_decision.required, ['refusal_job_id']);
   }
+});
+
+test('explicit refusal survives restart and blocks topic, old-parent and native-session shortcuts', async t => {
+  const f = fixture(t), thread = '12345678-1234-1234-1234-123456789abc';
+  const finish = (job, handoff = null) => { save(f.broker.jobPath(job.job_id), { ...f.broker.get(job.job_id), status: handoff ? 'blocked' : 'completed', thread_id: thread, handoff }); f.broker.unlock(job.job_id); };
+  const first = f.broker.start({ prompt: '原方案', user_request: '不做整集转码' }); finish(first);
+  const rejected = f.broker.start({ prompt: '实现原方案', parent_job_id: first.job_id });
+  const handoff = finalHandoff('[CODEX_PLAN_REJECTED]\n' + JSON.stringify({ original_plan: '直接播放', reason: '缺少显示通路', impact: '目前无法播放', question: '补齐还是更改？', options: ['补齐原方案', '更改目标'] }));
+  finish(rejected, handoff);
+  const original = fs.readFileSync(f.broker.jobPath(rejected.job_id)), restarted = new Broker(f.settings), count = restarted.list().length;
+  for (const args of [{ topic_id: rejected.topic_id }, { parent_job_id: first.job_id }, { topic_id: rejected.topic_id, user_followup: '仅有答复，没有关联拒绝' }]) assert.throws(() => restarted.start({ prompt: '已有授权，换方案即可', ...args }), /CODEX_USER_DECISION_REQUIRED/);
+  await assert.rejects(restarted.run({ prompt: '从原生会话绕过', session_id: thread }), /CODEX_USER_DECISION_REQUIRED/);
+  const compatibility = dispatch(restarted, { method: 'tools/call', params: { name: 'codex_continue', arguments: { job_id: first.job_id, prompt: '从旧 parent 绕过' } } });
+  assert.equal(compatibility.isError, true); assert.match(compatibility.content[0].text, /CODEX_USER_DECISION_REQUIRED/);
+  assert.equal(restarted.list().length, count);
+  const decision = { refusal_job_id: rejected.job_id };
+  assert.throws(() => restarted.start({ prompt: '仅传 ID', parent_job_id: first.job_id, plan_decision: decision }), /actual human reply/);
+  assert.throws(() => restarted.start({ prompt: '错误 ID', topic_id: rejected.topic_id, plan_decision: { refusal_job_id: first.job_id }, user_followup: '继续' }), /unresolved refusal/);
+  assert.throws(() => restarted.start({ prompt: '覆盖原文', topic_id: rejected.topic_id, plan_decision: decision, user_followup: '继续', user_request: '更容易的目标' }), /Cannot replace user_request/);
+  assert.throws(() => restarted.start({ prompt: '失败派发不能消费决定', topic_id: rejected.topic_id }), /CODEX_USER_DECISION_REQUIRED/);
+  assert.ok(restarted.start({ prompt: '另一个独立事项' }).job_id);
+  const reply = '  我选择补齐原方案，不接受转码。\r\n';
+  const response = dispatch(restarted, { method: 'tools/call', params: { name: 'codex_continue', arguments: { job_id: first.job_id, prompt: '继续补齐', plan_decision: decision, user_followup: reply } } });
+  assert.notEqual(response.isError, true);
+  const continued = JSON.parse(response.content[0].text), saved = restarted.get(continued.job_id);
+  assert.equal(saved.topic_id, rejected.topic_id); assert.equal(saved.thread_id, thread);
+  assert.equal(saved.plan_decision.refusal_job_id, rejected.job_id);
+  assert.equal(saved.request_context.followups.at(-1).text, reply);
+  assert.equal(restarted.receipt(continued.job_id).plan_decision.refusal_job_id, rejected.job_id);
+  assert.deepEqual(fs.readFileSync(f.broker.jobPath(rejected.job_id)), original, 'Do not rewrite the refusal as resolved/success');
+  finish(continued);
+  assert.ok(new Broker(f.settings).start({ prompt: '后续正常续接', parent_job_id: first.job_id }).job_id);
+});
+
+test('ordinary implementation errors do not require a human plan decision, stale or malformed decisions fail closed', t => {
+  const f = fixture(t), first = f.broker.start({ prompt: '正常任务' });
+  save(f.broker.jobPath(first.job_id), { ...f.broker.get(first.job_id), status: 'failed', thread_id: '12345678-1234-1234-1234-123456789abc', error: 'compiler error', handoff: null }); f.broker.unlock(first.job_id);
+  assert.ok(f.broker.start({ prompt: '自行修复编译错误', parent_job_id: first.job_id }).job_id);
+  for (const value of [null, [], {}, { refusal_job_id: 'bad' }, { refusal_job_id: first.job_id, approved: true }]) assert.throws(() => f.broker.start({ prompt: 'invalid decision', plan_decision: value }), /plan_decision/);
+  assert.throws(() => f.broker.start({ prompt: '不能复用别的事项的 ID', plan_decision: { refusal_job_id: first.job_id }, user_followup: '同意' }), /unresolved refusal/);
 });
 test('same-worktree admission has no numeric running-task cap, active listing exceeds twenty', t => {
   const f = fixture(t), jobs = Array.from({ length: 64 }, (_, n) => f.broker.start({ prompt: 'independent task ' + n }));

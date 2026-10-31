@@ -246,6 +246,36 @@ test('default reconciliation is fifteen seconds and an empty outbox does not sen
   finally { w.close(); }
 });
 
+test('plan refusal keeps executor reasons distinct, requires a human choice and tolerates legacy/malformed output', t => {
+  const f = fixture(t, 'blocked');
+  const payload = { original_plan: '直接播放', reason: '缺少画面显示通路', impact: '原目标不能交付', question: '继续补齐还是修改目标？', options: ['补齐：保留原目标', '修改：接受额外等待'], recommendation: '补齐', completed: '已核对代码' };
+  const handoff = finalHandoff('[CODEX_PLAN_REJECTED]\n```json\n' + JSON.stringify(payload) + '\n```');
+  assert.equal(handoff.kind, 'blocked'); assert.equal(handoff.requires_user_decision, true);
+  for (const key of ['original_plan', 'reason', 'impact']) assert.equal(handoff[key], payload[key]);
+  save(f.file, { ...f.job, handoff }); const event = f.emit('terminal', 'terminal'), message = eventMessage(read(f.file), event);
+  assert.deepEqual(new Broker({ data: f.root }).result(id).handoff, handoff);
+  for (const text of ['方案被执行端拒绝', payload.original_plan, payload.reason, payload.impact, ...payload.options, '不得掩盖拒绝', 'plan_decision.refusal_job_id=']) assert.ok(message.includes(text), text);
+  const draft = message.match(/<用户通知草稿>([\s\S]*?)<\/用户通知草稿>/)[1];
+  assert.ok(!draft.includes('refusal_job_id=')); assert.ok(!draft.includes('Codex建议'), 'Recommendation is not the executor reason or human answer');
+  assert.equal(finalHandoff('[CODEX_BLOCKED] 旧式明确拒绝').requires_user_decision, true);
+  assert.equal(finalHandoff('[CODEX_PLAN_REJECTED] { malformed').requires_user_decision, true);
+  assert.equal(finalHandoff('[CODEX_NEEDS_INPUT] {"decision_scope":"plan","question":"改目标吗？"}').requires_user_decision, true);
+  assert.equal(finalHandoff('[CODEX_NEEDS_INPUT] 补充一个路径').requires_user_decision, undefined);
+  assert.equal(finalHandoff('测试日志引用 [CODEX_PLAN_REJECTED] 不应触发'), null);
+  assert.equal(finalHandoff('编译报错，正在修复'), null);
+});
+
+test('an unacknowledged refusal notice is not erased by a newer job, restart delivery stays deduplicated', async t => {
+  const f = fixture(t, 'blocked'), handoff = finalHandoff('[CODEX_PLAN_REJECTED] 方案不能达到目标');
+  save(f.file, { ...f.job, created_at: '2000-01-01T00:00:00.000Z', handoff }); f.emit('terminal', 'terminal');
+  const next = 'bbbbbbbbbbbbbbbbbbbbbbbb'; fs.mkdirSync(path.dirname(f.broker.jobPath(next)));
+  save(f.broker.jobPath(next), { ...f.job, job_id: next, status: 'completed', created_at: '2001-01-01T00:00:00.000Z' });
+  let sends = 0;
+  assert.equal(await deliver(new Broker({ data: f.root }), id, async (recipient, message) => { sends++; assert.equal(recipient, chat); assert.match(message, /方案被执行端拒绝/); return {}; }), true);
+  assert.equal(await deliver(new Broker({ data: f.root }), id, async () => { sends++; return {}; }), false);
+  assert.equal(sends, 1); assert.equal(notificationSummary(f.file).latest.state, 'accepted');
+});
+
 test('health allows three reconciliation intervals before declaring the notifier stale', t => {
   const f = fixture(t), previous = process.env.CODEX_EXECUTOR_DATA;
   process.env.CODEX_EXECUTOR_DATA = f.root;
