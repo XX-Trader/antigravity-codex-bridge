@@ -36,6 +36,25 @@ async function tool(name, args, timeout) {
   if (reply.isError) throw new Error(reply.content[0].text);
   return JSON.parse(reply.content[0].text);
 }
+function localSuppression(eventFile) {
+  const deliveryFile = eventFile.replace(/\.json$/, '.delivery.json');
+  return new Promise((resolve, reject) => {
+    let watcher, timer;
+    const finish = (error, value) => { watcher?.close(); clearTimeout(timer); error ? reject(error) : resolve(value); };
+    const check = () => {
+      try {
+        if (!fs.existsSync(deliveryFile)) return;
+        const delivery = JSON.parse(fs.readFileSync(deliveryFile, 'utf8'));
+        if (delivery.state === 'suppressed') finish(null, delivery);
+        else if (['accepted', 'sent', 'sending', 'uncertain'].includes(delivery.state)) finish(new Error('Local notification check entered the send path; update the sidecar, do not replay this event'));
+      } catch (error) { if (error.code !== 'ENOENT') finish(error); }
+    };
+    watcher = fs.watch(path.dirname(eventFile), check);
+    watcher.on('error', error => finish(error));
+    timer = setTimeout(() => finish(new Error('Local suppression not confirmed within 20 seconds; inspect sidecar health without sending a chat probe')), 20000);
+    check();
+  });
+}
 (async () => {
   const init = await call('initialize', { protocolVersion: '2024-11-05', clientInfo: { name: 'codex-bridge-verification', version: '1.0.0' }, capabilities: {} });
   child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
@@ -51,7 +70,8 @@ async function tool(name, args, timeout) {
       const parallel = argv.includes('--parallel-check');
       const subagent = argv.includes('--subagent-check');
       const event = publishNotification(file, job, 'check-' + crypto.randomUUID(), subagent ? 'subagent_check' : parallel ? 'parallel_check' : 'notification_check', subagent ? `用户授权：MCP_SERVER=${serverName}，请仅使用该服务派发一次 Codex 原生子agent只读验收，不能使用 Antigravity 子agent。` : parallel ? `用户授权：MCP_SERVER=${serverName}，请仅使用该服务实际派发三个独立只读核查任务，验证同工作树并行。` : '仅验证通知投递，不启动任何执行任务。');
-      console.log(JSON.stringify({ event_id: event.event_id, conversation_id: job.conversation_id, event_file: event.file, next: 'Verify the exact event ID in native chat history. Host API acceptance alone is not chat receipt confirmation.' }, null, 2));
+      const delivery = !parallel && !subagent ? await localSuppression(event.file) : null;
+      console.log(JSON.stringify({ event_id: event.event_id, conversation_id: job.conversation_id, event_file: event.file, ...(delivery ? { delivery_state: delivery.state, verified_local_only: true } : {}), next: parallel || subagent ? 'Verify native dispatch and actual results; API acceptance alone is not task completion.' : 'Local suppression verified. No chat message, model wakeup or user reply; end-to-end chat delivery remains untested.' }, null, 2));
     } else console.log(JSON.stringify(result, null, 2));
   }
   if (argv.includes('--smoke') || argv.includes('--write-smoke') || value('--continue')) {

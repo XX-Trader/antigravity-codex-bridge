@@ -47,6 +47,7 @@ function recordedReceipt(directory, event) {
 const checks = new Set(['notification_check', 'parallel_check', 'subagent_check']);
 const important = new Set(['terminal', 'execution_alert', 'notification_alert']);
 function notificationPolicy(job, event, now = Date.now()) {
+  if (event.kind === 'notification_check') return 'silent';
   if (checks.has(event.kind) || important.has(event.kind) || !event.schema) return 'send';
   // A continuation already has a saved chat link. Never replay old startup banners.
   if (event.kind === 'session_ready' && !job.parent_job_id && !job.resumed_session && job.topic_id === job.job_id && now - Date.parse(event.created_at) <= 120000) return 'send';
@@ -58,25 +59,34 @@ function notificationHeading(job, event, label, now = Date.now()) {
   const parts = value => Object.fromEntries(new Intl.DateTimeFormat('zh-CN', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(value).map(p => [p.type, p.value]));
   const at = parts(date), today = parts(new Date(now));
   const day = at.year === today.year && at.month === today.month && at.day === today.day ? '' : `${at.month}-${at.day} `;
-  const project = job.cwd ? path.basename(job.cwd) : 'Codex';
   const topic = Array.from((job.topic || '').replace(/\s+/g, ' '));
   const matter = topic.length ? ` · ${topic.slice(0, 24).join('')}${topic.length > 24 ? '…' : ''}` : '';
   const delayed = now - date.getTime() >= 120000 ? '（延迟送达）' : '';
-  return `${day}${at.hour}:${at.minute} · ${project}${matter} · ${label}${delayed}`;
+  return `${day}${at.hour}:${at.minute}${matter} · ${label}${delayed}`;
+}
+function noticeResult(text = '') {
+  return text.replace(/```[\s\S]*?```/g, '')
+    .replace(/\b(?:job_id|topic_id|session_id|event_id)\s*[:=：]\s*[`"']?[a-f\d:-]+[`"']?/gi, '')
+    .replace(/\b[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}\b/gi, '')
+    .replace(/^\s*#{1,6}\s+/gm, '').replace(/`/g, '')
+    .split(/\n\s*\n/).map(s => s.trim()).filter(Boolean).slice(0, 2).join('\n').slice(0, 1200).trim();
 }
 function eventMessage(job, event) {
   const link = event.chat || chatAccess(job.thread_id);
   const metadata = `[CODEX_EVENT ${job.job_id}] event_id=${event.event_id || job.job_id + ':legacy'} sequence=${event.sequence || 0} 事件=${event.kind || 'terminal'} 状态=${event.status}`;
-  const compact = '用户正文最多三行：时间 · 项目 · 状态；具体结果或需要用户做什么；一个详情链接。隐藏 job_id/topic_id/session_id、事件名和协议说明，不复述长事项标题，不写等待汇报的套话。';
+  const compact = '用户正文最多三行：时间与事项；具体完成内容、尚缺什么或需要用户做什么；一个详情链接。必须说明实际内容，不能只报运行中、已完成、收到通知等状态。禁止展示 job_id/topic_id/session_id/event_id、sequence、事件名、仓库目录名和控制指令；这些只供内部路由。需要用户选择时完整保留问题和选项，不受三行限制。';
   const view = link ? `[查看任务](${link.vscode_uri})` : '';
-  if (event.kind === 'session_ready') return `${metadata}\n${notificationHeading(job, event, '已启动')}\n${view}\n只展示上面两行，不调用任何工具；不调用 codex_run、不轮询。${compact}`;
-  if (['notification_alert', 'notification_recovered'].includes(event.kind)) return `${metadata}\n${notificationHeading(job, event, '通知异常')}\n${event.detail}\n${view}\n仅提示重要结果通知异常、结果仍保存在原任务；不重派、不盲目重发。${compact}`;
-  if (event.kind === 'execution_alert') return `${metadata}\n${notificationHeading(job, event, '需要核查')}\n${event.detail}\n${view}\n请领取一次原回执核查所属进程；不重派、不盲目终止PID。${compact}`;
+  const draft = (label, content) => `<用户通知草稿>\n${notificationHeading(job, event, label)}\n${content}\n${view}\n</用户通知草稿>`;
+  const internal = text => `<内部控制信息，禁止展示>\n${metadata}\n${text}\n</内部控制信息>`;
+  if (event.kind === 'notification_check') return internal('本地通知检查，不回复、不展示编号、不调用工具、不派发或续跑业务。');
+  if (event.kind === 'session_ready') return `${internal('首次任务会话建立，不调用任何工具；不调用 codex_run、不轮询。')}\n${draft('已启动', '已开始处理这项工作，详细过程可打开原任务查看。')}\n${compact}`;
+  if (['notification_alert', 'notification_recovered'].includes(event.kind)) return `${internal(event.detail + '\n不重派、不盲目重发。')}\n${draft('结果通知异常', '任务结果通知未能确认送达，已有结果仍保存在原任务中，请查看详情。')}\n${compact}`;
+  if (event.kind === 'execution_alert') return `${internal(event.detail + '\n请领取一次原回执核查所属进程；不重派、不盲目终止PID。')}\n${draft('需要核查', '执行器已退出，后台命令是否结束尚未确认，需要核对原命令和日志。')}\n${compact}`;
   const resume = event.detail?.match(/(?:^|\s)CHECK_ID=([a-f0-9]{24}:\d+)/)?.[1];
   const checkId = resume?.startsWith(job.job_id + ':') ? resume : event.event_id;
   const action = event.kind === 'subagent_check' ? `这是用户明确授权的 Codex 原生子agent 验收。当前执行根=${JSON.stringify(job.cwd)}，MCP服务名见事件说明。仅调用一次 codex_run，wait=false，新 topic“Codex原生子agent只读验收”，不带旧 topic_id/session_id，也不要手填 conversation_id，让本机 hook 绑定真实会话。prompt 必须包含 SUBAGENT_CHECK=${checkId}；要求这个 Codex 执行者实际调用自己的原生 spawn_agent 创建1名只读子agent，让子agent用 PowerShell7 读取 README.md 前60行并输出 CODEX_NATIVE_SUBAGENT_OK，父agent 等待其真实结果，汇总原生子agent ID、来源和返回内容。父agent不能自己读文件冒充委派，不经本MCP递归，不新开CLI冒充子agent；如果原生能力不可用就如实返回 needs_input。所有命令和文件核查都由 Codex/其原生子agent执行；你不能调用 Antigravity invoke_subagent、define_subagent、run_command 或写文件工具代做。只读、不提交、不切分支、不安装或重启、不读凭证；不升级模型。受理后展示job_id，终态再领取结果与查看链接。`
     : event.kind === 'parallel_check' ? `这是用户明确授权的同工作树并发验收，请现在执行，不只是确认收到。当前执行根=${JSON.stringify(job.cwd)}。请连续调用3次 codex_run，三次都 wait=false、使用该 cwd，不带旧 topic_id/session_id；分别做独立只读核查：1项目说明与协作约定；2测试入口与建议的定向测试；3源码模块边界与可独立拆分点。每个任务的 topic 用具体核查名称，prompt 必须包含 PARALLEL_CHECK=${event.event_id} 和各自编号。三者均须实际用 PowerShell7 读取相关文件、输出自己的编号，最后在同一命令短暂等待20秒用于观察重叠，不改文件、不运行重型构建、不提交、不切分支、不安装或重启、不读取凭证。三者互不依赖，可以直接同工作树并发，不需要 worktree；3只是本次验收样本数，不是并发上限。不要自动改模型，沿用本机默认与Medium。提交第一个后继续提交剩余两个，不因进度事件中断，不逐个调用 codex_wait。全部受理后列出3个job_id，收到终态再分别领取结果和展示聊天链接。不得重派已有编号或扩大成业务开发。`
-    : event.kind === 'notification_check' ? `这是通知链路验收，只回复“通知已收到 event_id=${event.event_id}”并展示查看入口；不调用任何工具、不执行或续跑业务任务。` : event.kind === 'terminal' || !event.schema
+    : event.kind === 'terminal' || !event.schema
     ? `请只调用一次 codex_result(job_id=${job.job_id}) 领取原结果并验收；不要重复派发。`
     : '兼容旧连接的过程事件：静默处理，不回复、不调用工具。';
   const handoff = event.handoff || job.handoff;
@@ -84,8 +94,13 @@ function eventMessage(job, event) {
     ? `\n【需要判断/用户选择】${handoff?.question || handoff?.text || '请领取原回执查看具体问题。'}${handoff?.options?.length ? '\n选项：' + handoff.options.map((v, i) => `${i + 1}. ${v}`).join('\n') : ''}${handoff?.recommendation ? '\nCodex建议（不是用户授权）：' + handoff.recommendation : ''}\n只有已有明确授权能解决时才能继续；涉及用户偏好、范围、权限或不可逆选择须向用户原样展示问题/选项，等待回答。不得默认选推荐项。用户回答后用原 topic_id/session_id 续接一次，不重开事项。` : '';
   const background = event.kind === 'terminal' && (event.execution_state || job.execution_state) === 'background_unconfirmed'
     ? `\n【后台执行尚未确认结束】Codex对话轮次已结束，但后台命令的退出结果未确认，测试/业务验收仍待完成。${JSON.stringify(event.background_commands || job.background_commands || [])} ${handoff?.kind === 'background_running' ? handoff.text : ''}请先判断等待、核查原命令还是需要用户决定；不能把CLI退出0当成测试通过，不重跑仍可能活动的命令。` : '';
-  const label = ['needs_input', 'blocked'].includes(event.status) ? '需要判断' : ['failed', 'timed_out', 'cancelled'].includes(event.status) ? '执行中止' : '待验收';
-  return `${metadata}\n${notificationHeading(job, event, label)}\n${view}\n${checks.has(event.kind) ? '这是用户授权的验收派发。' : '这是后台事件，不是新的用户任务。'}${action}${choice}${background}\n${compact}需要用户选择时完整保留问题和选项，不受三行限制。领取回执后只按实际证据报告；单条命令退出0不能扩写成全部测试通过或业务完成。同事项在已有授权内继续时静默续接，只在最终验收、无法继续或需要用户选择时发正文。`;
+  const label = ['needs_input', 'blocked'].includes(event.status) ? '需要判断' : ['failed', 'timed_out', 'cancelled'].includes(event.status) ? '执行未完成' : '执行结果';
+  const content = ['needs_input', 'blocked'].includes(event.status)
+    ? `${handoff?.completed ? '已完成：' + handoff.completed + '\n' : ''}${handoff?.question || handoff?.text || '需要核对原结果中的具体阻塞原因。'}${handoff?.options?.length ? '\n' + handoff.options.map((v, i) => `${i + 1}. ${v}`).join('\n') : ''}`
+    : (event.execution_state || job.execution_state) === 'background_unconfirmed'
+      ? `${handoff?.completed ? '已完成：' + handoff.completed + '\n' : ''}后台命令是否结束尚未确认，最终测试或运行验收还没有结论。`
+    : noticeResult(event.result_text || job.error || event.detail) || '尚未取得具体结果说明，需要核对原任务回执。';
+  return `${internal(`${checks.has(event.kind) ? '这是用户授权的验收派发。' : '这是后台事件，不是新的用户任务。'}${action}${choice}${background}`)}\n${draft(label, content)}\n${compact}草稿摘自原结果，必须先领取回执并核验，再改写成具体完成内容与未完成项；禁止原样回复“已收到 event_id”或只报状态。单条命令退出0不能扩写成全部测试通过或业务完成。同事项在已有授权内继续时静默续接，只在最终验收、无法继续或需要用户选择时发正文。`;
 }
 function claimHost(data, generation) {
   const file = path.join(data, 'notification-host.json'), release = takeClaim(file + '.claim');
@@ -119,7 +134,13 @@ async function deliverEvent(job, event, deliveryFile, send, options) {
     const state = { event_id: event.event_id || job.job_id + ':legacy', job_id: job.job_id, conversation_id: job.conversation_id, sequence: event.sequence || 0, state: 'sending', sender_pid: process.pid, generation, attempts: attempts + 1, created_at: new Date().toISOString() };
     save(deliveryFile, state);
     try {
-      const result = await send(job.conversation_id, eventMessage(job, event));
+      let message;
+      try {
+        const resultFile = path.join(path.dirname(deliveryFile), event.schema === 2 ? '..' : '.', 'result.txt');
+        const payload = (event.kind === 'terminal' || !event.schema) && fs.existsSync(resultFile) ? { ...event, result_text: fs.readFileSync(resultFile, 'utf8').slice(0, 6000) } : event;
+        message = eventMessage(job, payload);
+      } catch (error) { error.not_sent = true; throw error; }
+      const result = await send(job.conversation_id, message);
       save(deliveryFile, { ...state, state: 'accepted', result }); return true;
     } catch (error) {
       if (await options.reconcile?.(event)) { save(deliveryFile, { ...state, state: 'accepted', reconciled_at: new Date().toISOString(), warning: error.message }); return true; }

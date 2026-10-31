@@ -122,7 +122,9 @@ test('continuation supersedes old notices and terminal supersedes stale pending 
   const next = 'bbbbbbbbbbbbbbbbbbbbbbbb', nextFile = f.broker.jobPath(next); fs.mkdirSync(path.dirname(nextFile)); save(nextFile, { ...f.job, job_id: next, created_at: '2099-01-01T00:00:00.000Z' });
   assert.equal(await deliver(f.broker, id, async () => { throw Error('stale matter alert'); }), false);
   f.emit('check', 'notification_check'); let checks = 0;
-  assert.equal(await deliver(f.broker, id, async (_, message) => { assert.match(message, /不调用任何工具/); checks++; return {}; }), true); assert.equal(checks, 1);
+  assert.equal(await deliver(f.broker, id, async () => { throw Error('local check must not enter chat'); }), false);
+  f.emit('parallel-check', 'parallel_check');
+  assert.equal(await deliver(f.broker, id, async (_, message) => { assert.match(message, /连续调用3次 codex_run/); checks++; return {}; }), true); assert.equal(checks, 1);
   fs.unlinkSync(nextFile); fs.rmdirSync(path.dirname(nextFile)); save(f.file, { ...f.job, status: 'completed' }); f.emit('end', 'terminal'); let calls = 0;
   await deliver(f.broker, id, async () => { calls++; return {}; }); assert.equal(calls, 1); assert.equal(notificationSummary(f.file).pending, 0);
 });
@@ -137,7 +139,7 @@ test('phase detection selects meaningful gates, not every read/log line', () => 
   assert.equal(commandPhase('cargo test --offline -p api'), '测试'); assert.equal(commandPhase('cargo clippy --workspace'), '静态检查');
   assert.equal(commandPhase('git status --short'), null); assert.equal(commandPhase('Get-Content file.txt'), null);
   const instructions = dispatch({ settings: { project: 'fixture' } }, { method: 'initialize' }).instructions;
-  assert.match(instructions, /Only terminal events require codex_result/); assert.match(instructions, /notification_check only acknowledges/);
+  assert.match(instructions, /Only terminal events require codex_result/); assert.match(instructions, /notification_check stays local and silent/);
   assert.match(instructions, /without a numeric concurrency cap/);
 });
 test('parallel verification is explicit read-only dispatch, not a task-count limit or a status acknowledgment', t => {
@@ -311,7 +313,7 @@ test('continuation and stale startup links are silent; first fresh chat and diag
   assert.equal(calls, 0);
   for (const kind of ['notification_check', 'parallel_check', 'subagent_check']) f.emit(kind, kind);
   await deliver(f.broker, id, async () => { calls++; return {}; });
-  assert.equal(calls, 3);
+  assert.equal(calls, 2);
 });
 
 test('silent policy preserves unknown prior sends and never blindly replays them', async t => {
@@ -342,8 +344,8 @@ test('startup watcher creation failure still discovers new terminal jobs through
 test('compact notifications use event time, distinguish dates/delay and bound result claims', t => {
   const f = fixture(t), job = { ...f.job, cwd: path.join(f.root, 'example'), topic: '播放验收', settings: { notification_timezone: 'Asia/Shanghai' } };
   const now = Date.parse('2026-10-31T12:00:00Z');
-  assert.equal(notificationHeading(job, { created_at: '2026-10-31T11:59:00Z' }, '已启动', now), '19:59 · example · 播放验收 · 已启动');
-  assert.equal(notificationHeading(job, { created_at: '2026-10-30T11:59:00Z' }, '待验收', now), '10-30 19:59 · example · 播放验收 · 待验收（延迟送达）');
+  assert.equal(notificationHeading(job, { created_at: '2026-10-31T11:59:00Z' }, '已启动', now), '19:59 · 播放验收 · 已启动');
+  assert.equal(notificationHeading(job, { created_at: '2026-10-30T11:59:00Z' }, '待验收', now), '10-30 19:59 · 播放验收 · 待验收（延迟送达）');
   const message = eventMessage(job, f.emit('terminal', 'terminal'));
   assert.match(message, /最多三行/); assert.match(message, /单条命令退出0不能扩写成全部测试通过/);
   assert.match(message, /静默续接/); assert.match(message, /问题和选项/);
@@ -359,4 +361,65 @@ test('delivering the original result suppresses an alarm that became stale in th
   assert.equal(read(alert.file.replace(/\.json$/, '.delivery.json')).state, 'superseded');
   auditNotifications(f.broker, new Set([id]));
   assert.equal(Object.values(read(path.join(f.root, 'notification-alerts.json')).groups)[0].state, 'resolved');
+});
+
+test('notification checks stay local, including queued old checks, without a model acknowledgment', async t => {
+  const f = fixture(t), event = f.emit('check', 'notification_check'); let calls = 0;
+  save(event.file.replace(/\.json$/, '.delivery.json'), { state: 'not_sent', attempts: 2 });
+  await deliver(f.broker, id, async () => { calls++; return {}; });
+  assert.equal(calls, 0); assert.equal(notificationSummary(f.file).latest.state, 'suppressed');
+  assert.equal(notificationPolicy(f.job, { ...event, schema: undefined }), 'silent');
+  assert.doesNotMatch(eventMessage(f.job, event), /只回复.*通知已收到/);
+});
+
+test('terminal notices carry actual result content and separate it from routing codes', async t => {
+  const f = fixture(t, 'completed');
+  fs.writeFileSync(path.join(path.dirname(f.file), 'result.txt'), '已完成合集收藏的事务处理与跨季预热；真实窗口播放验证尚未完成。\n\njob_id: ' + id, 'utf8');
+  f.emit('terminal', 'terminal'); let notice;
+  await deliver(f.broker, id, async (_, message) => { notice = message; return {}; });
+  const content = notice.match(/<用户通知草稿>\n([\s\S]*?)\n<\/用户通知草稿>/)[1];
+  assert.match(content, /已完成合集收藏的事务处理与跨季预热/);
+  assert.match(content, /真实窗口播放验证尚未完成/);
+  assert.doesNotMatch(content, /job_id|event_id|sequence|phase_started|aaaaaaaaaaaaaaaaaaaaaaaa|fixture-root/);
+  assert.match(notice, /必须先领取回执并核验/);
+});
+
+test('question notifications contain completed work, the concrete question and all choices', t => {
+  const f = fixture(t, 'needs_input'), handoff = { completed: '已完成跨季预热实现', question: '当前窗口正在播放，何时执行播放验收？', options: ['现在关闭当前窗口后验收', '保留窗口，稍后验收'] };
+  const message = eventMessage(f.job, { ...f.emit('terminal', 'terminal'), handoff });
+  const content = message.match(/<用户通知草稿>\n([\s\S]*?)\n<\/用户通知草稿>/)[1];
+  assert.match(content, /已完成跨季预热实现/); assert.match(content, /何时执行播放验收/);
+  for (const option of handoff.options) assert.ok(content.includes(option));
+  assert.doesNotMatch(content, /job_id|event_id|状态=needs_input/);
+});
+
+test('notification verification CLI confirms local suppression without sending into the chat', async t => {
+  const f = fixture(t); save(f.file, { ...f.job, cwd: f.root }); let sends = 0;
+  const configFile = path.join(f.root, 'mcp.json');
+  save(configFile, { mcpServers: { 'codex-executor': { command: process.execPath, args: [path.resolve(__dirname, '../src/server.cjs')], env: { CODEX_EXECUTOR_PROJECT: f.root, CODEX_EXECUTOR_DATA: f.root, CODEX_EXECUTOR_ENTRY: process.execPath, CODEX_EXECUTOR_PWSH: process.execPath } } } });
+  const w = watch(f.broker, async () => { sends++; return {}; }, { reconcileMs: 25 }); t.after(() => w.close());
+  const output = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.resolve(__dirname, '../scripts/verify.cjs'), '--config', configFile, '--receipt', id, '--notification-check'], { windowsHide: true });
+    let stdout = '', stderr = ''; const timer = setTimeout(() => { child.kill(); reject(new Error('Local verification fixture timed out')); }, 30000);
+    child.stdout.on('data', b => { stdout += b; }); child.stderr.on('data', b => { stderr += b; });
+    child.once('error', e => { clearTimeout(timer); reject(e); });
+    child.once('close', code => { clearTimeout(timer); code === 0 ? resolve(stdout) : reject(new Error(stderr)); });
+  });
+  assert.match(output, /"delivery_state": "suppressed"/); assert.match(output, /"verified_local_only": true/);
+  assert.equal(sends, 0); assert.equal(notificationEvents(f.file).filter(e => e.kind === 'notification_check').length, 1);
+});
+
+test('a temporarily locked result is a known pre-send failure and retries without losing the outcome', async t => {
+  const f = fixture(t, 'completed'), resultFile = path.join(path.dirname(f.file), 'result.txt');
+  fs.writeFileSync(resultFile, '已完成收藏事务修复；播放验收尚未完成。', 'utf8'); f.emit('terminal', 'terminal');
+  const original = fs.readFileSync; let locked = true, sends = 0;
+  fs.readFileSync = (file, ...args) => {
+    if (path.resolve(String(file)) === resultFile && locked) { locked = false; throw Object.assign(new Error('fixture locked result'), { code: 'EBUSY' }); }
+    return original(file, ...args);
+  };
+  t.after(() => { fs.readFileSync = original; });
+  await assert.rejects(deliver(f.broker, id, async () => { sends++; return {}; }, { retryDelays: [0, 0, 0] }), /fixture locked result/);
+  assert.equal(sends, 0); assert.equal(notificationSummary(f.file).latest.state, 'not_sent');
+  await deliver(f.broker, id, async (_, message) => { sends++; assert.match(message, /收藏事务修复/); return {}; });
+  assert.equal(sends, 1); assert.equal(notificationSummary(f.file).latest.state, 'accepted');
 });

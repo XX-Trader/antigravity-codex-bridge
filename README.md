@@ -89,13 +89,13 @@ pwsh -NoProfile -Command 'node scripts/verify.cjs --config C:/path/to/mcp_config
 
 显式加 `--smoke` 或 `--write-smoke` 才会调用真实 Codex，可能消耗账号额度；不要在同一项目已有任务运行时启动测试。单元测试、原生协议验证、Antigravity 的真实通知/界面验收是不同层级，不能互相替代。
 
-可以向已有任务的原 Antigravity 聊天发送一条明确标注的通知验收事件，不重新执行 Codex：
+可对已有任务做一次本地通知策略检查，不重新执行 Codex，也不在聊天中产生测试回执：
 
 ```pwsh
 pwsh -NoProfile -Command 'node scripts/verify.cjs --config C:/path/to/mcp_config.json --notification-check --receipt JOB_ID'
 ```
 
-它会唤醒该聊天，可能消耗 Antigravity 模型额度；应回读同一 `event_id` 的原生收件及回复，而不是只看本地 `accepted`。不会自动领取业务结果或续跑任务。
+回读该事件的本地投递记录，预期为 `suppressed`。它不唤醒聊天或模型，不展示内部编号，不代表真实聊天收发验收已通过。正常结果通知应说明具体完成内容、剩余事项或需要用户作出的选择，不能用状态、代号或“通知已收到”代替。
 
 要在原 Antigravity 聊天中实际验收多个 Codex 并行，可把 `--notification-check` 换成 `--parallel-check`。它明确请求 Antigravity 连续提交三个独立只读项目核查；每个任务读取文件并短暂等待20秒，以观察执行区间重叠。三是本次验收样本数，不是运行上限。该模式会调用真实 Codex 和 Antigravity、消耗额度，不修改业务文件或提交代码。应先确认当前 MCP 已加载新版，再执行一次，保留事件和任务编号，不重复派发。
 

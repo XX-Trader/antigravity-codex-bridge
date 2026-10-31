@@ -22,8 +22,8 @@ description: Antigravity 负责理解与验收，Codex 负责执行；按事项�
 ## 等待与结果
 
 - 不用 schedule、定时器、周期性模型状态查询或重复派发。用户明确要等待才使用 wait=true 或一次 codex_wait；普通聊天不检查后台任务。
-- 收到 CODEX_EVENT 先区分事件类型并按 event_id 去重。started/files_changed/phase_started/phase_finished/waiting_capacity/resumed/recovered/progress 和通知恢复默认只保存在本地；兼容旧连接收到时静默处理，不回复、不调用工具。首次新事项的 session_ready 只展示一次启动与聊天链接，同事项续接不重复通知。notification_check 只确认事件编号，不调用任何工具。
-- 用户通知默认最多三行：本地事件时间 · 项目/短事项 · 状态；具体结果或需要用户做什么；一个详情链接。同日用 HH:mm，跨日加 MM-DD，明显延迟时注明延迟送达。隐藏 job_id/topic_id/session_id、英文事件名和协议说明，不复述长事项标题，不写“非完成回执”“收到终态立即汇报”等套话。单条命令退出0不能扩写成全部测试通过或业务完成；问题和选项必须完整展示，不受三行限制。
+- 收到 CODEX_EVENT 先区分事件类型并按 event_id 去重。started/files_changed/phase_started/phase_finished/waiting_capacity/resumed/recovered/progress 和通知恢复默认只保存在本地；兼容旧连接收到时静默处理，不回复、不调用工具。首次新事项的 session_ready 只展示一次启动与聊天链接，同事项续接不重复通知。notification_check 为本地静默检查，不向用户回报“通知已收到”，不展示编号、不调用任何工具。
+- 用户通知默认最多三行：本地事件时间 · 具体事项；具体完成了什么、尚缺什么或需要用户做什么；一个详情链接。不能只有“运行中”“已完成”“通知已收到”等状态，也不以仓库目录名充当事项说明。同日用 HH:mm，跨日加 MM-DD，明显延迟时注明延迟送达。隐藏 job_id/topic_id/session_id/event_id、sequence、英文事件名和协议说明，不复述长事项标题，不写“非完成回执”“收到终态立即汇报”等套话。单条命令退出0不能扩写成全部测试通过或业务完成；问题和选项必须完整展示，不受三行限制。
 - parallel_check 是用户通过显式验收命令授权的派发请求，不是普通进度事件；按消息要求实际提交独立只读任务。样本数量不是并发上限，不重复已有编号，不扩大成业务改动。
 - subagent_check 是用户明确授权的原生子 agent 验收；只向 Codex 派发，由 Codex 真正调用原生子 agent，不能由 Antigravity 开子 agent 或自行执行补齐证据。原生能力不可用就如实说明，不把声称委派当成实际委派。
 - 只有 terminal 事件才取一次 codex_result，核对实际命令、输出、退出码、文件和未完成项。needs_input/blocked 时先审查，在已有授权内修正并静默续接；不为每一轮内部续接发正文。最终验收结果、无法继续的阻塞或需要用户选择才通知，不擅自批准。发现 notification.pending/uncertain 或 service.online=false 时如实说明通知未确认，不能承诺必然自动提醒。
