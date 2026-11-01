@@ -100,6 +100,13 @@ function finalHandoff(text = '') {
   if (!execution && (kind === 'blocked' || structured?.decision_scope === 'plan')) handoff.requires_user_decision = true;
   return handoff;
 }
+function changeJob(file, change) {
+  let release;
+  for (let n = 0; n < 100 && !release; n++) { release = takeFileClaim(file + '.state.claim'); if (!release) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
+  if (!release) throw new Error('Job state is busy; no state overwritten');
+  try { const current = read(file), next = change(current); if (next !== current) save(file, next); return next; }
+  finally { release(); }
+}
 function executionBlock(handoff, stderr = '', jobId = null) {
   // Only the CLI router's own execution error is machine evidence, never arbitrary
   // command stdout, an agent quote, or a successful command printing these words.
@@ -372,12 +379,36 @@ class Broker {
     let workerPid = job.worker_pid;
     const lease = path.join(this.lock, `${id}.json`);
     if (!workerPid) try { workerPid = read(lease).worker_pid; } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (!terminal.has(job.status) && (fs.existsSync(crashFile) || (Date.now() - Date.parse(job.created_at) > 15000 && !alive(workerPid)))) {
+    // Older loaded clients could overwrite a new terminal status with their generic
+    // crash fallback. Recover only this exact corruption with matching saved evidence.
+    const overwritten = job.status === 'failed' && job.error === 'Worker exited before recording completion' && job.execution_block && job.handoff?.kind === 'execution_blocked';
+    if (overwritten || (!terminal.has(job.status) && (fs.existsSync(crashFile) || (Date.now() - Date.parse(job.created_at) > 15000 && !alive(workerPid))))) {
+      return changeJob(file, current => {
+      if (current.status === 'failed' && current.error === 'Worker exited before recording completion' && current.execution_block && current.handoff?.kind === 'execution_blocked') {
+        const event = notificationEvents(file).find(e => e.kind === 'terminal' && e.status === 'execution_blocked' && e.job_id === id && e.topic_id === current.topic_id && e.conversation_id === current.conversation_id && e.execution_block?.category === 'execution_policy');
+        if (event) return { ...current, status: 'execution_blocked', error: current.execution_block.reason, ended_at: event.created_at,
+          state_recovery: { previous_error: current.error, evidence_event_id: event.event_id, recovered_at: stamp() } };
+      }
+      // Re-read under the same short claim used by worker updates, not the stale
+      // pre-liveness snapshot. A real saved terminal result must never be replaced.
+      if (terminal.has(current.status)) return current;
+      job = current;
+      if (!fs.existsSync(crashFile) && (Date.now() - Date.parse(job.created_at) <= 15000 || alive(job.worker_pid || workerPid))) return job;
       // Keep the exact session owned while its child may still run; other matters remain independent.
       if (alive(job.child_pid)) return { ...job, status: 'orphaned', error: 'Worker exited but Codex may still run; inspect this owned job before retrying' };
-      job = { ...job, status: 'failed', error: fs.existsSync(crashFile) ? tail(crashFile, 4000) : 'Worker exited before recording completion', ended_at: stamp() };
-      save(file, job);
+      const dir = path.dirname(file), result = path.join(dir, 'result.txt');
+      const handoff = fs.existsSync(result) ? finalHandoff(fs.readFileSync(result, 'utf8')) : null;
+      const stderr = tail(path.join(dir, 'stderr.log'), 8000), execution_block = executionBlock(handoff, stderr, id);
+      const worker_error = fs.existsSync(crashFile) ? tail(crashFile, 4000) : 'Worker exited before recording completion';
+      if (execution_block || ['needs_input', 'blocked', 'background_running'].includes(handoff?.kind)) {
+        const background = handoff?.kind === 'background_running' || job.background_commands?.length > 0;
+        job = { ...job, status: execution_block ? 'execution_blocked' : handoff.kind === 'background_running' ? 'failed' : handoff.kind,
+          handoff, execution_block, worker_error, error: execution_block?.reason || handoff.reason || handoff.question || handoff.text,
+          execution_state: background ? 'background_unconfirmed' : execution_block ? 'policy_blocked' : 'cli_finished', verification_state: execution_block ? 'blocked' : background ? 'pending' : 'not_verified', ended_at: stamp() };
+      } else job = { ...job, status: 'failed', worker_error, error: stderr.trim() || worker_error, ended_at: stamp() };
       this.unlock(id);
+      return job;
+      });
     }
     return job;
   }
@@ -637,8 +668,8 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
   const dir = path.dirname(file), broker = new Broker(job.settings);
   const events = fs.openSync(path.join(dir, 'events.jsonl'), 'a'), stderr = fs.openSync(path.join(dir, 'stderr.log'), 'a');
   let stopReason;
-  const update = changes => { job = { ...job, ...changes }; save(file, job); };
-  const finish = changes => { broker.unlock(job.job_id); update(changes); };
+  const update = changes => { job = changeJob(file, current => ({ ...current, ...changes })); };
+  const finish = changes => { update(changes); broker.unlock(job.job_id); };
   const notify = (key, kind, detail) => {
     try { publishNotification(file, job, key, kind, detail); }
     catch (error) { update({ notification_error: error.message }); fs.writeSync(stderr, 'notification persistence: ' + error.message + '\n'); }

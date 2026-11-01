@@ -308,6 +308,54 @@ test('execution-policy notifications preserve the plan, do not ask a new plan ch
   assert.match(eventMessage(diagnostic, { ...event, status: 'completed', execution_block: null, handoff: null }), /原操作仍受阻/);
 });
 
+test('blocked and failed user drafts show the actual error, progress and next action before diagnosis', t => {
+  const f = fixture(t, 'execution_blocked');
+  const handoff = finalHandoff('[CODEX_EXECUTION_BLOCKED]\n' + JSON.stringify({ blocked_action: '启动隔离原型', reason: 'CreateProcess: Rejected: blocked by policy', completed: ['原型构建完成', '模块测试通过'], affected_checks: ['连续播放', '音画同步'], unknowns: ['具体规则尚未确认'] }));
+  const execution_block = executionBlock(handoff, '', id), job = { ...f.job, handoff, execution_block };
+  const message = eventMessage(job, { ...f.emit('terminal', 'terminal'), handoff, execution_block });
+  const draft = message.match(/<用户通知草稿>([\s\S]*?)<\/用户通知草稿>/)[1];
+  for (const text of ['启动隔离原型', 'CreateProcess: Rejected: blocked by policy', '原型构建完成', '模块测试通过', '连续播放', '音画同步', '未恢复', '下一步', '具体规则尚未确认']) assert.ok(draft.includes(text), text);
+  assert.match(message, /先反馈，再排查/); assert.match(message, /失败、受阻、暂停或需要用户选择不受三行限制/); assert.doesNotMatch(draft, /job_id|event_id|known_facts|选择方案/);
+  const failed = eventMessage({ ...f.job, status: 'failed', error: 'link.exe exited with code 1120' }, { ...f.emit('failed', 'terminal'), status: 'failed' });
+  assert.match(failed.match(/<用户通知草稿>([\s\S]*?)<\/用户通知草稿>/)[1], /link.exe exited with code 1120/);
+});
+
+test('matching terminal evidence repairs legacy status overwrite without rewriting or replaying accepted notices', async t => {
+  const f = fixture(t, 'execution_blocked'), handoff = finalHandoff('[CODEX_EXECUTION_BLOCKED]\n{"reason":"Rejected: blocked by policy","blocked_action":"隔离原型启动"}');
+  const job = { ...f.job, handoff, execution_block: executionBlock(handoff, '', id), execution_state: 'policy_blocked', verification_state: 'blocked' }; save(f.file, job);
+  fs.writeFileSync(path.join(path.dirname(f.file), 'result.txt'), '[CODEX_EXECUTION_BLOCKED]\n{"reason":"Rejected: blocked by policy"}', 'utf8');
+  const event = f.emit('terminal', 'terminal'); await deliver(f.broker, id, async () => ({}));
+  const eventBytes = fs.readFileSync(event.file), deliveryFile = event.file.replace(/\.json$/, '.delivery.json'), deliveryBytes = fs.readFileSync(deliveryFile);
+  save(f.file, { ...job, status: 'failed', error: 'Worker exited before recording completion', ended_at: new Date().toISOString() });
+  const restarted = new Broker({ data: f.root }), recovered = restarted.get(id);
+  assert.equal(recovered.status, 'execution_blocked'); assert.equal(recovered.error, 'Rejected: blocked by policy'); assert.equal(recovered.ended_at, event.created_at);
+  assert.equal(recovered.state_recovery.evidence_event_id, event.event_id); assert.equal(recovered.state_recovery.previous_error, 'Worker exited before recording completion');
+  assert.equal(await deliver(restarted, id, async () => { throw Error('Must not replay accepted notice'); }), false);
+  assert.deepEqual(fs.readFileSync(event.file), eventBytes); assert.deepEqual(fs.readFileSync(deliveryFile), deliveryBytes);
+  save(f.file, { ...job, status: 'failed', error: 'independent worker failure' }); assert.equal(restarted.get(id).status, 'failed');
+  save(f.file, { ...job, topic_id: 'b'.repeat(24), status: 'failed', error: 'Worker exited before recording completion' }); assert.equal(restarted.get(id).status, 'failed');
+});
+
+test('a dead worker keeps a saved refusal or question and raw stderr instead of a generic crash message', t => {
+  const f = fixture(t), dir = path.dirname(f.file), stale = { ...f.job, worker_pid: 2147483647, created_at: '2000-01-01T00:00:00Z' };
+  save(f.file, stale); fs.writeFileSync(path.join(dir, 'result.txt'), '[CODEX_EXECUTION_BLOCKED]\n{"reason":"Rejected: blocked by policy","completed":["已构建"]}', 'utf8');
+  const recovered = f.broker.get(id); assert.equal(recovered.status, 'execution_blocked'); assert.equal(recovered.handoff.completed, '已构建'); assert.equal(recovered.error, 'Rejected: blocked by policy'); assert.match(recovered.worker_error, /Worker exited/);
+  save(f.file, stale); fs.writeFileSync(path.join(dir, 'result.txt'), '[CODEX_NEEDS_INPUT]\n{"question":"是否关闭正在播放的窗口？","options":["保留窗口","稍后验收"]}', 'utf8');
+  assert.equal(f.broker.get(id).status, 'needs_input'); assert.deepEqual(f.broker.get(id).handoff.options, ['保留窗口', '稍后验收']);
+  save(f.file, stale); fs.unlinkSync(path.join(dir, 'result.txt')); fs.writeFileSync(path.join(dir, 'stderr.log'), 'compiler fixture: missing runtime DLL', 'utf8');
+  const failed = f.broker.get(id); assert.equal(failed.status, 'failed'); assert.equal(failed.error, 'compiler fixture: missing runtime DLL');
+});
+
+test('liveness recovery re-reads terminal state under claim before writing a crash fallback', t => {
+  const f = fixture(t, 'completed'), terminalBytes = fs.readFileSync(f.file), readFile = fs.readFileSync; let stale = true;
+  fs.readFileSync = (file, ...args) => {
+    if (path.resolve(String(file)) === f.file && stale) { stale = false; return JSON.stringify({ ...f.job, status: 'running', worker_pid: 2147483647, created_at: '2000-01-01T00:00:00Z' }); }
+    return readFile(file, ...args);
+  };
+  try { assert.equal(f.broker.get(id).status, 'completed'); assert.deepEqual(readFile(f.file), terminalBytes); }
+  finally { fs.readFileSync = readFile; }
+});
+
 test('health allows three reconciliation intervals before declaring the notifier stale', t => {
   const f = fixture(t), previous = process.env.CODEX_EXECUTOR_DATA;
   process.env.CODEX_EXECUTOR_DATA = f.root;
