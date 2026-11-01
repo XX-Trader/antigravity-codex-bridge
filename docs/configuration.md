@@ -33,6 +33,22 @@ Codex 明确拒绝方案时输出 `[CODEX_PLAN_REJECTED]` 及 JSON：`original_p
 
 这是防遗漏和错误续接的协作门禁，不是人类身份认证：桥接不能验证调用方提交的答复是否真的来自用户，也不能识别完全新建的无关联 topic 是否故意重复同一业务。Antigravity 必须如实转交原话，不另开事项绕过门禁。
 
+## 执行策略受阻
+
+执行端以 `[CODEX_EXECUTION_BLOCKED]` 加 JSON 报告：`blocked_action`、`reason`、`known_facts`、`unknowns`、`affected_checks`、`evidence`、`completed`。兼容结构化的 `[CODEX_NEEDS_INPUT]` / `[CODEX_BLOCKED]` 中 `blocker_type="execution_policy"`，但不把任意正文中的拒绝关键词自动当成策略证据。独立的 `[CODEX_PLAN_REJECTED]` 仍是方案选择，不能用类别字段把它改成普通执行问题。
+
+桥接保存独立的 `execution_block`；终态为 `execution_blocked`、`verification_state=blocked`，没有未确认后台命令时 `execution_state=policy_blocked`。它不代表方案失败或业务验收通过。明确的 CLI router stderr（带时间戳与原生工具错误前缀）即使与 CLI 正常结束并存也会保留为机器观察的执行拒绝；普通命令 stdout、引用的报错和不相关错误不触发。结构化报告标记来源为 `executor_report`；两种来源都不自动确认具体根因，`reported_cause` 仅是执行端提出的解释。完整原文留在原结果、事件和 stderr 文件中；回执字段为有限长度摘录。旧 JSON 后附说明及已完成项数组均能读取。
+
+策略受阻通知不要求用户重新选择已确认方案，说明受阻操作、事实/未知与受影响验收；方案拒绝另行保留。通知和拒绝记录不会仅因后续诊断任务出现而被静默清除。现有15秒本地补查、去重、不盲目重放和零模型轮询保持不变。
+
+同一事项/会话的普通续接被 `[CODEX_EXECUTION_POLICY_UNRESOLVED]` 拦住。调用方须用 `execution_followup` 显式引用所有未解决的 `blocked_job_ids`，并声明 `intent`：
+
+- `diagnose`：只读、无副作用核查，原拒绝保持未解决。
+- `continue_unblocked`：只做不依赖受阻动作的已授权工作，不执行原动作或等价替代，原拒绝保持未解决。
+- `resume_after_resolution`：先有正常授权或策略修复，再提供 `resolution: {"kind":"formal_approval 或 policy_fix","evidence":"实际审批/修复证据及位置"}`。记录为调用方声明，不授予任何操作权限；当前工具限制仍优先，不能据此绕过拒绝。
+
+新任务的执行提示会收到持久化的续接模式和未解决约束。诊断或不相关工作完成不等于原任务全部完成；通过摘要、旧 parent 或原生 session 续接仍要检查这些记录。未关联的新事项不受数字并发限制，但不得伪造新事项绕过同一业务的拒绝。旧回执不追溯改写为新状态。桥接不独立认证审批真实性，不改变 Codex 内核、系统安全规则或全局权限，不启动被拒绝的程序做“自动修复”。
+
 ## 模型和速度
 
 默认不传 `-m`，继承 Codex 当前账号的模型配置。需要覆盖时用 `--model MODEL_ID`；`codex_run(model=...)` 也可为具体事项选择模型。模型 ID 是否可用取决于账号，错误时不会悄悄换模型。

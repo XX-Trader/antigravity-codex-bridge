@@ -81,17 +81,24 @@ $acceptanceContract = $prompt.Contains('逐项验收') -and $prompt.Contains('�
 $text = 'FAKE_OK resume=' + ($argv -contains 'resume') + ' unicode=' + $prompt.Contains('中文参数') + ' model=' + $argv[$mi+1] + ' effort=' + ($ec -join ',') + ' fast=' + $fast + ' sandbox=' + $argv[$si+1] + ' web_live=' + $liveWeb + ' native_subagents=' + $nativeAgents
 $text += ' acceptance_contract=' + $acceptanceContract
 $text += ' original_request=' + $prompt.Contains('USER_ORIGINAL_SENTINEL') + ' user_followup=' + $prompt.Contains('USER_FOLLOWUP_SENTINEL')
+$text += ' policy_contract=' + ($prompt.Contains('执行策略拒绝与方案不成立必须分开') -and $prompt.Contains('不自动重试、换壳、拆命令、改入口'))
+$text += ' execution_diag=' + $prompt.Contains('"intent":"diagnose"')
 if ($prompt.Contains('NEEDS_INPUT_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT] 请确认选择A还是B' }
 if ($prompt.Contains('STRUCTURED_QUESTION_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT]' + [Environment]::NewLine + '{"question":"选择工作树还是等待？","options":["工作树：隔离修改","等待：复用目录"],"recommendation":"等待","completed":"已定位文件范围"}' }
 if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { $text = '[CODEX_BACKGROUND_RUNNING] 测试命令 test-pending 退出结果未确认，请勿重跑。' }
 if ($prompt.Contains('BLOCKED_FIXTURE')) { $text = '[CODEX_BLOCKED] 方案与当前代码矛盾' }
 if ($prompt.Contains('PLAN_REJECTED_FIXTURE')) { $text = '[CODEX_PLAN_REJECTED]' + [Environment]::NewLine + '{"original_plan":"直接播放","reason":"缺少画面显示通路","impact":"原目标未完成","question":"补齐还是改方案？","options":["补齐原方案","修改目标"]}' }
+if ($prompt.Contains('POLICY_REPORTED_FIXTURE')) { $text = '[CODEX_EXECUTION_BLOCKED]' + [Environment]::NewLine + '{"blocked_action":"隔离原型启动","reason":"Rejected: blocked by policy","known_facts":["完整访问"],"unknowns":["具体规则"],"affected_checks":["连续播放"],"completed":["已构建","未实机验证"]}' + [Environment]::NewLine + '原始证据保留。' }
+if ($prompt.Contains('POLICY_COMBINED_FIXTURE')) { $text = '[CODEX_PLAN_REJECTED]' + [Environment]::NewLine + '{"reason":"另有方案矛盾","question":"如何修正方案？","options":["补齐原方案","修改要求"]}' }
+if ($prompt.Contains('POLICY_MACHINE_FIXTURE') -or $prompt.Contains('POLICY_COMBINED_FIXTURE')) { [Console]::Error.WriteLine('2026-11-01T03:33:17.760090Z ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: "Rejected: blocked by policy" }') }
+if ($prompt.Contains('POLICY_QUOTED_FIXTURE')) { $text = '测试引用 Rejected: blocked by policy，不代表真的拒绝。' }
 [IO.File]::WriteAllText($argv[$i+1], $text, [Text.UTF8Encoding]::new($false))
 $tid = '00000000-0000-0000-0000-000000000001'
 if ($argv -contains 'resume') { $tid = $argv[[Array]::IndexOf($argv, 'resume')+1] }
 elseif ($prompt.Contains('SECOND_SESSION')) { $tid = '00000000-0000-0000-0000-000000000002' }
 elseif ($prompt.Contains('TITLE_METADATA_ERROR')) { $tid = '00000000-0000-0000-0000-000000000004' }
 elseif ($prompt.Contains('PLAN_REJECTED_FIXTURE')) { $tid = '00000000-0000-0000-0000-000000000005' }
+elseif ($prompt.Contains('POLICY_')) { $tid = '00000000-0000-0000-0000-000000000006' }
 elseif ($prompt.Contains('CONCURRENT_FIXTURE')) { $tid = [guid]::NewGuid().ToString() }
 '{"type":"thread.started","thread_id":"' + $tid + '"}'
 if ($prompt.Contains('RECOVERED_ERROR_FIXTURE')) { '{"type":"error","message":"Reconnecting... 2/5 (request timed out)"}' }
@@ -366,6 +373,27 @@ exit 0
       const failed = await refused.run({ wait: true, prompt: 'PLAN_REJECTED_FIXTURE NONZERO_REFUSAL_FIXTURE', topic: '拒绝伴随退出错误' });
       assert.equal(failed.exit_code, 1); assert.equal(failed.status, 'blocked'); assert.equal(failed.handoff.requires_user_decision, true);
       assert.equal(failed.handoff.reason, '缺少画面显示通路');
+    });
+    await t.test('worker distinguishes policy blocks, persists original constraints and injects diagnostic continuation without a model', async () => {
+      const policyData = path.join(root, 'policy-runtime'); fs.mkdirSync(policyData);
+      const host = new Broker({ ...settings, data: policyData });
+      const reported = await host.run({ wait: true, prompt: 'POLICY_REPORTED_FIXTURE', topic: '执行受阻', user_request: '保留已经确认的方案 A' });
+      assert.equal(reported.status, 'execution_blocked'); assert.equal(reported.execution_state, 'policy_blocked'); assert.equal(reported.verification_state, 'blocked');
+      assert.equal(reported.execution_block.source, 'executor_report'); assert.equal(reported.handoff.requires_user_decision, undefined); assert.equal(host.lockOwner(), null);
+      assert.equal(reported.handoff.completed, '已构建\n未实机验证');
+      await assert.rejects(new Broker(host.settings).run({ prompt: '不能静默重试', topic_id: reported.topic_id }), /CODEX_EXECUTION_POLICY_UNRESOLVED/);
+      const diagnostic = await host.run({ wait: true, prompt: '只读诊断，不执行原动作', topic_id: reported.topic_id, execution_followup: { blocked_job_ids: [reported.job_id], intent: 'diagnose' } });
+      assert.equal(diagnostic.status, 'completed'); assert.equal(diagnostic.session_id, reported.session_id); assert.match(diagnostic.final_response, /policy_contract=True execution_diag=True/);
+      assert.equal(diagnostic.execution_constraints[0].blocked_job_id, reported.job_id);
+      await assert.rejects(host.run({ prompt: '诊断未解除拒绝', topic_id: reported.topic_id }), /CODEX_EXECUTION_POLICY_UNRESOLVED/);
+      const machine = await host.run({ wait: true, prompt: 'POLICY_MACHINE_FIXTURE NONZERO_REFUSAL_FIXTURE', topic: '原生日志拒绝' });
+      assert.equal(machine.exit_code, 1); assert.equal(machine.status, 'execution_blocked'); assert.equal(machine.execution_block.source, 'cli_stderr'); assert.equal(machine.execution_block.cause_status, 'unverified');
+      const quoted = await host.run({ wait: true, prompt: 'POLICY_QUOTED_FIXTURE', topic: '引用不构成拒绝' });
+      assert.equal(quoted.status, 'completed'); assert.equal(quoted.execution_block, null);
+      const both = await host.run({ wait: true, prompt: 'POLICY_COMBINED_FIXTURE', topic: '两类问题并存' });
+      assert.equal(both.status, 'execution_blocked'); assert.equal(both.execution_block.source, 'cli_stderr'); assert.equal(both.handoff.requires_user_decision, true);
+      assert.deepEqual(both.handoff.options, ['补齐原方案', '修改要求']);
+      assert.equal(new Broker(host.settings).result(reported.job_id).status, 'execution_blocked');
     });
     await t.test('structured question resumes exact topic/session with user answer; background command is not verified', async () => {
       const paused = await broker.run({ wait: true, prompt: 'STRUCTURED_QUESTION_FIXTURE', topic: '选择题交接' });

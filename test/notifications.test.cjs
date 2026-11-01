@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { Broker, save, read, publishNotification, notificationEvents, notificationSummary, commandPhase, dispatch, finalHandoff, takeFileClaim } = require('../src/server.cjs');
+const { Broker, save, read, publishNotification, notificationEvents, notificationSummary, commandPhase, dispatch, finalHandoff, executionBlock, takeFileClaim } = require('../src/server.cjs');
 const { deliver, watch, claimHost, recordedReceipt, nativeSend, eventMessage, notificationPolicy, notificationHeading, auditNotifications } = require('../src/notifier.cjs');
 const chat = '11111111-1111-1111-1111-111111111111';
 const id = 'aaaaaaaaaaaaaaaaaaaaaaaa';
@@ -274,6 +274,38 @@ test('an unacknowledged refusal notice is not erased by a newer job, restart del
   assert.equal(await deliver(new Broker({ data: f.root }), id, async (recipient, message) => { sends++; assert.equal(recipient, chat); assert.match(message, /方案被执行端拒绝/); return {}; }), true);
   assert.equal(await deliver(new Broker({ data: f.root }), id, async () => { sends++; return {}; }), false);
   assert.equal(sends, 1); assert.equal(notificationSummary(f.file).latest.state, 'accepted');
+});
+
+test('execution policy reports retain facts and unknowns, parse trailing JSON notes and never become plan approval', t => {
+  const payload = { blocked_action: '隔离原型启动', reason: 'Rejected: blocked by policy', reported_cause: '猜测：审批参数', known_facts: ['完整访问'], unknowns: ['拒绝规则'], affected_checks: ['音画同步'], completed: ['已构建', '未实机验证'], blocker_type: 'execution_policy', decision_scope: 'plan' };
+  const h = finalHandoff('[CODEX_NEEDS_INPUT]\n```json\n' + JSON.stringify(payload) + '\n```\n原始证据仍在日志中。');
+  assert.equal(h.kind, 'execution_blocked'); assert.equal(h.requires_user_decision, undefined); assert.equal(h.completed, '已构建\n未实机验证');
+  const block = executionBlock(h, '', id); assert.equal(block.source, 'executor_report'); assert.equal(block.cause_status, 'unverified'); assert.equal(block.reported_cause, payload.reported_cause); assert.equal(block.auto_retry_allowed, false);
+  assert.equal(finalHandoff('[CODEX_EXECUTION_BLOCKED] malformed {').kind, 'execution_blocked');
+  assert.equal(finalHandoff('[CODEX_PLAN_REJECTED]\n' + JSON.stringify(payload)).requires_user_decision, true, 'Do not hide an independent plan refusal');
+  assert.equal(finalHandoff('引用 [CODEX_EXECUTION_BLOCKED] 不应触发'), null);
+  assert.equal(executionBlock(null, 'a successful command printed Rejected: blocked by policy'), null);
+});
+
+test('only a native router execution-denial log is machine evidence; it does not prove a specific root cause', t => {
+  const line = '2026-11-01T03:33:17.760090Z ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: "Rejected: blocked by policy" }';
+  const block = executionBlock(null, line, id); assert.equal(block.source, 'cli_stderr'); assert.equal(block.cause_status, 'unverified'); assert.equal(block.blocked_job_id, id);
+  for (const text of [line.replace('ERROR', 'WARN'), line.replace('codex_core::tools::router', 'unrelated'), 'quoted ' + line, 'Rejected: blocked by policy']) assert.equal(executionBlock(null, text), null);
+  assert.equal(executionBlock(null, line.replace('blocked by policy', 'path not found')), null);
+  assert.equal(executionBlock(null, line + 'x'.repeat(4000)).raw_excerpt_truncated, true);
+});
+
+test('execution-policy notifications preserve the plan, do not ask a new plan choice and survive later diagnosis', async t => {
+  const f = fixture(t, 'execution_blocked'), h = finalHandoff('[CODEX_EXECUTION_BLOCKED]\n{"blocked_action":"隔离原型启动","reason":"Rejected: blocked by policy","affected_checks":["连续播放"]}'), block = executionBlock(h, '', id);
+  save(f.file, { ...f.job, created_at: '2000-01-01T00:00:00.000Z', handoff: h, execution_block: block }); const event = f.emit('terminal', 'terminal');
+  assert.deepEqual(event.execution_block, block); assert.deepEqual(new Broker({ data: f.root }).receipt(id).execution_block, block);
+  const message = eventMessage(read(f.file), event), draft = message.match(/<用户通知草稿>([\s\S]*?)<\/用户通知草稿>/)[1];
+  for (const text of ['执行策略受阻', '原方案保留', '隔离原型启动', '连续播放']) assert.ok(draft.includes(text));
+  assert.ok(!draft.includes('方案被执行端拒绝')); assert.ok(!draft.includes('选择')); assert.match(message, /不自动重试/); assert.match(message, /不是权限授予/);
+  const next = 'b'.repeat(24); fs.mkdirSync(path.dirname(f.broker.jobPath(next)));
+  const diagnostic = { ...f.job, job_id: next, status: 'completed', created_at: '2001-01-01T00:00:00.000Z', execution_followup: { intent: 'diagnose', blocked_job_ids: [id] }, execution_constraints: [block] }; save(f.broker.jobPath(next), diagnostic);
+  assert.equal(await deliver(f.broker, id, async () => ({})), true); assert.equal(await deliver(new Broker({ data: f.root }), id, async () => { throw Error('duplicate'); }), false);
+  assert.match(eventMessage(diagnostic, { ...event, status: 'completed', execution_block: null, handoff: null }), /原操作仍受阻/);
 });
 
 test('health allows three reconciliation intervals before declaring the notifier stale', t => {

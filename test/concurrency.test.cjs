@@ -7,7 +7,7 @@ const cp = require('node:child_process');
 // Admission-only tests do not start Codex or a worker. Native worker isolation is tested separately.
 const originalSpawn = cp.spawn;
 cp.spawn = () => ({ pid: process.pid, on() {}, unref() {} });
-const { Broker, save, dispatch, finalHandoff } = require('../src/server.cjs');
+const { Broker, save, dispatch, finalHandoff, executionBlock } = require('../src/server.cjs');
 cp.spawn = originalSpawn;
 function fixture(t) {
   const base = fs.realpathSync(process.env.CODEX_EXECUTOR_TEST_ROOT), root = fs.mkdtempSync(path.join(base, 'concurrency-'));
@@ -56,6 +56,7 @@ test('all execution entry schemas expose original and followup separately from t
     assert.equal(properties.user_request.type, 'string'); assert.equal(properties.user_followup.type, 'string');
     assert.equal(properties.prompt.type, 'string');
     assert.deepEqual(properties.plan_decision.required, ['refusal_job_id']);
+    assert.deepEqual(properties.execution_followup.required, ['blocked_job_ids', 'intent']);
   }
 });
 
@@ -97,6 +98,44 @@ test('ordinary implementation errors do not require a human plan decision, stale
   assert.ok(f.broker.start({ prompt: '自行修复编译错误', parent_job_id: first.job_id }).job_id);
   for (const value of [null, [], {}, { refusal_job_id: 'bad' }, { refusal_job_id: first.job_id, approved: true }]) assert.throws(() => f.broker.start({ prompt: 'invalid decision', plan_decision: value }), /plan_decision/);
   assert.throws(() => f.broker.start({ prompt: '不能复用别的事项的 ID', plan_decision: { refusal_job_id: first.job_id }, user_followup: '同意' }), /unresolved refusal/);
+});
+
+test('policy blocks persist independently of plan choices; diagnosis and unaffected work never clear the block', async t => {
+  const f = fixture(t), thread = '12345678-1234-1234-1234-123456789abc';
+  const finish = (job, handoff = null) => { save(f.broker.jobPath(job.job_id), { ...f.broker.get(job.job_id), status: handoff ? 'execution_blocked' : 'completed', thread_id: thread, handoff, execution_block: executionBlock(handoff, '', job.job_id) }); f.broker.unlock(job.job_id); };
+  const first = f.broker.start({ prompt: '原方案', user_request: '方案 A 已确认，保留它。' }); finish(first);
+  const blocked = f.broker.start({ prompt: '执行', parent_job_id: first.job_id }), handoff = finalHandoff('[CODEX_EXECUTION_BLOCKED]\n{"blocked_action":"隔离原型启动","reason":"Rejected: blocked by policy","affected_checks":["连续播放"]}'); finish(blocked, handoff);
+  const original = fs.readFileSync(f.broker.jobPath(blocked.job_id)), restarted = new Broker(f.settings), count = restarted.list().length;
+  for (const args of [{ topic_id: blocked.topic_id }, { parent_job_id: first.job_id }, { topic_id: blocked.topic_id, user_followup: '我再次同意方案 A' }]) assert.throws(() => restarted.start({ prompt: '继续执行', ...args }), /CODEX_EXECUTION_POLICY_UNRESOLVED/);
+  await assert.rejects(restarted.run({ prompt: '原生会话绕过', session_id: thread }), /CODEX_EXECUTION_POLICY_UNRESOLVED/);
+  assert.throws(() => restarted.start({ prompt: '业务确认不是策略解除', topic_id: blocked.topic_id, plan_decision: { refusal_job_id: blocked.job_id }, user_followup: '同意' }), /unresolved refusal/);
+  assert.equal(restarted.list().length, count);
+  const followup = { blocked_job_ids: [blocked.job_id], intent: 'diagnose' };
+  const response = dispatch(restarted, { method: 'tools/call', params: { name: 'codex_continue', arguments: { job_id: first.job_id, prompt: '只读检查', execution_followup: followup } } });
+  assert.notEqual(response.isError, true);
+  const diagnostic = JSON.parse(response.content[0].text), saved = restarted.get(diagnostic.job_id);
+  assert.equal(saved.execution_followup.intent, 'diagnose'); assert.equal(saved.execution_constraints[0].blocked_job_id, blocked.job_id);
+  assert.equal(saved.request_context.original_text, '方案 A 已确认，保留它。'); assert.equal(saved.topic_id, blocked.topic_id); assert.equal(saved.thread_id, thread);
+  finish(diagnostic);
+  assert.throws(() => new Broker(f.settings).start({ prompt: '诊断结束不是放行', parent_job_id: first.job_id }), /CODEX_EXECUTION_POLICY_UNRESOLVED/);
+  const independent = restarted.start({ prompt: '另一个独立任务' }); assert.ok(independent.job_id);
+  const unaffected = restarted.start({ prompt: '仅做其它已授权工作', parent_job_id: first.job_id, execution_followup: { ...followup, intent: 'continue_unblocked' } }); finish(unaffected);
+  assert.throws(() => restarted.start({ prompt: '仍不能静默重试', parent_job_id: first.job_id }), /CODEX_EXECUTION_POLICY_UNRESOLVED/);
+  const resolved = restarted.start({ prompt: '只验证续接记录，不执行原动作', parent_job_id: first.job_id, execution_followup: { ...followup, intent: 'resume_after_resolution', resolution: { kind: 'policy_fix', evidence: 'fixture: operator supplied a verified repair record; this grants no permission' } } });
+  assert.equal(resolved.execution_followup.evidence_status, 'caller_reported_not_a_permission_grant'); assert.deepEqual(resolved.execution_constraints, []); finish(resolved);
+  assert.ok(new Broker(f.settings).start({ prompt: '后续步骤', parent_job_id: first.job_id }).job_id);
+  assert.deepEqual(fs.readFileSync(f.broker.jobPath(blocked.job_id)), original);
+});
+
+test('execution followups reject unrelated IDs, invalid modes and unsupported resolution claims before admission', t => {
+  const f = fixture(t), first = f.broker.start({ prompt: '原任务' }), h = finalHandoff('[CODEX_EXECUTION_BLOCKED] 未提供细分原因');
+  save(f.broker.jobPath(first.job_id), { ...f.broker.get(first.job_id), status: 'execution_blocked', thread_id: '12345678-1234-1234-1234-123456789abc', handoff: h, execution_block: executionBlock(h, '', first.job_id) }); f.broker.unlock(first.job_id);
+  const valid = { blocked_job_ids: [first.job_id], intent: 'diagnose' };
+  for (const value of [null, [], {}, { ...valid, blocked_job_ids: [] }, { ...valid, blocked_job_ids: [first.job_id, first.job_id] }, { ...valid, intent: 'retry_anyway' }, { ...valid, approved: true }]) assert.throws(() => f.broker.start({ prompt: 'invalid', topic_id: first.topic_id, execution_followup: value }), /Invalid execution_followup/);
+  assert.throws(() => f.broker.start({ prompt: 'wrong identity', topic_id: first.topic_id, execution_followup: { ...valid, blocked_job_ids: ['a'.repeat(24)] } }), /all unresolved/);
+  assert.throws(() => f.broker.start({ prompt: 'diagnosis is not resolution', topic_id: first.topic_id, execution_followup: { ...valid, resolution: { kind: 'policy_fix', evidence: 'x' } } }), /must not claim/);
+  for (const resolution of [undefined, null, { kind: 'business_plan_confirmed', evidence: '用户确认方案' }, { kind: 'policy_fix', evidence: '' }, { kind: 'formal_approval', evidence: 'x'.repeat(4001) }]) assert.throws(() => f.broker.start({ prompt: 'invalid resolution', topic_id: first.topic_id, execution_followup: { ...valid, intent: 'resume_after_resolution', resolution } }), /formal_approval or policy_fix/);
+  assert.equal(f.broker.list().length, 1);
 });
 test('same-worktree admission has no numeric running-task cap, active listing exceeds twenty', t => {
   const f = fixture(t), jobs = Array.from({ length: 64 }, (_, n) => f.broker.start({ prompt: 'independent task ' + n }));
