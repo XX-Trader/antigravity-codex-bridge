@@ -8,6 +8,15 @@ const { Broker, save, read, publishNotification, notificationEvents, notificatio
 const { deliver, watch, claimHost, recordedReceipt, nativeSend, eventMessage, notificationPolicy, notificationHeading, auditNotifications } = require('../src/notifier.cjs');
 const chat = '11111111-1111-1111-1111-111111111111';
 const id = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+test('review feedback reports the actual issue and routes technical revisions to fresh review, not user approval', t => {
+  const f = fixture(t, 'review_revise');
+  const handoff = { kind: 'review_revise', reason: '方案调用不存在的接口', evidence: ['已核对当前接口列表'], suggested_changes: '按当前接口重新设计', requires_user_decision: false };
+  const job = { ...f.job, handoff, stage: 'review_held', plan_review: { status: 'revise_required' } };
+  const message = eventMessage(job, { schema: 2, kind: 'terminal', status: 'review_revise', handoff, created_at: new Date().toISOString() });
+  assert.match(message, /方案调用不存在的接口/); assert.match(message, /已核对当前接口列表/);
+  assert.match(message, /review_followup.review_job_id/); assert.match(message, /重新审核/);
+  assert.doesNotMatch(message, /【方案被执行端拒绝，必须反馈用户】/);
+});
 function fixture(t, status = 'running', schema = 2) {
   const base = fs.realpathSync(process.env.CODEX_EXECUTOR_TEST_ROOT);
   const root = fs.mkdtempSync(path.join(base, 'notices-'));

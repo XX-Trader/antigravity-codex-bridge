@@ -115,6 +115,31 @@ worker 先保存终态再释放事项登记；状态更新与崩溃恢复共用�
 
 MCP 和 Sidecar 分别加载。配置写入后检查真实进程路径及 `notification.service`，不要把配置文件更新当成旧 MCP 已热加载。恢复时保留原任务与产物，没有 Sidecar 仍可手动领取结果，但不能承诺自动提醒。
 
+## 先审核再执行
+
+`codex_run`、`codex_start` 和同事项续接都从 `stage=review` 开始。用户原文与后续补充单独保存，`prompt` 承载规划端方案、证据来源和验收建议。审核只读，由同一个 Codex 执行者完成，不额外启动审核 agent；缺少原文时仍可受理旧调用，但不能通过审核进入实施。
+
+审核最终返回 `[CODEX_REVIEW_APPROVED]`、`[CODEX_REVIEW_REVISE]` 或 `[CODEX_REVIEW_NEEDS_EVIDENCE]` 及 JSON。所有审核回执须原样带回 `plan_sha256`；通过结果还须有非空 `evidence`、`allowed_scope` 和成功工具核查记录。输入版本绑定本任务、cwd、环境、方案、用户原文与后续补充、审核答复及执行策略约束，调用方不能通过参数自行批准。审核阶段出现文件变更事件时暂停；回执缺失、无效、版本不符或后台核查命令退出未确认时不启动执行。
+
+通过后桥接在同一 job、同一原生会话自动续接 `stage=execute`，将审核范围交给执行者；不要求用户再次批准已授权工作。审核输出为 `review-attempt-N.result.txt`，执行输出为 `attempt-N.result.txt`；审核尝试保存在 `plan_review.attempts`，执行尝试仍在 `attempts`，usage 包含两阶段。最终回执、列表和终态通知保留审核结果。每次修改方案或补充要求后重新审核，不复用另一任务或旧版本的批准。
+
+技术问题用 `decision_scope=technical`，任务结束为 `review_revise` 或 `review_needs_evidence`。规划端领取回执并回应后，按原 topic/session 续接：
+
+```json
+{
+  "topic_id": "原事项编号",
+  "prompt": "修订方案、补充依据及原验收条件",
+  "review_followup": {
+    "review_job_id": "未解决的技术审核任务编号",
+    "response": "逐项回应审核发现的问题，说明修订和补证"
+  }
+}
+```
+
+修订仍需由 Codex 审核，规划端的同意不构成批准。改变用户目标、明确约束、验收或授权时使用 `decision_scope=user`，保留问题和选项，等待真实用户答复，再通过 `plan_decision` 和逐字 `user_followup` 续接。旧方案拒绝与执行策略门禁继续保留；技术重审不能清除策略拒绝。
+
+执行中发现关键假设失效时返回 `[CODEX_REVIEW_REVISE]`，说明原因、证据、已完成部分和决定归属；暂停受影响操作，保留已有工作，修订后重审。审核通过仍是执行者基于有限证据的判断，不能证明内容正确或业务已完成。完整访问下的只读限制由执行者遵守，协议不具备操作系统写隔离，也不能识别全部 shell 副作用。
+
 ## 同工作树并发
 
 独立事项不设数量上限、不默认排队；`active-tasks/` 仅登记各自拥有的任务，短暂的 `dispatch.claim` 只保护接收与同会话去重，不占用任务整个运行期。旧 `active.lock` 保留兼容清理，不再阻止新独立事项。各任务的 job、会话、通知、结果及取消仍独立，单个任务结束只释放自身登记。

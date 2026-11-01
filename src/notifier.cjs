@@ -93,19 +93,23 @@ function eventMessage(job, event) {
   const execution = event.kind === 'terminal' && (event.execution_block || job.execution_block);
   const restrictedWork = event.kind === 'terminal' && job.execution_constraints?.length;
   const refusal = event.kind === 'terminal' && handoff?.requires_user_decision;
+  const review = event.kind === 'terminal' && !refusal && ['review_revise', 'review_needs_evidence'].includes(handoff?.kind);
+  const reviewControl = review ? `\n【独立审核未通过，未进入执行】先反馈具体原因、证据和未完成范围。技术问题由你与 Codex 在原事项讨论：把修订或新增证据写入 prompt，带 review_followup.review_job_id=${job.job_id} 和 response 逐项回应，再由 Codex 重新审核；不得把你的同意当成审核通过，不用新事项/旧会话跳过审核。能自行查明的事实先补证，不能编造用户原文。改变用户目标、约束、验收或授权时才交用户决定；已有用户决定门禁仍保留。执行中的新证据推翻假设时同样重新审核，已完成工作不重做。` : '';
   const choice = event.kind === 'terminal' && !refusal && !execution && ['needs_input', 'blocked'].includes(event.status)
     ? `\n【需要判断/用户选择】${handoff?.question || handoff?.text || '请领取原回执查看具体问题。'}${handoff?.options?.length ? '\n选项：' + handoff.options.map((v, i) => `${i + 1}. ${v}`).join('\n') : ''}${handoff?.recommendation ? '\nCodex建议（不是用户授权）：' + handoff.recommendation : ''}\n只有已有明确授权能解决时才能继续；涉及用户偏好、范围、权限或不可逆选择须向用户原样展示问题/选项，等待回答。不得默认选推荐项。用户回答后用原 topic_id/session_id 续接一次，不重开事项。` : '';
   const background = event.kind === 'terminal' && (event.execution_state || job.execution_state) === 'background_unconfirmed'
     ? `\n【后台执行尚未确认结束】Codex对话轮次已结束，但后台命令的退出结果未确认，测试/业务验收仍待完成。${JSON.stringify(event.background_commands || job.background_commands || [])} ${handoff?.kind === 'background_running' ? handoff.text : ''}请先判断等待、核查原命令还是需要用户决定；不能把CLI退出0当成测试通过，不重跑仍可能活动的命令。` : '';
   const refusalControl = refusal ? `\n【方案被执行端拒绝，必须反馈用户】分别说明原计划、Codex拒绝理由、影响及你的建议；默认不用代码、文件名或底层日志解释，原回执保留为详情。不得掩盖拒绝、替用户批准、静默改方案或报告已解决。先等待用户决定，再用原 topic_id/session_id、plan_decision.refusal_job_id=${job.job_id} 和逐字 user_followup 续接。桥接器只记录调用方转交的答复，不独立认证用户身份或批准。` : '';
-  const problem = event.kind === 'terminal' && (execution || refusal || ['failed', 'timed_out', 'cancelled', 'needs_input', 'blocked'].includes(event.status));
+  const problem = event.kind === 'terminal' && (execution || refusal || review || ['failed', 'timed_out', 'cancelled', 'needs_input', 'blocked'].includes(event.status));
   const feedbackFirst = problem ? '\n【先反馈，再排查】领取一次原回执后，本次回复先向用户说明具体问题、原始错误短摘、已完成与受影响部分、受阻动作是否暂停及下一步；再安排诊断或不受阻工作。不能为了继续调查、等待另一任务或压缩摘要而不反馈。原因未核实就明说，accepted不是用户已看到的证据；不自动重发结果不明的通知。普通可自行修复的过程错误、网络重连和本地15秒补查不逐次通知。' : '';
   const executionControl = execution ? `\n【执行策略受阻，不是方案被否定】原方案和已完成结果保留，不要求用户重选已确认方案。已知事实与未知原因分开；来源=${execution.source}，原因核实状态=${execution.cause_status}，原始拒绝=${execution.reason}，已知=${JSON.stringify(execution.known_facts)}，未知=${JSON.stringify(execution.unknowns)}。只领取一次原回执，不凭完整访问或错误文字推断根因；不自动重试、换壳/拆命令/改入口/改权限规则规避。可明确声明 execution_followup，引用全部未解决 blocked_job_ids，以 diagnose 做只读核查或 continue_unblocked 仅做不依赖受阻动作的工作；这些不能清除原拒绝。恢复原动作必须先完成正常授权或策略修复，resume_after_resolution 仅记录其证据，不是权限授予；平台仍拒绝就继续保留受阻。向用户只说明什么受阻、已知/未知、影响哪些验收，详情展开，不用技术选项反复打扰。` : '';
-  const label = execution ? '执行策略受阻' : refusal ? '方案被执行端拒绝' : restrictedWork ? '本轮结束，原操作仍受阻' : ['needs_input', 'blocked'].includes(event.status) ? '需要判断' : ['failed', 'timed_out', 'cancelled'].includes(event.status) ? '执行未完成' : '执行结果';
+  const label = execution ? '执行策略受阻' : refusal ? '方案被执行端拒绝' : review ? (handoff.kind === 'review_revise' ? '方案需要修订' : '审核证据不足') : restrictedWork ? '本轮结束，原操作仍受阻' : ['needs_input', 'blocked'].includes(event.status) ? '需要判断' : ['failed', 'timed_out', 'cancelled'].includes(event.status) ? '执行未完成' : '执行结果';
   const content = execution
     ? `受阻操作：${execution.blocked_action}\n原始错误：${String(execution.reason || '未提供原始错误，需核对回执').slice(0, 3000)}\n${handoff?.completed ? '已完成：' + handoff.completed + '\n' : ''}${execution.affected_checks?.length ? '未完成/受影响：' + execution.affected_checks.join('；') : '相关运行验收尚未完成。'}\n当前：受阻动作未恢复${background ? '；其他后台命令是否结束仍待确认' : ''}。原方案保留，不代表方案不成立。\n下一步：核对正常授权或策略修复途径，不自动重试；无需重新确认原业务方案。具体规则尚未核实${execution.unknowns?.length ? '：' + execution.unknowns.join('；') : '。'}${refusal ? '\n另有方案选择：' + (handoff.reason || handoff.question || handoff.text) + (handoff.options?.length ? '\n' + handoff.options.join('\n') : '') : ''}`
     : refusal
     ? `${handoff.original_plan ? '原计划：' + handoff.original_plan + '\n' : ''}执行端反馈：${handoff.reason || handoff.text}\n${handoff.impact ? '影响：' + handoff.impact + '\n' : ''}${handoff.question || '需要你决定是否修改方案；目前尚未解决。'}${handoff.options?.length ? '\n' + handoff.options.map((v, i) => `${i + 1}. ${v}`).join('\n') : ''}`
+    : review
+      ? `审核意见：${handoff.reason || handoff.text}\n${handoff.evidence?.length ? '核查依据：' + handoff.evidence.join('；') + '\n' : ''}${handoff.suggested_changes ? '待修订/补证：' + handoff.suggested_changes + '\n' : ''}当前：受影响操作已暂停，尚未完成最终验收。下一步：在原事项补证或修订，重新审核后再执行。`
     : ['failed', 'timed_out', 'cancelled'].includes(event.status)
       ? `具体问题：${String(job.error || event.detail || '未提供原始错误，需要核对日志').slice(0, 3000)}\n${handoff?.completed ? '已完成：' + handoff.completed + '\n' : ''}当前：本轮已结束，最终验收未通过或未完成${background ? '；后台命令退出未确认' : ''}。\n下一步：保留已完成结果，核对原回执和失败日志后处理；只有需要改变目标或授权时才请你决定。`
     : restrictedWork
@@ -115,7 +119,7 @@ function eventMessage(job, event) {
     : (event.execution_state || job.execution_state) === 'background_unconfirmed'
       ? `${handoff?.completed ? '已完成：' + handoff.completed + '\n' : ''}后台命令是否结束尚未确认，最终测试或运行验收还没有结论。`
     : noticeResult(event.result_text || job.error || event.detail) || '尚未取得具体结果说明，需要核对原任务回执。';
-  return `${internal(`${checks.has(event.kind) ? '这是用户授权的验收派发。' : '这是后台事件，不是新的用户任务。'}${action}${choice}${refusalControl}${executionControl}${background}${feedbackFirst}`)}\n${draft(label, content)}\n${compact}草稿摘自原结果，必须先领取回执并核验，再改写成具体完成内容与未完成项；禁止原样回复“已收到 event_id”或只报状态。单条命令退出0不能扩写成全部测试通过或业务完成。非阻塞的正常内部工作静默续接；失败、受阻或需要用户处理时先反馈具体问题，不能等诊断或下一轮完成才说。`;
+  return `${internal(`${checks.has(event.kind) ? '这是用户授权的验收派发。' : '这是后台事件，不是新的用户任务。'}${action}${choice}${refusalControl}${reviewControl}${executionControl}${background}${feedbackFirst}`)}\n${draft(label, content)}\n${compact}草稿摘自原结果，必须先领取回执并核验，再改写成具体完成内容与未完成项；禁止原样回复“已收到 event_id”或只报状态。单条命令退出0不能扩写成全部测试通过或业务完成。非阻塞的正常内部工作静默续接；失败、受阻或需要用户处理时先反馈具体问题，不能等诊断或下一轮完成才说。`;
 }
 function claimHost(data, generation) {
   const file = path.join(data, 'notification-host.json'), release = takeClaim(file + '.claim');

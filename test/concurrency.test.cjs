@@ -7,7 +7,7 @@ const cp = require('node:child_process');
 // Admission-only tests do not start Codex or a worker. Native worker isolation is tested separately.
 const originalSpawn = cp.spawn;
 cp.spawn = () => ({ pid: process.pid, on() {}, unref() {} });
-const { Broker, save, dispatch, finalHandoff, executionBlock } = require('../src/server.cjs');
+const { Broker, save, dispatch, finalHandoff, executionBlock, reviewVersion, reviewOutcome } = require('../src/server.cjs');
 cp.spawn = originalSpawn;
 function fixture(t) {
   const base = fs.realpathSync(process.env.CODEX_EXECUTOR_TEST_ROOT), root = fs.mkdtempSync(path.join(base, 'concurrency-'));
@@ -57,7 +57,39 @@ test('all execution entry schemas expose original and followup separately from t
     assert.equal(properties.prompt.type, 'string');
     assert.deepEqual(properties.plan_decision.required, ['refusal_job_id']);
     assert.deepEqual(properties.execution_followup.required, ['blocked_job_ids', 'intent']);
+    assert.deepEqual(properties.review_followup.required, ['review_job_id', 'response']);
   }
+});
+
+test('review approval binds the exact task, original, followups, environment and recorded scope', t => {
+  const f = fixture(t), first = f.broker.start({ prompt: '基于真实接口的方案', user_request: '不改变原目标', plan_review: { status: 'approved' } });
+  const job = { ...f.broker.get(first.job_id), thread_id: '12345678-1234-1234-1234-123456789abc' };
+  assert.equal(job.stage, 'review'); assert.equal(job.plan_review.status, 'pending', 'Caller cannot inject approval');
+  const reply = '[CODEX_REVIEW_APPROVED]\n' + JSON.stringify({ plan_sha256: job.plan_review.plan_sha256, evidence: ['src 接口已读取'], allowed_scope: ['只改约定模块，不删除原数据'] });
+  assert.equal(reviewOutcome(reply, job).status, 'approved');
+  for (const delta of [{ prompt: '更换方案' }, { cwd: f.root }, { sandbox: 'read-only' }, { request_context: { original_text: '偷偷改变目标', followups: [] } }, { request_context: { ...job.request_context, followups: [{ text: '新约束' }] } }, { execution_constraints: [{ reason: '策略拒绝' }] }]) {
+    assert.notEqual(reviewVersion({ ...job, ...delta }), job.plan_review.plan_sha256);
+    assert.equal(reviewOutcome(reply, { ...job, ...delta }).status, 'needs_evidence');
+  }
+  assert.equal(reviewOutcome(reply, job, '已观察到文件变更').status, 'needs_evidence');
+  const revision = finalHandoff('[CODEX_REVIEW_REVISE]\n' + JSON.stringify({ decision_scope: 'technical', reason: '接口不存在', suggested_changes: ['核对接口', '保留原目标'] }));
+  assert.equal(revision.suggested_changes, '核对接口\n保留原目标');
+});
+
+test('technical review cannot be skipped through old parents, sessions, restarts or unrelated review IDs', async t => {
+  const f = fixture(t), thread = '12345678-1234-1234-1234-123456789abc';
+  const first = f.broker.start({ prompt: '初始方案', user_request: '保留全部约束' });
+  save(f.broker.jobPath(first.job_id), { ...f.broker.get(first.job_id), status: 'completed', thread_id: thread }); f.broker.unlock(first.job_id);
+  const held = f.broker.start({ prompt: '需要修订的方案', parent_job_id: first.job_id });
+  const handoff = finalHandoff('[CODEX_REVIEW_REVISE]\n' + JSON.stringify({ reason: '接口不存在', decision_scope: 'technical', evidence: ['当前接口列表'], suggested_changes: '按当前接口修订' }));
+  save(f.broker.jobPath(held.job_id), { ...f.broker.get(held.job_id), status: 'review_revise', handoff, thread_id: thread }); f.broker.unlock(held.job_id);
+  const restarted = new Broker(f.settings);
+  for (const identity of [{ topic_id: held.topic_id }, { parent_job_id: first.job_id }]) assert.throws(() => restarted.start({ prompt: '直接执行', ...identity }), /CODEX_REVIEW_FOLLOWUP_REQUIRED/);
+  await assert.rejects(restarted.run({ prompt: '直接执行', session_id: thread }), /CODEX_REVIEW_FOLLOWUP_REQUIRED/);
+  assert.throws(() => restarted.start({ prompt: '修订', topic_id: held.topic_id, review_followup: { review_job_id: first.job_id, response: '已修改' } }), /unresolved technical review/);
+  const revised = restarted.start({ prompt: '新的修订方案', parent_job_id: first.job_id, review_followup: { review_job_id: held.job_id, response: '已核对并修正接口' } });
+  assert.equal(revised.plan_review.status, 'pending'); assert.equal(revised.stage, 'review');
+  assert.equal(restarted.get(revised.job_id).request_context.original_text, '保留全部约束');
 });
 
 test('explicit refusal survives restart and blocks topic, old-parent and native-session shortcuts', async t => {

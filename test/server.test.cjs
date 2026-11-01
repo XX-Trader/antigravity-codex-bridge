@@ -5,7 +5,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const readline = require('node:readline');
-const { taskTitle, syncTaskTitle, chatAccess, toolResponse, latestProgress, save, worker, capacityRetryAt, isCapacity, capacityMessage, Broker, config: parseConfig, dispatch, terminal, childEnvironment } = require('../src/server.cjs');
+const { taskTitle, syncTaskTitle, chatAccess, toolResponse, latestProgress, save, worker, capacityRetryAt, isCapacity, capacityMessage, Broker: RealBroker, config: parseConfig, dispatch, terminal, childEnvironment } = require('../src/server.cjs');
+// Supply an actual fixture request for independent mock tasks; continuations inherit theirs.
+class Broker extends RealBroker {
+  start(input, ...rest) {
+    const hasContext = input.parent_job_id || input.topic_id || input.session_id;
+    return super.start({ ...(!hasContext ? { user_request: '测试用户要求：按本次测试任务执行并核验。' } : {}), ...input }, ...rest);
+  }
+}
 
 const { originHook, deliver, watch } = require('../src/notifier.cjs');
 const fixtureAliases = { luna: 'fixture-luna', terra: 'fixture-terra', sol: 'fixture-sol' };
@@ -58,6 +65,33 @@ if ($argv -contains 'app-server') {
 }
 $prompt = $input -join "\n"
 $argv = @($args)
+if ($prompt.Contains('当前是独立审核阶段（stage=review）')) {
+  $oi = [Array]::IndexOf($argv, '-o')
+  $version = [regex]::Match($prompt, '本轮方案版本：([a-f0-9]{64})').Groups[1].Value
+  $review = @{ plan_sha256 = $version; evidence = @('已实际读取 fixture README 并核对目标'); allowed_scope = @('仅按测试要求实施，不扩大任务范围'); reason = 'fixture 审核通过'; decision_scope = 'technical' }
+  $marker = 'APPROVED'
+  if ($prompt.Contains('REVIEW_REVISE_FIXTURE')) { $marker = 'REVISE'; $review.reason = '方案调用不存在的接口'; $review.suggested_changes = '依据当前接口修订'; $review.Remove('allowed_scope') }
+  if ($prompt.Contains('REVIEW_EVIDENCE_FIXTURE')) { $marker = 'NEEDS_EVIDENCE'; $review.reason = '缺少实际运行日志'; $review.suggested_changes = '补充真实日志'; $review.Remove('allowed_scope') }
+  if ($prompt.Contains('REVIEW_USER_FIXTURE')) { $marker = 'REVISE'; $review.decision_scope = 'user'; $review.reason = '需要改变用户明确限制'; $review.question = '是否改变限制？'; $review.options = @('保留原限制', '明确更改限制') }
+  if ($prompt.Contains('REVIEW_WRONG_VERSION_FIXTURE')) { $review.plan_sha256 = 'f' * 64 }
+  if ($prompt.Contains('REVIEW_EMPTY_SCOPE_FIXTURE')) { $review.allowed_scope = @() }
+  $tid = '00000000-0000-0000-0000-000000000001'
+  if ($argv -contains 'resume') { $tid = $argv[[Array]::IndexOf($argv, 'resume')+1] }
+  elseif (($prompt -match 'REVIEW_[A-Z_]+_FIXTURE') -or $prompt.Contains('CONCURRENT_FIXTURE')) { $tid = [guid]::NewGuid().ToString() }
+  elseif ($prompt.Contains('SECOND_SESSION')) { $tid = '00000000-0000-0000-0000-000000000002' }
+  elseif ($prompt.Contains('TITLE_METADATA_ERROR')) { $tid = '00000000-0000-0000-0000-000000000004' }
+  elseif ($prompt.Contains('PLAN_REJECTED_FIXTURE')) { $tid = '00000000-0000-0000-0000-000000000005' }
+  elseif ($prompt.Contains('POLICY_')) { $tid = '00000000-0000-0000-0000-000000000006' }
+  elseif ($prompt.Contains('CAPACITY_')) { $tid = '00000000-0000-0000-0000-000000000009' }
+  $text = '[CODEX_REVIEW_' + $marker + ']' + [Environment]::NewLine + ($review | ConvertTo-Json -Depth 6 -Compress)
+  if ($prompt.Contains('REVIEW_NO_MARKER_FIXTURE')) { $text = '看起来没问题，直接执行吧。' }
+  [IO.File]::WriteAllText($argv[$oi+1], $text, [Text.UTF8Encoding]::new($false))
+  '{"type":"thread.started","thread_id":"' + $tid + '"}'
+  if (-not $prompt.Contains('REVIEW_NO_TOOLS_FIXTURE')) { '{"type":"item.completed","item":{"type":"command_execution","command":"read fixture README","exit_code":0}}' }
+  if ($prompt.Contains('REVIEW_WRITE_FIXTURE')) { '{"type":"item.completed","item":{"type":"file_change","changes":[]}}' }
+  '{"type":"turn.completed"}'
+  exit 0
+}
 if ($prompt.Contains('SLOW_FIXTURE')) { Start-Sleep -Seconds 60 }
 if ($prompt.Contains('FAIL_FIXTURE')) { [Console]::Error.WriteLine('fixture failure'); exit 7 }
 if ($prompt.Contains('EMPTY_FIXTURE')) { exit 0 }
@@ -87,6 +121,7 @@ if ($prompt.Contains('NEEDS_INPUT_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT] 请�
 if ($prompt.Contains('STRUCTURED_QUESTION_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT]' + [Environment]::NewLine + '{"question":"选择工作树还是等待？","options":["工作树：隔离修改","等待：复用目录"],"recommendation":"等待","completed":"已定位文件范围"}' }
 if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { $text = '[CODEX_BACKGROUND_RUNNING] 测试命令 test-pending 退出结果未确认，请勿重跑。' }
 if ($prompt.Contains('BLOCKED_FIXTURE')) { $text = '[CODEX_BLOCKED] 方案与当前代码矛盾' }
+if ($prompt.Contains('EXECUTION_REVIEW_INVALIDATED_FIXTURE')) { $text = '[CODEX_REVIEW_REVISE]' + [Environment]::NewLine + '{"decision_scope":"technical","reason":"新的运行证据推翻原假设","evidence":["实际接口返回不同"],"completed":"已完成只读检查","suggested_changes":"按实际接口重新设计"}' }
 if ($prompt.Contains('PLAN_REJECTED_FIXTURE')) { $text = '[CODEX_PLAN_REJECTED]' + [Environment]::NewLine + '{"original_plan":"直接播放","reason":"缺少画面显示通路","impact":"原目标未完成","question":"补齐还是改方案？","options":["补齐原方案","修改目标"]}' }
 if ($prompt.Contains('POLICY_REPORTED_FIXTURE')) { $text = '[CODEX_EXECUTION_BLOCKED]' + [Environment]::NewLine + '{"blocked_action":"隔离原型启动","reason":"Rejected: blocked by policy","known_facts":["完整访问"],"unknowns":["具体规则"],"affected_checks":["连续播放"],"completed":["已构建","未实机验证"]}' + [Environment]::NewLine + '原始证据保留。' }
 if ($prompt.Contains('POLICY_COMBINED_FIXTURE')) { $text = '[CODEX_PLAN_REJECTED]' + [Environment]::NewLine + '{"reason":"另有方案矛盾","question":"如何修正方案？","options":["补齐原方案","修改要求"]}' }
@@ -148,12 +183,59 @@ exit 0
       assert.equal(broker.lockOwner().job_id, other); broker.unlock(other); assert.equal(broker.lockOwner(), null);
     });
     let first;
+    await t.test('review gate: same native session, independent evidence, version binding and no execution before approval', async () => {
+      const result = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 中文参数', topic: '审核通过自动执行' });
+      assert.equal(result.status, 'completed'); assert.equal(result.plan_review.status, 'approved');
+      assert.deepEqual(result.plan_review.allowed_scope, ['仅按测试要求实施，不扩大任务范围']);
+      const events = fs.readFileSync(result.paths.events, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      assert.deepEqual(events.filter(e => e.type === 'bridge.attempt').map(e => e.stage), ['review', 'execute']);
+      assert.equal(events.filter(e => e.type === 'bridge.review.approved').length, 1);
+      assert.deepEqual([...new Set(events.filter(e => e.type === 'thread.started').map(e => e.thread_id))], [result.session_id]);
+      assert.equal(result.attempt_total, 1); assert.equal(result.plan_review.attempts.length, 1);
+      assert.match(result.final_response, /resume=True/);
+      for (const fixture of ['REVIEW_NO_MARKER_FIXTURE', 'REVIEW_WRONG_VERSION_FIXTURE', 'REVIEW_EMPTY_SCOPE_FIXTURE', 'REVIEW_NO_TOOLS_FIXTURE', 'REVIEW_WRITE_FIXTURE']) {
+        const held = await broker.run({ wait: true, prompt: fixture, topic: fixture });
+        assert.equal(held.status, 'review_needs_evidence', fixture);
+        assert.equal(held.plan_review.status, 'needs_evidence');
+        assert.equal(new Broker(settings).get(held.job_id).stage, 'review_held');
+        const log = fs.readFileSync(held.paths.events, 'utf8');
+        assert.doesNotMatch(log, /"stage":"execute"/, fixture);
+        assert.equal(fs.existsSync(path.join(path.dirname(held.paths.job || broker.jobPath(held.job_id)), 'attempt-1.result.txt')), false);
+      }
+      const missing = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 缺少用户原文', user_request: undefined });
+      assert.equal(missing.status, 'review_needs_evidence'); assert.match(missing.handoff.reason, /用户原文/);
+    });
+    await t.test('technical revision and evidence requests return to the same matter for fresh review; user decisions remain mandatory', async () => {
+      for (const [fixture, status] of [['REVIEW_REVISE_FIXTURE', 'review_revise'], ['REVIEW_EVIDENCE_FIXTURE', 'review_needs_evidence']]) {
+        const held = await broker.run({ wait: true, prompt: fixture, topic: fixture });
+        assert.equal(held.status, status); assert.equal(held.handoff.requires_user_decision, false);
+        await assert.rejects(broker.run({ prompt: '直接执行', topic_id: held.topic_id }), /CODEX_REVIEW_FOLLOWUP_REQUIRED/);
+        const revised = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 已按当前接口修订并补充日志', topic_id: held.topic_id, review_followup: { review_job_id: held.job_id, response: '回应全部待修订/补证项，保留原目标与约束。' } });
+        assert.equal(revised.status, 'completed'); assert.equal(revised.session_id, held.session_id);
+        assert.notEqual(revised.plan_review.plan_sha256, held.plan_review.plan_sha256);
+        assert.equal(broker.get(held.job_id).plan_review.status, held.plan_review.status);
+      }
+      const held = await broker.run({ wait: true, prompt: 'REVIEW_USER_FIXTURE', topic: '审核涉及用户限制' });
+      assert.equal(held.handoff.requires_user_decision, true);
+      await assert.rejects(broker.run({ prompt: '规划端认为可以', topic_id: held.topic_id }), /CODEX_USER_DECISION_REQUIRED/);
+      const reply = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 保留原限制继续', topic_id: held.topic_id, plan_decision: { refusal_job_id: held.job_id }, user_followup: '保留原限制，在限制内重新设计。' });
+      assert.equal(reply.status, 'completed'); assert.equal(reply.session_id, held.session_id);
+    });
+    await t.test('new execution evidence invalidates approval and preserves completed work for re-review', async () => {
+      const held = await broker.run({ wait: true, prompt: 'EXECUTION_REVIEW_INVALIDATED_FIXTURE', topic: '执行中假设失效' });
+      assert.equal(held.status, 'review_revise'); assert.equal(held.plan_review.status, 'revise_required');
+      assert.equal(held.handoff.completed, '已完成只读检查'); assert.equal(held.stage, 'review_held');
+      await assert.rejects(broker.run({ prompt: '继续原执行', topic_id: held.topic_id }), /CODEX_REVIEW_FOLLOWUP_REQUIRED/);
+      const continued = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 按新证据修订，不重复已做检查', topic_id: held.topic_id, review_followup: { review_job_id: held.job_id, response: '按实际接口重新设计，保留已完成部分。' } });
+      assert.equal(continued.status, 'completed'); assert.equal(continued.session_id, held.session_id);
+    });
     await t.test('background completion, UTF-8 and restart-safe reads', async () => {
       first = broker.start({ prompt: '中文参数', user_request: 'USER_ORIGINAL_SENTINEL 原文：不要偷偷换路线。', sandbox: 'read-only' });
       await assert.rejects(broker.run({ prompt: 'duplicate', topic_id: first.topic_id }), /still running/);
       const result = await finished(broker, first.job_id);
       assert.equal(result.status, 'completed'); assert.equal(result.exit_code, 0);
-      assert.match(result.final_response, /resume=False unicode=True/);
+      assert.match(result.final_response, /resume=True unicode=True/);
+      assert.equal(result.plan_review.status, 'approved'); assert.equal(result.stage, 'execute');
       assert.match(result.final_response, /native_subagents=True/);
       assert.match(result.final_response, /acceptance_contract=True/);
       assert.match(result.final_response, /original_request=True user_followup=False/);
@@ -282,13 +364,14 @@ exit 0
       const known = await broker.sessions({ include_native: false });
       assert.ok(known.sessions.some(x => x.topic_id === a.topic_id && x.model === 'fixture-luna'));
     });
-    await t.test('background MCP returns before execution ends and client disconnect does not stop the task', { timeout: 20000 }, async () => {
+    await t.test('background MCP returns before execution ends and client disconnect does not stop the task', { timeout: 30000 }, async t => {
       const child = spawn(process.execPath, [path.join(__dirname, '../src/server.cjs')], { windowsHide: true, env: { ...process.env, CODEX_EXECUTOR_PROJECT: project, CODEX_EXECUTOR_DATA: data, CODEX_EXECUTOR_ENTRY: entry }, stdio: ['pipe', 'pipe', 'pipe'] });
+      t.after(() => { child.stdin.destroy(); if (child.exitCode === null) child.kill(); });
       const pending = new Map(); let seq = 0;
       readline.createInterface({ input: child.stdout }).on('line', line => { const reply = JSON.parse(line); pending.get(reply.id)?.(reply); pending.delete(reply.id); });
       const call = (method, params = {}) => new Promise(resolve => { const id = seq++; pending.set(id, resolve); child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); });
       await call('initialize');
-      const reply = await call('tools/call', { name: 'codex_run', arguments: { prompt: '中文参数', topic: '不占聊天的后台事项', model: 'terra' } });
+      const reply = await call('tools/call', { name: 'codex_run', arguments: { prompt: '中文参数', user_request: '测试用户原文：核查中文参数。', topic: '不占聊天的后台事项', model: 'terra' } });
       assert.equal(reply.result.isError, false); const ack = JSON.parse(reply.result.content[0].text);
       assert.equal(ack.status, 'queued'); assert.equal(ack.final_response, undefined); assert.ok(ack.topic_id);
       assert.deepEqual((await call('ping')).result, {});
@@ -302,7 +385,7 @@ exit 0
       const execute = async (prompt, stopAfter) => {
         const id = require('node:crypto').randomBytes(12).toString('hex'), file = broker.jobPath(id);
         fs.mkdirSync(path.dirname(file));
-        fs.writeFileSync(file, JSON.stringify({ job_id: id, status: 'queued', created_at: new Date().toISOString(), cwd: project, sandbox: 'read-only', prompt, topic_id: id, topic: '限频容量续跑', timeout_seconds: 30, settings: { ...settings, model: 'fixture-luna' } }));
+        fs.writeFileSync(file, JSON.stringify({ job_id: id, status: 'queued', created_at: new Date().toISOString(), cwd: project, sandbox: 'read-only', prompt, request_context: { original_text: '测试原文：核查容量重试', followups: [] }, topic_id: id, topic: '限频容量续跑', timeout_seconds: 30, settings: { ...settings, model: 'fixture-luna' } }));
         let now = Date.now(), waits = 0;
         await worker(file, { now: () => now, wait: async until => { assert.ok(until >= now + 600000); now = until; return ++waits < stopAfter; } });
         return { receipt: broker.receipt(id), job: broker.get(id) };
@@ -410,8 +493,8 @@ exit 0
       const otherProject = path.join(root, '另一个项目'), otherData = path.join(root, 'other-runtime'); fs.mkdirSync(otherProject); fs.mkdirSync(otherData);
       const combined = config({ CODEX_EXECUTOR_PROJECT: project, CODEX_EXECUTOR_DATA: data, CODEX_EXECUTOR_ENTRY: entry, CODEX_EXECUTOR_PWSH: settings.pwsh, CODEX_EXECUTOR_PROJECTS: JSON.stringify([{ project, data }, { project: otherProject, data: otherData }]) });
       const { ProjectRouter } = require('../src/router.cjs'), router = new ProjectRouter(combined);
-      const slow = await router.run({ prompt: 'SLOW_FIXTURE', cwd: project, topic: '项目A独立任务' });
-      const fast = await router.run({ wait: true, prompt: '中文参数', cwd: otherProject, topic: '项目B独立任务', model: 'terra' });
+      const slow = await router.run({ prompt: 'SLOW_FIXTURE', user_request: '测试项目A独立任务', cwd: project, topic: '项目A独立任务' });
+      const fast = await router.run({ wait: true, prompt: '中文参数', user_request: '测试项目B独立任务', cwd: otherProject, topic: '项目B独立任务', model: 'terra' });
       assert.equal(fast.status, 'completed'); assert.ok(fast.paths.result.startsWith(otherData)); assert.equal(router.status(slow.job_id).cwd, project);
       await assert.rejects(router.run({ prompt: 'x', topic_id: fast.topic_id, cwd: project }), /different project/);
       const chat = '34343434-3434-3434-3434-343434343434';
@@ -474,8 +557,9 @@ exit 0
       assert.equal(replies.length, 3); assert.equal(replies.find(reply => reply.id === 0).result.serverInfo.name, 'codex-executor');
       assert.equal(replies.find(reply => reply.id === 1).result.tools.length, 9); assert.equal(replies.find(reply => reply.id === null).error.code, -32700);
     });
-    await t.test('one real MCP execution response, no progress model turns, concurrent ping remains responsive', async () => {
+    await t.test('one real MCP execution response, no progress model turns, concurrent ping remains responsive', async t => {
       const child = spawn(process.execPath, [path.join(__dirname, '../src/server.cjs')], { windowsHide: true, env: { ...process.env, CODEX_EXECUTOR_PROJECT: project, CODEX_EXECUTOR_DATA: data, CODEX_EXECUTOR_ENTRY: entry }, stdio: ['pipe', 'pipe', 'pipe'] });
+      t.after(() => { child.stdin.destroy(); if (child.exitCode === null) child.kill(); });
       const pending = new Map(), replies = []; let seq = 0;
       readline.createInterface({ input: child.stdout }).on('line', line => {
         const reply = JSON.parse(line); replies.push(reply);
@@ -485,7 +569,7 @@ exit 0
         const id = seq++; pending.set(id, resolve); child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
       });
       await call('initialize', { protocolVersion: '2024-11-05' });
-      const running = call('tools/call', { name: 'codex_run', arguments: { wait: true, prompt: '中文参数', conversation_id: 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee' } });
+      const running = call('tools/call', { name: 'codex_run', arguments: { wait: true, prompt: '中文参数', user_request: '测试真实协议的中文参数', conversation_id: 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee' } });
       const ping = await call('ping'); assert.deepEqual(ping.result, {});
       const completed = await running; const receipt = JSON.parse(completed.result.content[0].text);
       assert.equal(receipt.status, 'completed'); assert.equal(receipt.conversation_id, 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee');

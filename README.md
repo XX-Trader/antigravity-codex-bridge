@@ -1,6 +1,6 @@
 # Antigravity Codex Bridge
 
-让 Antigravity 负责理解需求、分析与验收，让本机 Codex CLI 实际执行任务。
+让 Antigravity 理解需求、提出方案并验收，由本机 Codex CLI 独立审核，通过后执行任务。
 
 执行和子 agent 都属于 Codex：Antigravity 不用自己的原生子 agent、命令或写文件工具代做。需要细分时，由 Codex 会话调用自己的原生 `spawn_agent` 并汇总结果。桥接启动时显式启用 `features.multi_agent=true`，不覆盖用户的原生子线程数量配置；这与多个独立顶层 Codex 任务是两件事。
 
@@ -51,6 +51,12 @@ pwsh -NoProfile -File scripts/Setup.ps1 --project 'C:/work/my-project' --data 'C
 完整参数、手动配置和回滚见 [配置说明](docs/configuration.md)。项目编排规则正文只有一份：[Antigravity 项目说明](.agents/rules/antigravity-codex.md)。
 
 ## 常用工具
+
+每次派发同时提供用户原文 `user_request` 和规划建议 `prompt`，后续用户说明用 `user_followup` 逐字追加。Codex 先只读核查真实代码、日志和工具结果，返回审核依据与允许实施的范围；桥接核对本轮输入版本后，在同一原生会话自动发起执行，无需用户重复批准已授权事项。审核轮次和执行轮次分别保留输出及尝试记录，仍是同一个事项、同一个 job 和原生会话。
+
+审核结果缺失、版本不符、没有成功核查记录、原文缺失或没有明确范围时，任务停在 `review_needs_evidence`；技术方案需修订时为 `review_revise`。规划端按原事项传 `review_followup={review_job_id, response}` 回应，并提供修订后的 `prompt`，新版本重新审核。若涉及用户目标、明确约束、验收或授权变化，仍须真实用户决定，通过既有 `plan_decision` 续接。执行中新证据推翻假设时也会退回审核，保留已完成部分。
+
+`plan_review` 记录输入 SHA-256、执行者的依据、`allowed_scope` 和状态；它是协议门禁和执行者判断，不是操作系统沙箱，也不能证明依据内容一定正确。完整访问下的只读核查仍由 Codex 遵守；桥接发现审核中的文件变更事件会暂停，但不能识别所有 shell 命令的副作用。审核通过不代替测试、运行回读或业务验收。
 
 | 工具 | 用途 |
 | --- | --- |
