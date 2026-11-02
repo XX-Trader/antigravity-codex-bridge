@@ -96,7 +96,7 @@ function eventMessage(job, event) {
   const restrictedWork = event.kind === 'terminal' && job.execution_constraints?.length;
   const refusal = event.kind === 'terminal' && handoff?.requires_user_decision;
   const review = event.kind === 'terminal' && !refusal && ['review_revise', 'review_needs_evidence'].includes(handoff?.kind);
-  const reviewControl = review ? `\n【方案需修订或补证，受影响操作未继续】先反馈具体原因、证据和未完成范围。技术问题由你与 Codex 在原事项讨论：把修订或新增证据写入 prompt，续接原 topic/session，由 Codex 结合上下文自行核查；可带 review_followup.review_job_id=${job.job_id} 和 response 逐项回应。仅审核模式或没有真实审核上下文时仍独立审核；不得把你的同意当成方案通过。能自行查明的事实先补证，不能编造用户原文。改变用户目标、约束、验收或授权时才交用户决定；已有用户决定门禁仍保留。执行中的新证据推翻假设时暂停受影响操作，修订后沿原会话自行核查，已完成工作不重做。` : '';
+  const reviewControl = review ? `\n【方案需修订或补证，受影响操作未继续】先反馈具体原因、证据和未完成范围。能在原用户授权内自行纠正的技术问题由 Codex 直接修正并验证；确实缺少无法补齐的证据或没有可行修正时，才在原事项讨论：把缺失证据或待澄清点写入 prompt，续接原 topic/session，由 Codex 结合上下文自行核查；可带 review_followup.review_job_id=${job.job_id} 和 response 逐项回应。仅审核模式或没有真实审核上下文时仍独立审核；不得把你的同意当成方案通过。能自行查明的事实先补证，不能编造用户原文。改变用户目标、约束、验收或授权时才交用户决定；已有用户决定门禁仍保留。执行中的新证据推翻假设时暂停受影响操作，修订后沿原会话自行核查，已完成工作不重做。` : '';
   const choice = event.kind === 'terminal' && !refusal && !execution && ['needs_input', 'blocked'].includes(event.status)
     ? `\n【需要判断/用户选择】${handoff?.question || handoff?.text || '请领取原回执查看具体问题。'}${handoff?.options?.length ? '\n选项：' + handoff.options.map((v, i) => `${i + 1}. ${v}`).join('\n') : ''}${handoff?.recommendation ? '\nCodex建议（不是用户授权）：' + handoff.recommendation : ''}\n只有已有明确授权能解决时才能继续；涉及用户偏好、范围、权限或不可逆选择须向用户原样展示问题/选项，等待回答。不得默认选推荐项。用户回答后用原 topic_id/session_id 续接一次，不重开事项。` : '';
   const background = event.kind === 'terminal' && (event.execution_state || job.execution_state) === 'background_unconfirmed'

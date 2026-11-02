@@ -23,7 +23,19 @@ test('review model routing is separate from execution and preserves quant contex
   f.broker.settings.model = 'executor'; f.broker.settings.review_models = { general: 'review-sol', quant: 'review-astra' };
   assert.equal(reviewRoute({ prompt: '日常接口方案' }, f.broker.settings).model, 'review-sol');
   for (const input of [{ prompt: '因子净化方案' }, { user_followup: '这是量化相关的' }, { review_category: 'quant' }]) assert.equal(reviewRoute(input, f.broker.settings).model, 'review-astra');
-  assert.equal(reviewRoute({ prompt: '继续审查' }, f.broker.settings, { review_route: { category: 'quant' } }).model, 'review-astra');
+  assert.equal(reviewRoute({ prompt: '继续审查' }, f.broker.settings, { review_route: { category: 'quant', source: 'quant_context' }, request_context: { original_text: '量化因子研究' } }).model, 'review-astra');
+  for (const prompt of ['将三层诊断的完整量化数据落盘', '播放器 CPU 量化指标与量化结果', '量化性能和量化延迟，进行性能量化']) {
+    assert.equal(reviewRoute({ prompt }, f.broker.settings).model, 'review-sol', prompt);
+  }
+  const falsePositive = { review_route: { category: 'quant', source: 'quant_context' }, prompt: '将诊断量化数据落盘', request_context: { original_text: 'Python 切集提速并核验 CPU、内存' } };
+  assert.equal(reviewRoute({ prompt: '继续修复清理线程' }, f.broker.settings, falsePositive).model, 'review-sol');
+  assert.equal(reviewRoute({ prompt: '继续' }, f.broker.settings, { ...falsePositive, review_route: { category: 'quant', source: 'explicit_category' } }).model, 'review-astra');
+  const explicitParent = { ...falsePositive, review_route: reviewRoute({ review_category: 'quant' }, f.broker.settings) };
+  const explicitChild = { ...falsePositive, review_route: reviewRoute({ prompt: '继续' }, f.broker.settings, explicitParent) };
+  assert.equal(reviewRoute({ prompt: '再次继续' }, f.broker.settings, explicitChild).model, 'review-astra');
+  assert.equal(reviewRoute({ prompt: '量化策略' }, f.broker.settings, { review_route: { category: 'general', source: 'explicit_category' } }).model, 'review-sol');
+  assert.equal(reviewRoute({ prompt: '量化数据用于回测与选股' }, f.broker.settings).model, 'review-astra');
+  assert.equal(reviewRoute({ prompt: '性能量化数据' }, { ...f.broker.settings, review_category: 'quant' }).model, 'review-astra');
   assert.equal(reviewRoute({ review_category: 'general' }, { ...f.broker.settings, review_category: 'quant' }).model, 'review-sol');
   assert.throws(() => reviewRoute({ review_category: 'guess' }, f.broker.settings), /review_category/);
   assert.throws(() => f.broker.start({ prompt: '审核', review_only: 'true' }), /boolean/);

@@ -65,11 +65,13 @@ if ($argv -contains 'app-server') {
 }
 $prompt = $input -join "\n"
 $argv = @($args)
+$implementationContract = $prompt.Contains('规划建议不构成用户硬性约束') -and $prompt.Contains('审核阶段仍只读') -and $prompt.Contains('用户边界内的技术错误由 Codex 自行纠正、实现并验证') -and $prompt.Contains('只审核、不改文件等限制及执行策略拒绝不因技术自主权解除') -and (-not $prompt.Contains('技术方案问题按审核交接修订')) -and (-not $prompt.Contains('建议与原文矛盾时按审核协议退回 technical'))
 if ($prompt.Contains('当前是独立审核阶段（stage=review）')) {
   $oi = [Array]::IndexOf($argv, '-o')
   $version = [regex]::Match($prompt, '本轮方案版本：([a-f0-9]{64})').Groups[1].Value
   $review = @{ plan_sha256 = $version; evidence = @('已实际读取 fixture README 并核对目标'); allowed_scope = @('仅按测试要求实施，不扩大任务范围'); reason = 'fixture 审核通过'; decision_scope = 'technical' }
   $review.reason += ' reviewer=' + $argv[[Array]::IndexOf($argv, '-m')+1]
+  $review.reason += ' self_repair=' + $implementationContract
   $marker = 'APPROVED'
   if ($prompt.Contains('REVIEW_REVISE_FIXTURE')) { $marker = 'REVISE'; $review.reason = '方案调用不存在的接口'; $review.suggested_changes = '依据当前接口修订'; $review.Remove('allowed_scope') }
   if ($prompt.Contains('REVIEW_EVIDENCE_FIXTURE')) { $marker = 'NEEDS_EVIDENCE'; $review.reason = '缺少实际运行日志'; $review.suggested_changes = '补充真实日志'; $review.Remove('allowed_scope') }
@@ -120,6 +122,7 @@ $text += ' original_request=' + $prompt.Contains('USER_ORIGINAL_SENTINEL') + ' u
 $text += ' policy_contract=' + ($prompt.Contains('执行策略拒绝与方案不成立必须分开') -and $prompt.Contains('不自动重试、换壳、拆命令、改入口'))
 $text += ' execution_diag=' + $prompt.Contains('"intent":"diagnose"')
 $text += ' context_check=' + $prompt.Contains('本轮方案仍由你自行核查，不表示自动通过')
+$text += ' self_repair=' + $implementationContract
 if ($prompt.Contains('NEEDS_INPUT_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT] 请确认选择A还是B' }
 if ($prompt.Contains('STRUCTURED_QUESTION_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT]' + [Environment]::NewLine + '{"question":"选择工作树还是等待？","options":["工作树：隔离修改","等待：复用目录"],"recommendation":"等待","completed":"已定位文件范围"}' }
 if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { $text = '[CODEX_BACKGROUND_RUNNING] 测试命令 test-pending 退出结果未确认，请勿重跑。' }
@@ -193,6 +196,7 @@ exit 0
       assert.equal(general.status, 'completed'); assert.equal(general.stage, 'review_complete');
       assert.equal(general.review_only, true); assert.equal(general.review_route.model, 'fixture-sol');
       assert.match(general.plan_review.reason, /reviewer=fixture-sol/);
+      assert.match(general.plan_review.reason, /self_repair=True/);
       assert.doesNotMatch(fs.readFileSync(general.paths.events, 'utf8'), /"stage":"execute"/);
       const quant = await routed.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 量化因子回测方案审核', review_only: true });
       assert.equal(quant.review_route.model, 'fixture-astra'); assert.match(quant.plan_review.reason, /reviewer=fixture-astra/);
@@ -203,11 +207,13 @@ exit 0
       assert.match(execution.final_response, /model=fixture-terra/);
       assert.equal(execution.plan_review.status, 'context'); assert.equal(execution.context_review.job_id, general.job_id);
       assert.equal(execution.session_id, general.session_id); assert.match(execution.final_response, /context_check=True/);
+      assert.match(execution.final_response, /self_repair=True/);
       const stages = result => fs.readFileSync(result.paths.events, 'utf8').trim().split('\n').map(JSON.parse).filter(e => e.type === 'bridge.attempt').map(e => e.stage);
       assert.deepEqual(stages(execution), ['execute']);
       const continued = await routed.run({ wait: true, topic_id: general.topic_id, prompt: '继续处理同一事项的后续方案，不额外审核' });
       assert.equal(continued.session_id, general.session_id); assert.equal(continued.plan_review.status, 'context');
       assert.deepEqual(stages(continued), ['execute']); assert.match(continued.final_response, /context_check=True/);
+      assert.match(continued.final_response, /self_repair=True/);
       const legacyId = require('node:crypto').randomBytes(12).toString('hex');
       const legacy = { job_id: legacyId, status: 'queued', stage: 'review', created_at: new Date().toISOString(),
         cwd: settings.project, sandbox: 'danger-full-access', prompt: '旧连接派发的后续方案', timeout_seconds: 60, settings,
