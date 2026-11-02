@@ -16,6 +16,31 @@ function fixture(t) {
   const settings = { project, data, entry: process.execPath, pwsh: process.execPath, model_aliases: {} };
   return { root, project, data, settings, broker: new Broker(settings) };
 }
+
+test('legacy review loops produce a takeover instead of demanding all obsolete review replies; one real answer resets duplicate holds', t => {
+  const f = fixture(t), { takeover, loopState } = require('../src/loop-guard.cjs');
+  const first = f.broker.start({ prompt: '方案', user_request: '保持原验收' });
+  const finish = (id, fields) => { save(f.broker.jobPath(id), { ...f.broker.get(id), thread_id: '12345678-1234-1234-1234-123456789abc', ...fields }); f.broker.unlock(id); };
+  finish(first.job_id, { status: 'completed' });
+  // Seed pre-protocol history without inventing answered technical reviews.
+  for (let n = 1; n <= 3; n++) {
+    const id = n.toString(16).padStart(24, '0'), file = f.broker.jobPath(id); fs.mkdirSync(path.dirname(file));
+    save(file, { ...f.broker.get(first.job_id), job_id: id, created_at: new Date(Date.now() + n).toISOString(), status: 'review_revise', handoff: { kind: 'review_revise', reason: '接口失败' } });
+  }
+  const held = f.broker.start({ parent_job_id: first.job_id, prompt: '再修一次', review_followup: { review_job_id: '000000000000000000000003', response: '修订' } });
+  const state = loopState(f.broker.list()); finish(held.job_id, { status: 'needs_input', handoff: takeover(state) });
+  const copy = 'cccccccccccccccccccccccc', file = f.broker.jobPath(copy); fs.mkdirSync(path.dirname(file));
+  save(file, { ...f.broker.get(held.job_id), job_id: copy, created_at: new Date(Date.now() + 20).toISOString() });
+  assert.throws(() => f.broker.start({ parent_job_id: first.job_id, prompt: '自行继续' }), /CODEX_USER_DECISION_REQUIRED/);
+  const resumed = f.broker.start({ parent_job_id: first.job_id, prompt: '按原标准诊断', plan_decision: { refusal_job_id: copy }, user_followup: '先只读查原因' });
+  assert.equal(f.broker.get(resumed.job_id).loop_reset.human_reply_job_id, resumed.job_id);
+  finish(resumed.job_id, { status: 'completed' });
+  const next = f.broker.start({ parent_job_id: resumed.job_id, prompt: '继续原事项' });
+  finish(next.job_id, { status: 'review_revise', handoff: { kind: 'review_revise', reason: '新的技术问题' } });
+  const reply = { review_job_id: next.job_id, response: '补充本轮技术证据' };
+  const revised = f.broker.start({ parent_job_id: next.job_id, prompt: '再次审核', review_followup: reply });
+  assert.deepEqual(f.broker.get(revised.job_id).review_followup, reply, 'A real human reset must be read from full saved context, not the redacted summary');
+});
 test('verbatim user text is distinct from the plan, immutable and retained across old-parent continuation', t => {
   const f = fixture(t), raw = '  用户原文\r\n必须用原方案，不要换成省事方案。\n';
   const first = f.broker.start({ prompt: '规划摘要 A', user_request: raw });

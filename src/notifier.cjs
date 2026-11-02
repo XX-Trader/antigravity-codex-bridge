@@ -45,7 +45,7 @@ function recordedReceipt(directory, event) {
   return false;
 }
 const checks = new Set(['notification_check', 'parallel_check', 'subagent_check']);
-const important = new Set(['terminal', 'execution_alert', 'notification_alert']);
+const important = new Set(['terminal', 'execution_alert', 'notification_alert', 'silence_alert']);
 function notificationPolicy(job, event, now = Date.now()) {
   if (event.kind === 'notification_check') return 'silent';
   if (checks.has(event.kind) || important.has(event.kind) || !event.schema) return 'send';
@@ -65,7 +65,7 @@ function notificationHeading(job, event, label, now = Date.now()) {
   return `${day}${at.hour}:${at.minute}${matter} · ${label}${delayed}`;
 }
 function noticeResult(text = '') {
-  return text.replace(/```[\s\S]*?```/g, '')
+  return text.split('\n[CODEX_EXECUTION_REPORT]')[0].replace(/```[\s\S]*?```/g, '')
     .replace(/\b(?:job_id|topic_id|session_id|event_id)\s*[:=：]\s*[`"']?[a-f\d:-]+[`"']?/gi, '')
     .replace(/\b[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}\b/gi, '')
     .replace(/^\s*#{1,6}\s+/gm, '').replace(/`/g, '')
@@ -82,6 +82,7 @@ function eventMessage(job, event) {
   if (event.kind === 'session_ready') return `${internal('首次任务会话建立，不调用任何工具；不调用 codex_run、不轮询。')}\n${draft('已启动', '已开始处理这项工作，详细过程可打开原任务查看。')}\n${compact}`;
   if (['notification_alert', 'notification_recovered'].includes(event.kind)) return `${internal(event.detail + '\n不重派、不盲目重发。')}\n${draft('结果通知异常', '任务结果通知未能确认送达，已有结果仍保存在原任务中，请查看详情。')}\n${compact}`;
   if (event.kind === 'execution_alert') return `${internal(event.detail + '\n请领取一次原回执核查所属进程；不重派、不盲目终止PID。')}\n${draft('需要核查', '执行器已退出，后台命令是否结束尚未确认，需要核对原命令和日志。')}\n${compact}`;
+  if (event.kind === 'silence_alert') return `${internal(event.detail + '\n这是用户要求的四小时兜底。只领取一次当前 codex_result（diagnostics=true，核对原始日志尾部），先向用户解释：为什么这么久没有回复？当前卡在哪里？哪些原因有日志支持，哪些仍未知？已完成/未完成什么，如何解决最合适、何时再反馈？先反馈再诊断，不重派、不取消、不重跑仍活动的命令，不把收到本事件当成已答复用户。')}\n${draft('长时间未反馈，需要说明原因', '这项工作已达到四小时反馈兜底，需要核对当前执行与通知记录，解释迟迟未回复的原因、当前卡点和下一步。原因尚未核实，不能只报“仍在运行”。')}\n${compact}`;
   const resume = event.detail?.match(/(?:^|\s)CHECK_ID=([a-f0-9]{24}:\d+)/)?.[1];
   const checkId = resume?.startsWith(job.job_id + ':') ? resume : event.event_id;
   const action = event.kind === 'subagent_check' ? `这是用户明确授权的 Codex 原生子agent 验收。当前执行根=${JSON.stringify(job.cwd)}，MCP服务名见事件说明。仅调用一次 codex_run，wait=false，新 topic“Codex原生子agent只读验收”，不带旧 topic_id/session_id，也不要手填 conversation_id，让本机 hook 绑定真实会话。prompt 必须包含 SUBAGENT_CHECK=${checkId}；要求这个 Codex 执行者实际调用自己的原生 spawn_agent 创建1名只读子agent，让子agent用 PowerShell7 读取 README.md 前60行并输出 CODEX_NATIVE_SUBAGENT_OK，父agent 等待其真实结果，汇总原生子agent ID、来源和返回内容。父agent不能自己读文件冒充委派，不经本MCP递归，不新开CLI冒充子agent；如果原生能力不可用就如实返回 needs_input。所有命令和文件核查都由 Codex/其原生子agent执行；你不能调用 Antigravity invoke_subagent、define_subagent、run_command 或写文件工具代做。只读、不提交、不切分支、不安装或重启、不读凭证；不升级模型。受理后展示job_id，终态再领取结果与查看链接。`
@@ -99,11 +100,11 @@ function eventMessage(job, event) {
     ? `\n【需要判断/用户选择】${handoff?.question || handoff?.text || '请领取原回执查看具体问题。'}${handoff?.options?.length ? '\n选项：' + handoff.options.map((v, i) => `${i + 1}. ${v}`).join('\n') : ''}${handoff?.recommendation ? '\nCodex建议（不是用户授权）：' + handoff.recommendation : ''}\n只有已有明确授权能解决时才能继续；涉及用户偏好、范围、权限或不可逆选择须向用户原样展示问题/选项，等待回答。不得默认选推荐项。用户回答后用原 topic_id/session_id 续接一次，不重开事项。` : '';
   const background = event.kind === 'terminal' && (event.execution_state || job.execution_state) === 'background_unconfirmed'
     ? `\n【后台执行尚未确认结束】Codex对话轮次已结束，但后台命令的退出结果未确认，测试/业务验收仍待完成。${JSON.stringify(event.background_commands || job.background_commands || [])} ${handoff?.kind === 'background_running' ? handoff.text : ''}请先判断等待、核查原命令还是需要用户决定；不能把CLI退出0当成测试通过，不重跑仍可能活动的命令。` : '';
-  const refusalControl = refusal ? `\n【方案被执行端拒绝，必须反馈用户】分别说明原计划、Codex拒绝理由、影响及你的建议；默认不用代码、文件名或底层日志解释，原回执保留为详情。不得掩盖拒绝、替用户批准、静默改方案或报告已解决。先等待用户决定，再用原 topic_id/session_id、plan_decision.refusal_job_id=${job.job_id} 和逐字 user_followup 续接。桥接器只记录调用方转交的答复，不独立认证用户身份或批准。` : '';
+  const refusalControl = refusal ? `\n【方案被执行端拒绝，必须反馈用户】分别说明原计划、Codex拒绝理由、影响及你的建议；默认不用代码、文件名或底层日志解释，原回执保留为详情。不得掩盖拒绝、替用户批准、静默改方案或报告已解决。${handoff.blocker_type === 'human_takeover' ? '自动循环已达上限：必须先回答现在失败的原因是什么、如何解决最合适；区分已核实根因与假设，给出证据、剩余验收和建议，再展示完整问题与选项。不得自行清零或续跑。' : ''}先等待用户决定，再用原 topic_id/session_id、plan_decision.refusal_job_id=${job.job_id} 和逐字 user_followup 续接。桥接器只记录调用方转交的答复，不独立认证用户身份或批准。` : '';
   const problem = event.kind === 'terminal' && (execution || refusal || review || ['failed', 'timed_out', 'cancelled', 'needs_input', 'blocked'].includes(event.status));
   const feedbackFirst = problem ? '\n【先反馈，再排查】领取一次原回执后，本次回复先向用户说明具体问题、原始错误短摘、已完成与受影响部分、受阻动作是否暂停及下一步；再安排诊断或不受阻工作。不能为了继续调查、等待另一任务或压缩摘要而不反馈。原因未核实就明说，accepted不是用户已看到的证据；不自动重发结果不明的通知。普通可自行修复的过程错误、网络重连和本地15秒补查不逐次通知。' : '';
   const executionControl = execution ? `\n【执行策略受阻，不是方案被否定】原方案和已完成结果保留，不要求用户重选已确认方案。已知事实与未知原因分开；来源=${execution.source}，原因核实状态=${execution.cause_status}，原始拒绝=${execution.reason}，已知=${JSON.stringify(execution.known_facts)}，未知=${JSON.stringify(execution.unknowns)}。只领取一次原回执，不凭完整访问或错误文字推断根因；不自动重试、换壳/拆命令/改入口/改权限规则规避。可明确声明 execution_followup，引用全部未解决 blocked_job_ids，以 diagnose 做只读核查或 continue_unblocked 仅做不依赖受阻动作的工作；这些不能清除原拒绝。恢复原动作必须先完成正常授权或策略修复，resume_after_resolution 仅记录其证据，不是权限授予；平台仍拒绝就继续保留受阻。向用户只说明什么受阻、已知/未知、影响哪些验收，详情展开，不用技术选项反复打扰。` : '';
-  const label = execution ? '执行策略受阻' : refusal ? '方案被执行端拒绝' : review ? (handoff.kind === 'review_revise' ? '方案需要修订' : '审核证据不足') : restrictedWork ? '本轮结束，原操作仍受阻' : ['needs_input', 'blocked'].includes(event.status) ? '需要判断' : ['failed', 'timed_out', 'cancelled'].includes(event.status) ? '执行未完成' : '执行结果';
+  const label = handoff?.blocker_type === 'human_takeover' ? '自动循环已暂停，等待人工决定' : execution ? '执行策略受阻' : refusal ? '方案被执行端拒绝' : review ? (handoff.kind === 'review_revise' ? '方案需要修订' : '审核证据不足') : restrictedWork ? '本轮结束，原操作仍受阻' : ['needs_input', 'blocked'].includes(event.status) ? '需要判断' : ['failed', 'timed_out', 'cancelled'].includes(event.status) ? '执行未完成' : '执行结果';
   const content = execution
     ? `受阻操作：${execution.blocked_action}\n原始错误：${String(execution.reason || '未提供原始错误，需核对回执').slice(0, 3000)}\n${handoff?.completed ? '已完成：' + handoff.completed + '\n' : ''}${execution.affected_checks?.length ? '未完成/受影响：' + execution.affected_checks.join('；') : '相关运行验收尚未完成。'}\n当前：受阻动作未恢复${background ? '；其他后台命令是否结束仍待确认' : ''}。原方案保留，不代表方案不成立。\n下一步：核对正常授权或策略修复途径，不自动重试；无需重新确认原业务方案。具体规则尚未核实${execution.unknowns?.length ? '：' + execution.unknowns.join('；') : '。'}${refusal ? '\n另有方案选择：' + (handoff.reason || handoff.question || handoff.text) + (handoff.options?.length ? '\n' + handoff.options.join('\n') : '') : ''}`
     : refusal
@@ -183,11 +184,11 @@ async function deliver(broker, id, send, options = {}) {
     try { const next = read(broker.jobPath(n)); return next.topic_id === job.topic_id && next.execution_followup?.intent === 'resume_after_resolution' && next.execution_followup.blocked_job_ids?.includes(id); } catch { return false; }
   });
   if (newer && (!job.handoff?.requires_user_decision || decisionRecorded) && (!job.execution_block || executionResolved)) {
-    for (const event of events.filter(e => !['notification_check', 'parallel_check', 'subagent_check'].includes(e.kind))) {
+    for (const event of events.filter(e => !['notification_check', 'parallel_check', 'subagent_check', 'silence_alert'].includes(e.kind))) {
       const file = event.file.replace(/\.json$/, '.delivery.json');
       if (!fs.existsSync(file) || read(file).state === 'not_sent') save(file, { state: 'superseded', event_id: event.event_id, reason: 'A newer job continued this matter.' });
     }
-    events = events.filter(e => ['notification_check', 'parallel_check', 'subagent_check'].includes(e.kind));
+    events = events.filter(e => ['notification_check', 'parallel_check', 'subagent_check', 'silence_alert'].includes(e.kind));
     if (!events.length) return false; // Explicit diagnostics may use an old job; stale business notices may not.
   }
   if (!events.length) {
@@ -221,7 +222,7 @@ async function deliver(broker, id, send, options = {}) {
       }
     }
     // A quick task can finish before the debounce; show one final receipt, not stale running alerts.
-    if (event !== last && !['notification_check', 'parallel_check', 'subagent_check'].includes(event.kind) && (last.kind === 'terminal' || (event.kind === 'started' && last.kind === 'session_ready')) && (!fs.existsSync(file) || read(file).state === 'not_sent')) { save(file, { state: 'superseded', event_id: event.event_id, superseded_by: last.event_id }); continue; }
+    if (event !== last && !['notification_check', 'parallel_check', 'subagent_check', 'silence_alert'].includes(event.kind) && (last.kind === 'terminal' || (event.kind === 'started' && last.kind === 'session_ready')) && (!fs.existsSync(file) || read(file).state === 'not_sent')) { save(file, { state: 'superseded', event_id: event.event_id, superseded_by: last.event_id }); continue; }
     sent = await deliverEvent(job, event, file, send, options) || sent;
   }
   return sent;
@@ -275,8 +276,64 @@ function auditNotifications(broker, ids, options = {}) {
   if (changed) save(file, ledger);
   return ledger;
 }
+// Independent of worker liveness and per-CLI timeout. Never use routine progress,
+// proposal changes or transport acceptance as proof that the user saw a reply.
+function auditSilence(broker, jobs, now = Date.now()) {
+  const period = 4 * 3600000, groups = new Map(), due = [];
+  for (const job of jobs) {
+    if (!job.topic_id || !uuid(job.conversation_id)) continue;
+    const key = job.conversation_id + ':' + job.topic_id;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(job);
+  }
+  const file = path.join(path.dirname(broker.jobs), 'feedback-watch.json'), release = takeClaim(file + '.claim');
+  if (!release) return due;
+  try {
+    const ledger = fs.existsSync(file) ? read(file) : { schema: 1, topics: {} };
+    let changed = false;
+    for (const [key, rows] of groups) {
+      rows.sort((a, b) => a.created_at.localeCompare(b.created_at) || a.job_id.localeCompare(b.job_id));
+      const latest = rows.at(-1);
+      const settled = latest.handoff?.requires_user_decision || ['needs_input', 'blocked', 'execution_blocked', 'cancelled'].includes(latest.status) ||
+        (latest.verification_state === 'accepted_with_evidence' && latest.execution_report?.outcome === 'accepted');
+      if (settled) {
+        const old = ledger.topics[key];
+        if (old?.event_file) {
+          const dfile = old.event_file.replace(/\.json$/, '.delivery.json'), claim = takeClaim(dfile + '.claim');
+          if (claim) try {
+            const delivery = fs.existsSync(dfile) ? read(dfile) : null;
+            if (!delivery || delivery.state === 'not_sent') save(dfile, { ...delivery, state: 'superseded', reason: 'Matter accepted, cancelled or waiting for the human; no stale silence question.' });
+          } finally { claim(); }
+        }
+        continue;
+      }
+      const unfinished = !terminal.has(latest.status) || ['failed', 'timed_out'].includes(latest.status) || ['review_revise', 'review_needs_evidence'].includes(latest.handoff?.kind) ||
+        latest.execution_state === 'background_unconfirmed' || ['progress', 'no_progress', 'failed'].includes(latest.execution_report?.outcome);
+      if (!unfinished) continue; // Legacy completed rounds have unknown business state.
+      let anchor = Date.parse(rows[0].created_at);
+      for (const job of rows) if ((job.verification_state === 'accepted_with_evidence' && job.execution_report?.outcome === 'accepted') ||
+          job.request_context?.followups?.some(f => f.job_id === job.job_id && f.text?.trim())) anchor = Date.parse(job.created_at);
+      const previous = ledger.topics[key];
+      if (previous?.anchor === anchor && previous.event_file) {
+        const dfile = previous.event_file.replace(/\.json$/, '.delivery.json');
+        const delivery = fs.existsSync(dfile) ? read(dfile) : null;
+        // No repeated wakeup while an earlier send is pending or uncertain.
+        if (!delivery || !['accepted', 'sent', 'suppressed', 'superseded'].includes(delivery.state)) { due.push(previous.job_id); continue; }
+      }
+      const last = previous?.anchor === anchor ? previous.created_at : anchor;
+      if (!Number.isFinite(anchor) || now - last < period) continue;
+      const bucket = Math.floor((now - anchor) / period);
+      const event = publishNotification(broker.jobPath(latest.job_id), latest, `silence-${anchor}-${bucket}`, 'silence_alert',
+        `距原事项/真实用户补充已超过四小时，内部续跑与通知接口 accepted 均不证明用户已得到答复。当前 job=${latest.job_id}，状态=${latest.status}；请读取一次该原回执，解释为什么这么久没有回复、当前卡点及最合适的解决方式。不得另开任务或中止现有进程。`);
+      if (event) { ledger.topics[key] = { anchor, created_at: now, job_id: latest.job_id, event_file: event.file }; changed = true; due.push(latest.job_id); }
+    }
+    if (changed) save(file, ledger);
+    return due;
+  } finally { release(); }
+}
+
 function watch(broker, send, options = {}) {
-  const pending = new Set(), timers = new Map(), offsets = new Map(), known = new Set(), tracked = new Set(); let draining = false, closed = false, interval, watcher;
+  const pending = new Set(), timers = new Map(), offsets = new Map(), known = new Set(), tracked = new Set(), snapshots = new Map(); let draining = false, closed = false, interval, watcher;
   const healthFile = path.join(path.dirname(broker.jobs), 'notification-health.json');
   const health = { pid: process.pid, generation: options.generation || null, interval_ms: options.reconcileMs ?? 15000, last_delivery_at: null, watch_error: null };
   const heartbeat = () => { if (fs.existsSync(path.dirname(healthFile))) save(healthFile, { ...health, checked_at: new Date().toISOString(), tracked_jobs: tracked.size, closed }); };
@@ -318,6 +375,7 @@ function watch(broker, send, options = {}) {
           adaptLegacy(id);
           if (await deliver(broker, id, send, options)) health.last_delivery_at = new Date().toISOString();
           const job = broker.get(id), rows = notificationEvents(broker.jobPath(id));
+          snapshots.set(id, job);
           // Worker status is saved before its terminal outbox event. Do not retire
           // that job in the gap, or a lost final callback will bypass reconciliation.
           const settled = terminal.has(job.status) && ((job.notification_schema !== 2 && rows.length === 0) || rows.some(e => e.kind === 'terminal')) && rows.every(e => {
@@ -345,6 +403,8 @@ function watch(broker, send, options = {}) {
       if (fs.existsSync(alertFile)) for (const g of Object.values(read(alertFile).groups)) if (g.state === 'open') for (const id of g.jobs) ids.add(id);
       const ledger = auditNotifications(broker, ids, options);
       for (const g of Object.values(ledger.groups)) if (g.state === 'open') ids.add(g.alert_job_id);
+      for (const id of ids) try { snapshots.set(id, broker.get(id)); } catch { /* A partial new job is retried. */ }
+      for (const id of auditSilence(broker, [...snapshots.values()], options.now ?? Date.now())) ids.add(id);
       for (const id of ids) { tracked.add(id); pending.add(id); }
       heartbeat(); void drain();
     } catch (error) { health.watch_error = error.message; heartbeat(); process.stderr.write(`Local reconciliation: ${error.message}\n`); }
@@ -381,7 +441,7 @@ function watch(broker, send, options = {}) {
   interval = setInterval(reconcile, health.interval_ms);
   heartbeat(); void drain(); return { close, reconcile };
 }
-module.exports = { originHook, deliver, watch, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
+module.exports = { originHook, deliver, watch, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications, auditSilence };
 if (require.main === module) {
   if (process.argv[2] === '--origin-hook') {
     let input = '';

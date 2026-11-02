@@ -75,7 +75,8 @@ if ($prompt.Contains('当前是独立审核阶段（stage=review）')) {
   if ($prompt.Contains('REVIEW_USER_FIXTURE')) { $marker = 'REVISE'; $review.decision_scope = 'user'; $review.reason = '需要改变用户明确限制'; $review.question = '是否改变限制？'; $review.options = @('保留原限制', '明确更改限制') }
   if ($prompt.Contains('REVIEW_WRONG_VERSION_FIXTURE')) { $review.plan_sha256 = 'f' * 64 }
   if ($prompt.Contains('REVIEW_EMPTY_SCOPE_FIXTURE')) { $review.allowed_scope = @() }
-  $tid = '00000000-0000-0000-0000-000000000001'
+  $tid = [guid]::NewGuid().ToString()
+  if ($prompt.Contains('USER_ORIGINAL_SENTINEL')) { $tid = '00000000-0000-0000-0000-000000000001' }
   if ($argv -contains 'resume') { $tid = $argv[[Array]::IndexOf($argv, 'resume')+1] }
   elseif (($prompt -match 'REVIEW_[A-Z_]+_FIXTURE') -or $prompt.Contains('CONCURRENT_FIXTURE')) { $tid = [guid]::NewGuid().ToString() }
   elseif ($prompt.Contains('SECOND_SESSION')) { $tid = '00000000-0000-0000-0000-000000000002' }
@@ -127,6 +128,7 @@ if ($prompt.Contains('POLICY_REPORTED_FIXTURE')) { $text = '[CODEX_EXECUTION_BLO
 if ($prompt.Contains('POLICY_COMBINED_FIXTURE')) { $text = '[CODEX_PLAN_REJECTED]' + [Environment]::NewLine + '{"reason":"另有方案矛盾","question":"如何修正方案？","options":["补齐原方案","修改要求"]}' }
 if ($prompt.Contains('POLICY_MACHINE_FIXTURE') -or $prompt.Contains('POLICY_COMBINED_FIXTURE')) { [Console]::Error.WriteLine('2026-11-01T03:33:17.760090Z ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: "Rejected: blocked by policy" }') }
 if ($prompt.Contains('POLICY_QUOTED_FIXTURE')) { $text = '测试引用 Rejected: blocked by policy，不代表真的拒绝。' }
+if ($text.StartsWith('FAKE_OK')) { $text += [Environment]::NewLine + '[CODEX_EXECUTION_REPORT]' + [Environment]::NewLine + '{"outcome":"accepted","reason":"fixture 全部验收通过","evidence_commands":["fixture verify"],"remaining_checks":[]}' }
 [IO.File]::WriteAllText($argv[$i+1], $text, [Text.UTF8Encoding]::new($false))
 $tid = '00000000-0000-0000-0000-000000000001'
 if ($argv -contains 'resume') { $tid = $argv[[Array]::IndexOf($argv, 'resume')+1] }
@@ -142,7 +144,7 @@ if ($prompt.Contains('PROGRESS_FIXTURE')) {
   '{"type":"item.completed","item":{"id":"check1","type":"command_execution","command":"cargo test -p fixture","exit_code":0}}'
 }
 if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { '{"type":"item.started","item":{"id":"test-pending","type":"command_execution","command":"cargo test -p fixture"}}' }
-'{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"part-1","exit_code":0}}'
+'{"type":"item.completed","item":{"id":"verify1","type":"command_execution","command":"fixture verify","aggregated_output":"part-1","exit_code":0}}'
 '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"part-2","exit_code":0}}'
 '{"type":"item.completed","item":{"type":"agent_message","text":"FAKE_OK"}}'
 '{"type":"turn.completed"}'

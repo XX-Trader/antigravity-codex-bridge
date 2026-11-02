@@ -5,9 +5,71 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { Broker, save, read, publishNotification, notificationEvents, notificationSummary, commandPhase, dispatch, finalHandoff, executionBlock, takeFileClaim } = require('../src/server.cjs');
-const { deliver, watch, claimHost, recordedReceipt, nativeSend, eventMessage, notificationPolicy, notificationHeading, auditNotifications } = require('../src/notifier.cjs');
+const { deliver, watch, claimHost, recordedReceipt, nativeSend, eventMessage, notificationPolicy, notificationHeading, auditNotifications, auditSilence } = require('../src/notifier.cjs');
 const chat = '11111111-1111-1111-1111-111111111111';
 const id = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+
+test('four-hour fallback asks why, survives continuation/restart, and never treats transport as a user reply', async t => {
+  const f = fixture(t), at = Date.now(), hour = 3600000;
+  const original = { ...f.job, created_at: new Date(at - 4 * hour).toISOString() }; save(f.file, original);
+  assert.deepEqual(auditSilence(f.broker, [original], at - 1), []);
+  assert.deepEqual(auditSilence(f.broker, [original], at), [id]);
+  const alert = notificationEvents(f.file).find(e => e.kind === 'silence_alert');
+  const message = eventMessage(original, alert);
+  assert.match(message, /为什么这么久没有回复/); assert.match(message, /如何解决最合适|最合适的解决/);
+  assert.match(message, /不重派、不取消/); assert.equal(notificationPolicy(original, alert), 'send');
+  assert.deepEqual(auditSilence(new Broker({ data: f.root }), [original], at + hour), [id], 'Pending event is retried through its existing outbox');
+  assert.equal(notificationEvents(f.file).filter(e => e.kind === 'silence_alert').length, 1);
+  await deliver(f.broker, id, async () => ({ exit_code: 0 }));
+  const next = { ...original, job_id: 'bbbbbbbbbbbbbbbbbbbbbbbb', created_at: new Date(at + hour).toISOString() };
+  fs.mkdirSync(path.dirname(f.broker.jobPath(next.job_id))); save(f.broker.jobPath(next.job_id), next);
+  assert.deepEqual(auditSilence(f.broker, [original, next], at + 2 * hour), []);
+  assert.deepEqual(auditSilence(f.broker, [original, next], at + 4 * hour), [next.job_id]);
+  assert.equal(notificationEvents(f.broker.jobPath(next.job_id)).filter(e => e.kind === 'silence_alert').length, 1);
+});
+
+test('four-hour fallback preserves uncertain delivery and leaves human decisions, cancelled and accepted work alone', async t => {
+  const f = fixture(t), now = Date.now(), job = { ...f.job, created_at: new Date(now - 5 * 3600000).toISOString() }; save(f.file, job);
+  auditSilence(f.broker, [job], now);
+  await assert.rejects(deliver(f.broker, id, async () => { throw Error('unknown send'); }), /unknown send/);
+  auditSilence(f.broker, [job], now + 8 * 3600000);
+  assert.equal(notificationEvents(f.file).length, 1);
+  for (const delta of [{ status: 'cancelled' }, { status: 'needs_input', handoff: { requires_user_decision: true } }, { status: 'completed', verification_state: 'accepted_with_evidence', execution_report: { outcome: 'accepted' } }]) assert.deepEqual(auditSilence(f.broker, [{ ...job, ...delta }], now + 9 * 3600000), []);
+});
+
+test('four-hour fallback still asks why after a failed or timed-out worker, with no active process required', t => {
+  const now = Date.now();
+  for (const status of ['failed', 'timed_out']) {
+    const f = fixture(t, status);
+    const job = { ...f.job, status, created_at: new Date(now - 5 * 3600000).toISOString(), worker_pid: null };
+    save(f.file, job);
+    assert.deepEqual(auditSilence(f.broker, [job], now), [id]);
+    assert.equal(notificationEvents(f.file).find(e => e.kind === 'silence_alert').status, status);
+  }
+});
+
+test('sidecar reconciliation actually emits a due silence question without touching the active worker', async t => {
+  const f = fixture(t), now = Date.now(), job = { ...f.job, created_at: new Date(now - 4 * 3600000).toISOString() }; save(f.file, job);
+  let sent = 0;
+  const service = watch(f.broker, async (_recipient, message) => { assert.match(message, /为什么这么久没有回复/); sent++; return {}; }, { now, reconcileMs: 60000 });
+  t.after(() => service.close());
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await changed(f.root, () => service.reconcile(), () => notificationEvents(f.file).some(e => e.kind === 'silence_alert') && notificationSummary(f.file).latest?.state === 'accepted');
+  assert.equal(sent, 1); assert.equal(f.broker.get(id).status, 'running'); assert.equal(f.broker.get(id).worker_pid, process.pid);
+});
+
+test('saved review terminal is repaired only with exact durable evidence, with no notification replay', async t => {
+  const f = fixture(t, 'review_revise');
+  const job = { ...f.job, handoff: { kind: 'review_revise', reason: '接口错误' }, plan_review: { status: 'revise_required' } }; save(f.file, job);
+  f.emit('terminal', 'terminal', '接口错误'); await deliver(f.broker, id, async () => ({}));
+  save(f.file, { ...job, status: 'failed', error: 'Worker exited before recording completion' });
+  assert.equal(new Broker({ data: f.root }).get(id).status, 'review_revise');
+  assert.equal(await deliver(f.broker, id, async () => { throw Error('must not replay'); }), false);
+  save(f.file, { ...job, status: 'failed', error: 'real worker failure' });
+  assert.equal(f.broker.get(id).status, 'failed');
+  save(f.file, { ...job, topic_id: 'ffffffffffffffffffffffff', status: 'failed', error: 'Worker exited before recording completion' });
+  assert.equal(f.broker.get(id).status, 'failed');
+});
 test('review feedback reports the actual issue and routes technical revisions to fresh review, not user approval', t => {
   const f = fixture(t, 'review_revise');
   const handoff = { kind: 'review_revise', reason: '方案调用不存在的接口', evidence: ['已核对当前接口列表'], suggested_changes: '按当前接口重新设计', requires_user_decision: false };
