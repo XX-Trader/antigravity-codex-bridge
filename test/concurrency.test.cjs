@@ -8,6 +8,7 @@ const cp = require('node:child_process');
 const originalSpawn = cp.spawn;
 cp.spawn = () => ({ pid: process.pid, on() {}, unref() {} });
 const { Broker, save, dispatch, finalHandoff, executionBlock, reviewVersion, reviewOutcome } = require('../src/server.cjs');
+const { reviewRoute, liveReviewSettings, config } = require('../src/server.cjs');
 cp.spawn = originalSpawn;
 function fixture(t) {
   const base = fs.realpathSync(process.env.CODEX_EXECUTOR_TEST_ROOT), root = fs.mkdtempSync(path.join(base, 'concurrency-'));
@@ -16,6 +17,41 @@ function fixture(t) {
   const settings = { project, data, entry: process.execPath, pwsh: process.execPath, model_aliases: {} };
   return { root, project, data, settings, broker: new Broker(settings) };
 }
+
+test('review model routing is separate from execution and preserves quant context across continuation', t => {
+  const f = fixture(t);
+  f.broker.settings.model = 'executor'; f.broker.settings.review_models = { general: 'review-sol', quant: 'review-astra' };
+  assert.equal(reviewRoute({ prompt: '日常接口方案' }, f.broker.settings).model, 'review-sol');
+  for (const input of [{ prompt: '因子净化方案' }, { user_followup: '这是量化相关的' }, { review_category: 'quant' }]) assert.equal(reviewRoute(input, f.broker.settings).model, 'review-astra');
+  assert.equal(reviewRoute({ prompt: '继续审查' }, f.broker.settings, { review_route: { category: 'quant' } }).model, 'review-astra');
+  assert.equal(reviewRoute({ review_category: 'general' }, { ...f.broker.settings, review_category: 'quant' }).model, 'review-sol');
+  assert.throws(() => reviewRoute({ review_category: 'guess' }, f.broker.settings), /review_category/);
+  assert.throws(() => f.broker.start({ prompt: '审核', review_only: 'true' }), /boolean/);
+  const job = f.broker.start({ prompt: '日常方案', model: 'explicit-executor', review_only: true });
+  const saved = f.broker.get(job.job_id);
+  assert.equal(saved.review_route.model, 'review-sol'); assert.equal(saved.settings.model, 'explicit-executor');
+  assert.notEqual(reviewVersion(saved), reviewVersion({ ...saved, review_only: false }));
+  assert.notEqual(reviewVersion(saved), reviewVersion({ ...saved, review_route: { ...saved.review_route, model: 'another' } }));
+});
+
+test('review configuration binds project categories; legacy workers read only matching installation policy', t => {
+  const f = fixture(t), other = path.join(f.root, 'other-project'), otherData = path.join(f.root, 'other-data'); fs.mkdirSync(other); fs.mkdirSync(otherData);
+  const env = { CODEX_EXECUTOR_PROJECT: f.project, CODEX_EXECUTOR_DATA: f.data, CODEX_EXECUTOR_ENTRY: process.execPath,
+    CODEX_EXECUTOR_MODEL: 'executor', CODEX_EXECUTOR_MODEL_ALIASES: JSON.stringify({ sol: 'review-sol', astra: 'review-astra' }), CODEX_EXECUTOR_REVIEW_MODEL: 'sol', CODEX_EXECUTOR_QUANT_REVIEW_MODEL: 'astra',
+    CODEX_EXECUTOR_PROJECTS: JSON.stringify([{ project: f.project, data: f.data }, { project: other, data: otherData, review_category: 'quant' }]) };
+  const configured = config(env);
+  assert.equal(configured.projects[0].review_category, 'general'); assert.equal(configured.projects[1].review_category, 'quant');
+  assert.equal(reviewRoute({}, configured.projects[1]).model, 'review-astra');
+  assert.throws(() => config({ ...env, CODEX_EXECUTOR_REVIEW_CATEGORY: 'invalid' }), /category/);
+  assert.throws(() => config({ ...env, CODEX_EXECUTOR_QUANT_REVIEW_MODEL: 'bad model' }), /model/);
+  const file = path.join(f.root, 'mcp.json'), doc = { mcpServers: { 'codex-executor': { args: [path.resolve(__dirname, '../src/server.cjs')], env } } }; save(file, doc);
+  const legacy = { ...f.settings, model: 'keep-executor', review_config_file: file };
+  const live = liveReviewSettings(legacy);
+  assert.equal(live.model, 'keep-executor'); assert.equal(live.entry, legacy.entry);
+  assert.deepEqual(live.review_models, { general: 'review-sol', quant: 'review-astra' });
+  doc.mcpServers['codex-executor'].args = ['another-server.cjs']; save(file, doc);
+  assert.equal(liveReviewSettings(legacy), legacy, 'Unrelated servers cannot supply policy');
+});
 
 test('legacy review loops produce a takeover instead of demanding all obsolete review replies; one real answer resets duplicate holds', t => {
   const f = fixture(t), { takeover, loopState } = require('../src/loop-guard.cjs');

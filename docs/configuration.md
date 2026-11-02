@@ -117,6 +117,12 @@ MCP 和 Sidecar 分别加载。配置写入后检查真实进程路径及 `notif
 
 ## 先审核再执行
 
+审核模型与执行模型独立。`CODEX_EXECUTOR_REVIEW_MODEL` 设置日常审核模型，`CODEX_EXECUTOR_QUANT_REVIEW_MODEL` 设置量化审核模型，均接受本机别名；未设置时继承执行模型，不在代码中固定个人模型 ID。项目条目可设 `review_category: "quant"`，普通项目默认为 `general`。调用时可显式传 `review_category`；未指定时结合项目、原事项和量化/回测/因子等任务内容判断。量化事项续接保留类别；只有显式指定类别才覆盖。容量不足仍等待原审核模型，不自动切回其他模型。`model` 保留执行模型，实际审核选择见 `review_route`，两阶段的尝试记录保存各自实际模型。
+
+用户单独交方案要求审核时，调用 `codex_run` 并设 `review_only=true`。审核通过后返回 `stage=review_complete`、`execution_state=review_only`，不会启动执行阶段，也不再发送未完成业务的四小时提醒。审核修订仍沿原事项续接并保留只审核模式。用户明确要求实施后，以逐字 `user_followup` 加 `review_only=false` 续接，重新审核新版本；只在规划摘要中写“现在执行”不能解除该边界。审核模型、类别和只审核模式也绑定到方案版本中。
+
+新 worker 也兼容旧连接的派发：缺少审核路由时，按 `CODEX_EXECUTOR_REVIEW_CONFIG`（旧注册使用默认 MCP 配置路径）回读同一安装、同一注册项目的当前审核策略，只更新审核模型与类别，不导入执行模型、CLI 或权限。已有执行阶段不热切换。旧连接仍需刷新工具定义，才能传入新增的只审核字段。
+
 自动修订有上限：同一未完成事项累计失败 3 轮，或连续 2 个执行轮次无可核验进展，worker 保存 `needs_input` / `handoff.blocker_type=human_takeover`，不再调用模型实施。历史 job 是计数依据，重启、换方案、审核通过及 CLI 退出 0 不清零。按整个原始事项保守累计，不能把失败的验收项换个名字清零；只完成部分要求时继续保留累计失败。旧客户端派发也经过新 worker 的入口检查。
 
 执行结果末尾的 `[CODEX_EXECUTION_REPORT]` 报告 `outcome`、原因、剩余验收与本轮证据。桥接把 `evidence_outputs` 的逐字输出摘录、`evidence_commands` 的完整命令或 `evidence_item_ids` 与本轮成功工具事件核对；缺失或不匹配视为无可核验进展。只有 `accepted`、无剩余验收、实际证据匹配且 CLI 正常完成才标记 `accepted_with_evidence` 并重置；这仍是执行者的验收判断，不是对业务正确性的独立证明。容量等待、取消和策略拒绝不作为普通修订失败；用户实际回答接管问题后，以原 `plan_decision` 和逐字 `user_followup` 重置循环并重新审核，不清除执行策略拒绝。

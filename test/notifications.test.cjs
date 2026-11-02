@@ -9,6 +9,13 @@ const { deliver, watch, claimHost, recordedReceipt, nativeSend, eventMessage, no
 const chat = '11111111-1111-1111-1111-111111111111';
 const id = 'aaaaaaaaaaaaaaaaaaaaaaaa';
 
+test('approved review-only jobs finish with review feedback and do not wake implementation or silence alarms', t => {
+  const f = fixture(t, 'completed'), job = { ...f.job, review_only: true, stage: 'review_complete', plan_review: { status: 'approved' } };
+  const message = eventMessage(job, { kind: 'terminal', status: 'completed', created_at: job.created_at });
+  assert.match(message, /方案审核完成/); assert.match(message, /不能派发实施/);
+  assert.deepEqual(auditSilence(f.broker, [job], Date.now() + 8 * 3600000), []);
+});
+
 test('four-hour fallback asks why, survives continuation/restart, and never treats transport as a user reply', async t => {
   const f = fixture(t), at = Date.now(), hour = 3600000;
   const original = { ...f.job, created_at: new Date(at - 4 * hour).toISOString() }; save(f.file, original);

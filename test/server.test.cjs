@@ -15,7 +15,7 @@ class Broker extends RealBroker {
 }
 
 const { originHook, deliver, watch } = require('../src/notifier.cjs');
-const fixtureAliases = { luna: 'fixture-luna', terra: 'fixture-terra', sol: 'fixture-sol' };
+const fixtureAliases = { astra: 'fixture-astra', luna: 'fixture-luna', terra: 'fixture-terra', sol: 'fixture-sol' };
 const fixtureEnv = { CODEX_EXECUTOR_MODEL: 'terra', CODEX_EXECUTOR_MODEL_ALIASES: JSON.stringify(fixtureAliases), CODEX_EXECUTOR_SERVICE_TIER: 'fast' };
 Object.assign(process.env, fixtureEnv);
 const config = env => parseConfig({ ...fixtureEnv, ...env });
@@ -69,6 +69,7 @@ if ($prompt.Contains('当前是独立审核阶段（stage=review）')) {
   $oi = [Array]::IndexOf($argv, '-o')
   $version = [regex]::Match($prompt, '本轮方案版本：([a-f0-9]{64})').Groups[1].Value
   $review = @{ plan_sha256 = $version; evidence = @('已实际读取 fixture README 并核对目标'); allowed_scope = @('仅按测试要求实施，不扩大任务范围'); reason = 'fixture 审核通过'; decision_scope = 'technical' }
+  $review.reason += ' reviewer=' + $argv[[Array]::IndexOf($argv, '-m')+1]
   $marker = 'APPROVED'
   if ($prompt.Contains('REVIEW_REVISE_FIXTURE')) { $marker = 'REVISE'; $review.reason = '方案调用不存在的接口'; $review.suggested_changes = '依据当前接口修订'; $review.Remove('allowed_scope') }
   if ($prompt.Contains('REVIEW_EVIDENCE_FIXTURE')) { $marker = 'NEEDS_EVIDENCE'; $review.reason = '缺少实际运行日志'; $review.suggested_changes = '补充真实日志'; $review.Remove('allowed_scope') }
@@ -185,6 +186,22 @@ exit 0
       assert.equal(broker.lockOwner().job_id, other); broker.unlock(other); assert.equal(broker.lockOwner(), null);
     });
     let first;
+    await t.test('review routing selects general or quant CLI models, review-only stops, execution retains its own model', async () => {
+      const routed = new Broker({ ...settings, review_models: { general: 'fixture-sol', quant: 'fixture-astra' } });
+      const general = await routed.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 日常方案审核', review_only: true });
+      assert.equal(general.status, 'completed'); assert.equal(general.stage, 'review_complete');
+      assert.equal(general.review_only, true); assert.equal(general.review_route.model, 'fixture-sol');
+      assert.match(general.plan_review.reason, /reviewer=fixture-sol/);
+      assert.doesNotMatch(fs.readFileSync(general.paths.events, 'utf8'), /"stage":"execute"/);
+      const quant = await routed.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 量化因子回测方案审核', review_only: true });
+      assert.equal(quant.review_route.model, 'fixture-astra'); assert.match(quant.plan_review.reason, /reviewer=fixture-astra/);
+      assert.equal(quant.stage, 'review_complete');
+      await assert.rejects(routed.run({ topic_id: general.topic_id, prompt: '擅自实施', review_only: false }), /actual human instruction/);
+      const execution = await routed.run({ wait: true, topic_id: general.topic_id, prompt: 'REVIEW_VALID_FIXTURE 按已审核方案实施', review_only: false, user_followup: '现在按通过的方案实施。' });
+      assert.equal(execution.status, 'completed'); assert.equal(execution.review_route.model, 'fixture-sol');
+      assert.match(execution.final_response, /model=fixture-terra/);
+      assert.match(execution.plan_review.reason, /reviewer=fixture-sol/);
+    });
     await t.test('review gate: same native session, independent evidence, version binding and no execution before approval', async () => {
       const result = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 中文参数', topic: '审核通过自动执行' });
       assert.equal(result.status, 'completed'); assert.equal(result.plan_review.status, 'approved');

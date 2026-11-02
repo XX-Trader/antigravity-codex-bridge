@@ -16,6 +16,33 @@ const isCapacity = message => typeof message === 'string' && message.trim().repl
 const VERSION = require('../package.json').version;
 const efforts = new Set(['low', 'medium', 'high']);
 const sandboxModes = ['read-only', 'workspace-write', 'danger-full-access'];
+function reviewRoute(input, settings, parent) {
+  const explicit = input.review_category;
+  if (explicit !== undefined && !['general', 'quant'].includes(explicit)) throw new Error('review_category must be general or quant');
+  const quant = parent?.review_route?.category === 'quant' || settings.review_category === 'quant' ||
+    /量化|回测|因子|选股|投资组合|样本外|\bquant(?:itative)?\b|\bbacktest(?:ing)?\b/i.test([input.user_request, input.user_followup, input.prompt, input.topic, input.request_context?.original_text, ...(input.request_context?.followups || []).map(row => row.text)].filter(Boolean).join('\n'));
+  const category = explicit || (quant ? 'quant' : 'general');
+  return { category, model: settings.review_models?.[category] || settings.review_models?.general || settings.model || null,
+    source: explicit ? 'explicit_category' : quant ? 'quant_context' : 'default_category' };
+}
+function liveReviewSettings(settings, file = settings.review_config_file || path.join(os.homedir(), '.gemini', 'config', 'mcp_config.json')) {
+  if (!fs.existsSync(file)) return settings;
+  const document = read(file), entry = document.mcpServers?.['codex-executor'];
+  // Read only this installation's registered review policy. Never import another
+  // server's execution model, CLI, permissions or unrelated project configuration.
+  if (!entry?.args?.some(arg => typeof arg === 'string' && path.resolve(arg).toLowerCase() === __filename.toLowerCase())) return settings;
+  const env = entry.env || {}, projects = JSON.parse(env.CODEX_EXECUTOR_PROJECTS || '[]');
+  const project = projects.find(p => { try { return fs.realpathSync(p.project).toLowerCase() === settings.project.toLowerCase(); } catch { return false; } });
+  if (!project) return settings;
+  const aliases = JSON.parse(env.CODEX_EXECUTOR_MODEL_ALIASES || '{}');
+  const category = project.review_category || env.CODEX_EXECUTOR_REVIEW_CATEGORY || settings.review_category || 'general';
+  if (!['general', 'quant'].includes(category)) throw new Error('Invalid live review category');
+  return { ...settings, review_category: category, review_models: {
+    ...settings.review_models,
+    ...(env.CODEX_EXECUTOR_REVIEW_MODEL ? { general: selectedModel(env.CODEX_EXECUTOR_REVIEW_MODEL, aliases) } : {}),
+    ...(env.CODEX_EXECUTOR_QUANT_REVIEW_MODEL ? { quant: selectedModel(env.CODEX_EXECUTOR_QUANT_REVIEW_MODEL, aliases) } : {})
+  } };
+}
 function executionSandbox(input, settings) {
   const sandbox = input.sandbox === undefined ? 'danger-full-access' : input.sandbox;
   if (!sandboxModes.includes(sandbox)) throw new Error('sandbox must be read-only, workspace-write or danger-full-access');
@@ -89,7 +116,7 @@ function reviewVersion(job) {
     prompt: job.prompt, original: job.request_context?.original_text ?? null,
     followups: (job.request_context?.followups || []).map(row => row.text),
     review_followup: job.review_followup || null, execution_followup: job.execution_followup || null,
-    execution_constraints: job.execution_constraints || [] }), 'utf8').digest('hex');
+    execution_constraints: job.execution_constraints || [], review_route: job.review_route || null, review_only: job.review_only === true }), 'utf8').digest('hex');
 }
 function reviewOutcome(text, job, violation = '') {
   const match = text.trimStart().match(/^\[CODEX_REVIEW_(APPROVED|REVISE|NEEDS_EVIDENCE)\]\s*([\s\S]*)$/);
@@ -276,11 +303,16 @@ function config(env = process.env) {
   if (service_tier !== null && service_tier !== 'fast') throw new Error('service tier must be fast or omitted to inherit Codex configuration');
   if (env.CODEX_EXECUTOR_ALLOW_SANDBOX !== undefined && !['0', '1'].includes(env.CODEX_EXECUTOR_ALLOW_SANDBOX)) throw new Error('CODEX_EXECUTOR_ALLOW_SANDBOX must be 0 or 1');
   const settings = { project, data, entry, pwsh: env.CODEX_EXECUTOR_PWSH || 'pwsh.exe', model: env.CODEX_EXECUTOR_MODEL ? selectedModel(env.CODEX_EXECUTOR_MODEL, model_aliases) : null, model_aliases, reasoning_effort, service_tier, web_search: 'live', allow_sandbox: env.CODEX_EXECUTOR_ALLOW_SANDBOX === '1' };
+  settings.review_category = env.CODEX_EXECUTOR_REVIEW_CATEGORY || 'general';
+  settings.review_config_file = env.CODEX_EXECUTOR_REVIEW_CONFIG || null;
+  if (!['general', 'quant'].includes(settings.review_category)) throw new Error('Invalid review category');
+  settings.review_models = Object.fromEntries([['general', env.CODEX_EXECUTOR_REVIEW_MODEL], ['quant', env.CODEX_EXECUTOR_QUANT_REVIEW_MODEL]].filter(([, value]) => value).map(([key, value]) => [key, selectedModel(value, model_aliases)]));
   if (env.CODEX_EXECUTOR_PROJECTS) {
     const projects = JSON.parse(env.CODEX_EXECUTOR_PROJECTS);
     if (!Array.isArray(projects) || !projects.length || projects.length > 20) throw new Error('Register 1..20 explicit project roots');
     if (projects.some(p => !p || typeof p.project !== 'string' || typeof p.data !== 'string' || !path.isAbsolute(p.project) || !path.isAbsolute(p.data))) throw new Error('Project/data roots must be explicit absolute paths');
-    settings.projects = projects.map(p => config({ ...env, CODEX_EXECUTOR_PROJECTS: '', CODEX_EXECUTOR_PROJECT: p.project, CODEX_EXECUTOR_DATA: p.data }));
+    if (projects.some(p => p.review_category !== undefined && !['general', 'quant'].includes(p.review_category))) throw new Error('Project review_category must be general or quant');
+    settings.projects = projects.map(p => config({ ...env, CODEX_EXECUTOR_PROJECTS: '', CODEX_EXECUTOR_PROJECT: p.project, CODEX_EXECUTOR_DATA: p.data, CODEX_EXECUTOR_REVIEW_CATEGORY: p.review_category || settings.review_category }));
     const roots = new Set(settings.projects.map(p => p.project.toLowerCase()));
     const dataRoots = new Set(settings.projects.map(p => p.data.toLowerCase()));
     if (roots.size !== projects.length || dataRoots.size !== projects.length || !settings.projects.some(p => p.project === project)) throw new Error('Project roots/data must be unique and include the default project');
@@ -468,7 +500,7 @@ class Broker {
     } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
   summary(job) {
-    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title', 'notification_error', 'concurrency', 'handoff', 'plan_decision', 'stage', 'plan_review', 'review_followup', 'execution_block', 'execution_followup', 'execution_constraints', 'execution_state', 'verification_state', 'background_commands', 'loop_guard', 'loop_reset', 'execution_report', 'repair_round_failed'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), request_context: requestContextSummary(job), execution_environment: job.sandbox === 'danger-full-access' ? 'host' : 'sandbox', chat: chatAccess(job.thread_id), notification: job.job_id ? notificationSummary(this.jobPath(job.job_id)) : null, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
+    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title', 'notification_error', 'concurrency', 'handoff', 'plan_decision', 'stage', 'plan_review', 'review_followup', 'execution_block', 'execution_followup', 'execution_constraints', 'execution_state', 'verification_state', 'background_commands', 'review_route', 'review_only', 'loop_guard', 'loop_reset', 'execution_report', 'repair_round_failed'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), request_context: requestContextSummary(job), execution_environment: job.sandbox === 'danger-full-access' ? 'host' : 'sandbox', chat: chatAccess(job.thread_id), notification: job.job_id ? notificationSummary(this.jobPath(job.job_id)) : null, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
   }
   start(input, resumption = null) {
     if (process.env.CODEX_EXECUTOR_CHILD === '1') throw new Error('Recursive Codex delegation is disabled');
@@ -480,6 +512,7 @@ class Broker {
     if (input.wait !== undefined && typeof input.wait !== 'boolean') throw new Error('wait must be boolean');
     if (input.reasoning_effort !== undefined && !efforts.has(input.reasoning_effort)) throw new Error('reasoning_effort must be low, medium or high');
     if (input.model !== undefined) selectedModel(input.model, this.settings.model_aliases);
+    if (input.review_only !== undefined && typeof input.review_only !== 'boolean') throw new Error('review_only must be boolean');
     const cwd = fs.realpathSync(input.cwd || this.settings.project);
     if (!fs.statSync(cwd).isDirectory() || !inside(this.settings.project, cwd)) throw new Error('cwd is outside the configured project');
     const sandbox = executionSandbox(input, this.settings);
@@ -494,6 +527,9 @@ class Broker {
     if (input.topic_id && !topicParent) throw new Error('Unknown topic_id; omit it to create a new matter');
     if (input.topic && (parent?.topic || topicParent?.topic) && input.topic.trim() !== (parent?.topic || topicParent?.topic)) throw new Error('A different matter needs a new topic, not an existing topic_id/session_id');
     const taskSettings = { ...this.settings, model: input.model !== undefined ? selectedModel(input.model, this.settings.model_aliases) : parent?.settings?.model || this.settings.model, reasoning_effort: input.reasoning_effort || parent?.settings?.reasoning_effort || this.settings.reasoning_effort || 'medium' };
+    const review_route = reviewRoute(input, taskSettings, parent || topicParent);
+    const review_only = input.review_only ?? parent?.review_only ?? topicParent?.review_only ?? false;
+    if (!review_only && (parent?.review_only || topicParent?.review_only) && (typeof input.user_followup !== 'string' || !input.user_followup.trim())) throw new Error('Moving from review-only to execution requires the actual human instruction in user_followup');
     const id = crypto.randomBytes(12).toString('hex');
     const dir = path.dirname(this.jobPath(id));
     const topicId = parent?.topic_id || input.topic_id || id, sessionId = parent?.thread_id || resumption?.id || null;
@@ -561,7 +597,7 @@ class Broker {
       const job = {
         job_id: id, status: 'queued', created_at: stamp(), cwd, sandbox,
         prompt: input.prompt, request_context, stage: 'review', ...(humanReset ? { loop_reset: { human_reply_job_id: id, refusal_job_id: plan_decision.refusal_job_id } } : {}), ...(review_followup ? { review_followup } : {}), ...(plan_decision ? { plan_decision } : {}), ...(execution_followup ? { execution_followup, execution_constraints } : {}), timeout_seconds: input.timeout_seconds || 3600,
-        settings: taskSettings, concurrency: 'unlimited', notification_schema: 2, topic_id: topicId, topic: parent?.topic || topicParent?.topic || input.topic?.trim() || taskTitle({ prompt: input.prompt }),
+        settings: taskSettings, review_route, review_only, concurrency: 'unlimited', notification_schema: 2, topic_id: topicId, topic: parent?.topic || topicParent?.topic || input.topic?.trim() || taskTitle({ prompt: input.prompt }),
         ...(input.conversation_id ? { conversation_id: input.conversation_id } : {}),
         ...(parent ? { parent_job_id: parent.job_id, thread_id: parent.thread_id, ...(parent.chat_title ? { chat_title: parent.chat_title } : {}) } : {}),
         ...(resumption ? { resumed_session: true, thread_id: resumption.id } : {})
@@ -616,7 +652,7 @@ class Broker {
       model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6), ...(job.capacity_retry_at ? { capacity_retry_at: job.capacity_retry_at } : {}),
       ...(job.conversation_id ? { conversation_id: job.conversation_id } : {}),
       exit_code: job.exit_code ?? null, ...(job.error ? { error: job.error } : {}),
-      loop_guard: job.loop_guard || null, execution_report: job.execution_report || null, request_context: requestContextSummary(job), stage: job.stage || null, plan_review: job.plan_review || null, review_followup: job.review_followup || null, handoff: job.handoff || null, plan_decision: job.plan_decision || null, execution_block: job.execution_block || null, execution_followup: job.execution_followup || null, execution_constraints: job.execution_constraints || [], execution_state: job.execution_state || (terminal.has(job.status) ? 'cli_finished' : 'running'), verification_state: job.verification_state || 'not_verified', background_commands: job.background_commands || [],
+      review_route: job.review_route || null, review_only: job.review_only === true, loop_guard: job.loop_guard || null, execution_report: job.execution_report || null, request_context: requestContextSummary(job), stage: job.stage || null, plan_review: job.plan_review || null, review_followup: job.review_followup || null, handoff: job.handoff || null, plan_decision: job.plan_decision || null, execution_block: job.execution_block || null, execution_followup: job.execution_followup || null, execution_constraints: job.execution_constraints || [], execution_state: job.execution_state || (terminal.has(job.status) ? 'cli_finished' : 'running'), verification_state: job.verification_state || 'not_verified', background_commands: job.background_commands || [],
       final_response: tail(resultFile, 8000), result_truncated: size > 8000,
       progress: latestProgress(path.join(dir, 'events.jsonl')), notification: notificationSummary(this.jobPath(id)),
       ...(usage ? { usage } : {}),
@@ -753,7 +789,8 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       return;
     }
     // Jobs admitted before this protocol must also pass a fresh review; no legacy bypass.
-    if (!job.plan_review) update({ stage: 'review', plan_review: { status: 'pending', plan_sha256: reviewVersion(job), allowed_scope: [], evidence: [] } });
+    if (job.stage !== 'execute' && !job.review_route) update({ review_route: reviewRoute(job, liveReviewSettings(job.settings)), stage: 'review' });
+    if (!job.plan_review || (job.stage === 'review' && job.plan_review.status === 'pending' && job.plan_review.plan_sha256 !== reviewVersion(job))) update({ stage: 'review', plan_review: { status: 'pending', plan_sha256: reviewVersion(job), allowed_scope: [], evidence: [] } });
     update({ status: 'running', started_at: stamp(), worker_pid: process.pid, attempts: [] });
     notify('started', 'started', '已开始独立核查方案；审核通过后才进入执行。');
     for (let attempt = 1; ; attempt++) {
@@ -761,11 +798,12 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       if (executionUsed >= job.timeout_seconds * 1000) { stopReason = 'timed_out'; break; }
       const started = clock.now(), deadline = Date.now() + job.timeout_seconds * 1000 - executionUsed;
       const reviewing = job.stage === 'review';
+      const attemptModel = reviewing ? job.review_route?.model || job.settings.model : job.settings.model;
       if (!reviewing && (job.plan_review.status !== 'approved' || job.plan_review.plan_sha256 !== reviewVersion(job))) throw new Error('Approved review does not match this execution input; execution was not started');
       update({ attempt, status: 'running', capacity_retry_at: null });
       if (attempt > 1) notify(`resumed-${attempt}`, 'resumed', `原模型、原会话续跑，第 ${attempt} 次启动。`);
       fs.rmSync(path.join(dir, 'result.txt'), { force: true });
-      fs.writeSync(events, JSON.stringify({ type: 'bridge.attempt', stage: job.stage, attempt, model: job.settings.model }) + '\n');
+      fs.writeSync(events, JSON.stringify({ type: 'bridge.attempt', stage: job.stage, attempt, model: attemptModel }) + '\n');
       let child, timer, killSent = false, turnCompleted = false, turnFailed = false, lastError = '', businessStarted = false, observed = false, reviewWrite = false, usage;
       const openCommands = new Map(), evidenceItems = new Map();
       const stop = reason => {
@@ -816,7 +854,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       const capacity = !successful && !stopReason && !executionBlock(null, attemptStderr) && isCapacity(lastError);
       const reportedUsage = { ...(job.usage || {}) };
       for (const [key, value] of Object.entries(usage || {})) if (typeof value === 'number') reportedUsage[key] = (reportedUsage[key] || 0) + value;
-      update({ ...(usage ? { usage: reportedUsage } : {}), attempts: [...job.attempts, { attempt, started_at: new Date(started).toISOString(), model: job.settings.model, exit_code: outcome.code, capacity, ...(usage ? { usage } : {}), ...(lastError ? { error: lastError } : {}) }] });
+      update({ ...(usage ? { usage: reportedUsage } : {}), attempts: [...job.attempts, { attempt, started_at: new Date(started).toISOString(), model: attemptModel, exit_code: outcome.code, capacity, ...(usage ? { usage } : {}), ...(lastError ? { error: lastError } : {}) }] });
       if (fs.existsSync(output)) fs.copyFileSync(output, path.join(dir, 'result.txt'));
       if (!capacity || businessStarted) executionUsed += Math.max(0, clock.now() - started);
       // Exact capacity message only: no lifetime retry cap, <=6 launches in a rolling hour.
@@ -843,6 +881,10 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
         handoff = review.handoff;
         update({ plan_review: { ...job.plan_review, ...review, handoff: undefined, attempts: job.attempts }, execution_used_ms: executionUsed });
         if (review.status === 'approved') {
+          if (job.review_only) {
+            finish({ status: 'completed', stage: 'review_complete', execution_state: 'review_only', verification_state: 'reviewed_not_executed', child_pid: null, execution_used_ms: executionUsed, exit_code: outcome.code, ended_at: stamp() });
+            break;
+          }
           update({ stage: 'execute', attempts: [], attempt: 0, child_pid: null });
           fs.writeSync(events, JSON.stringify({ type: 'bridge.review.approved', plan_sha256: job.plan_review.plan_sha256, thread_id: job.thread_id }) + '\n');
           const recent = job.plan_review.attempts.filter(row => Date.parse(row.started_at) > clock.now() - 3600000);
@@ -898,6 +940,8 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
 const object = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
 const idSchema = { type: 'string', description: 'The exact job_id returned by codex_run or a prior bridge job' };
 const requestFields = {
+  review_category: { type: 'string', enum: ['general', 'quant'], description: 'Review domain, independent of the execution model. Inferred from project/task context when omitted.' },
+  review_only: { type: 'boolean', description: 'True for plan-review-only requests: approval ends the job without execution. Continuations retain this mode; moving to implementation requires an actual human instruction in user_followup.' },
   user_request: { type: 'string', minLength: 1, maxLength: 60000, description: 'Verbatim human request, separate from prompt (the planner summary/implementation advice). Supply on new matters. Immutable once captured; omit or repeat exactly on continuation. Never invent missing original text.' },
   user_followup: { type: 'string', minLength: 1, maxLength: 60000, description: 'Verbatim new human clarification/decision, appended to the saved request history. Not a replacement summary or evidence of approval by itself.' },
   review_followup: { ...object({ review_job_id: idSchema, response: { type: 'string', minLength: 1, maxLength: 8000 } }, ['review_job_id', 'response']), description: 'Respond to an unresolved technical review in the same matter: explain revisions or added evidence. This never approves the plan; Codex reviews the new version before execution. Human scope/authorization changes still require plan_decision and the actual user reply.' },
@@ -918,7 +962,7 @@ const tools = [
 
 function dispatch(broker, request, signal) {
   const { method, params = {} } = request;
-  if (method === 'initialize') return { protocolVersion: ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'].includes(params.protocolVersion) ? params.protocolVersion : '2024-11-05', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'codex-executor', version: VERSION }, instructions: `Every task first enters an independent Codex review. Send the verbatim user_request and all human followups separately from the planner proposal/evidence in prompt. Review checks real code/logs/tool output; missing originals, evidence or scope cannot pass. The bridge records the input version, evidence and allowed_scope; only that approved version auto-executes in the same native session, without another human confirmation for already authorized work. Technical review_revise/review_needs_evidence returns require review_followup identifying the exact review and explaining revisions; Codex reviews again. Changes to human goals, explicit constraints, acceptance or authorization still require the actual human reply through plan_decision. New contradictory execution evidence suspends affected operations for re-review. Review approval is not business acceptance or a grant of permissions. Execution environment: ${broker.settings.allow_sandbox === true ? 'Local configuration permits user-requested isolation; omit sandbox for host execution.' : 'Host current-user environment only. Do not pass sandbox; do not infer isolation from read-only diagnostics. Sandbox requests are rejected before execution.'} Read-only, no-restart and no-file-change constraints belong in prompt and remain binding. Debug the environment where the problem actually occurs; sandbox invisibility is not evidence that host targets are absent. Execution boundary: Antigravity only plans, delegates and reviews; all execution and subagents must be Codex-owned. Codex-native spawn_agent is allowed, recursive calls through this MCP are not. Registered roots: ${(broker.settings?.projects || [broker.settings]).filter(Boolean).map(p => p.project).join(' ; ')}. Trusted-project executions default to danger-full-access and live web search. Sandbox selection requires local configuration opt-in and an explicit user isolation request. A finished session resumes in the host environment by default; never hot-change or resubmit a running task. Bind cwd to the current Antigravity project; never assume a different registered directory. Use codex_run once with a short topic and an available model ID or configured alias chosen for the task when needed. Default Medium and background acknowledgment; continue normal conversation without a waiting tool. Each unrelated matter gets its own topic/Codex session; reuse topic_id only for the same matter. A project-only identity hook binds the originating chat; a native sidecar pushes durable lifecycle events to that exact chat, each with event_id and sequence. Routine lifecycle/progress/recovery events stay local and silent; do not reply to legacy progress events. Show the initial saved chat link once, with no tool call. User notifications use at most three lines: local event time, project/matter/status; concrete verified result or action needed; one detail link. Hide internal IDs and protocol boilerplate. Never infer all checks passed from one command exit. Keep complete user-choice questions/options even when longer than three lines; never truncate choices. Only terminal events require codex_result once to review evidence or intervene within authorization. Continue an authorized unfinished matter silently; notify only a final reviewed outcome, unresolved blocker or user decision, not each internal turn. Notification transport alarms protect terminal/decision results; recovery remains local. execution_alert permits one inspect-only receipt read, never a redispatch. Forward needs_input handoff questions/options to the user without auto-selecting; resume the exact topic/session once after their answer. background_unconfirmed means CLI ended but command exit/verification is pending. notification_check stays local and silent, with no chat reply, tools or business execution. User notices must describe concrete completed work, remaining work or an actual question, never routing IDs, event codes or a receipt acknowledgment. Do not use repository folder names as user-facing task descriptions. parallel_check is an explicitly user-authorized native acceptance request: actually submit the independent read-only sample tasks it describes; the sample count is not a concurrency cap. Expose notification pending/not_sent/uncertain and service health; API acceptance is not rendered-chat or business acceptance. When a user asks to view a task, show its returned chat.vscode_uri as a clickable Markdown link; codex_list recovers these links after restart. Do not claim exec tasks automatically appear in the extension history list. Opening history does not authorize a new turn. Exact capacity errors resume the same model/thread, at most six starts per rolling hour with no lifetime cap; scripts wait, not models. Independent matters in the same worktree run without a numeric concurrency cap. Only duplicate simultaneous turns for the same topic/session are excluded. Before dispatch, assess file/API dependencies; if tightly coupled, ask the user whether to use separate worktrees or wait for the prerequisite, never create worktrees silently. Coordinate shared Git index, branch changes and final integration serially; switching branches in one shared directory is not isolation. Use codex_list(active_only=true) on explicit progress requests to see all active tasks, not periodic polling. No auto-upgrades, model-based schedule/timer/status polling or unrelated-chat messages. Fifteen-second local outbox reconciliation does not call a model or send heartbeats. Stop automatic repair after three cumulative failed rounds or two execution rounds without verified progress in the same unfinished matter. A human_takeover handoff requires explaining why it failed and the most suitable remedy, then the actual human reply through plan_decision plus user_followup. Approval, exit zero and changing plans never reset the count. silence_alert is an authorized four-hour fallback: read the current receipt once, explain why no reply, the blockage, evidence, remaining work and next feedback time. Do not redispatch or cancel active work; transport acceptance is not rendered-user feedback.` };
+  if (method === 'initialize') return { protocolVersion: ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'].includes(params.protocolVersion) ? params.protocolVersion : '2024-11-05', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'codex-executor', version: VERSION }, instructions: `Every task first enters an independent Codex review. Review models are routed by general versus quant context independently of execution models. For an explicit plan-review-only request set review_only=true; approval finishes the review without implementation. Send the verbatim user_request and all human followups separately from the planner proposal/evidence in prompt. Review checks real code/logs/tool output; missing originals, evidence or scope cannot pass. The bridge records the input version, evidence and allowed_scope; only that approved version auto-executes in the same native session, without another human confirmation for already authorized work. Technical review_revise/review_needs_evidence returns require review_followup identifying the exact review and explaining revisions; Codex reviews again. Changes to human goals, explicit constraints, acceptance or authorization still require the actual human reply through plan_decision. New contradictory execution evidence suspends affected operations for re-review. Review approval is not business acceptance or a grant of permissions. Execution environment: ${broker.settings.allow_sandbox === true ? 'Local configuration permits user-requested isolation; omit sandbox for host execution.' : 'Host current-user environment only. Do not pass sandbox; do not infer isolation from read-only diagnostics. Sandbox requests are rejected before execution.'} Read-only, no-restart and no-file-change constraints belong in prompt and remain binding. Debug the environment where the problem actually occurs; sandbox invisibility is not evidence that host targets are absent. Execution boundary: Antigravity only plans, delegates and reviews; all execution and subagents must be Codex-owned. Codex-native spawn_agent is allowed, recursive calls through this MCP are not. Registered roots: ${(broker.settings?.projects || [broker.settings]).filter(Boolean).map(p => p.project).join(' ; ')}. Trusted-project executions default to danger-full-access and live web search. Sandbox selection requires local configuration opt-in and an explicit user isolation request. A finished session resumes in the host environment by default; never hot-change or resubmit a running task. Bind cwd to the current Antigravity project; never assume a different registered directory. Use codex_run once with a short topic and an available model ID or configured alias chosen for the task when needed. Default Medium and background acknowledgment; continue normal conversation without a waiting tool. Each unrelated matter gets its own topic/Codex session; reuse topic_id only for the same matter. A project-only identity hook binds the originating chat; a native sidecar pushes durable lifecycle events to that exact chat, each with event_id and sequence. Routine lifecycle/progress/recovery events stay local and silent; do not reply to legacy progress events. Show the initial saved chat link once, with no tool call. User notifications use at most three lines: local event time, project/matter/status; concrete verified result or action needed; one detail link. Hide internal IDs and protocol boilerplate. Never infer all checks passed from one command exit. Keep complete user-choice questions/options even when longer than three lines; never truncate choices. Only terminal events require codex_result once to review evidence or intervene within authorization. Continue an authorized unfinished matter silently; notify only a final reviewed outcome, unresolved blocker or user decision, not each internal turn. Notification transport alarms protect terminal/decision results; recovery remains local. execution_alert permits one inspect-only receipt read, never a redispatch. Forward needs_input handoff questions/options to the user without auto-selecting; resume the exact topic/session once after their answer. background_unconfirmed means CLI ended but command exit/verification is pending. notification_check stays local and silent, with no chat reply, tools or business execution. User notices must describe concrete completed work, remaining work or an actual question, never routing IDs, event codes or a receipt acknowledgment. Do not use repository folder names as user-facing task descriptions. parallel_check is an explicitly user-authorized native acceptance request: actually submit the independent read-only sample tasks it describes; the sample count is not a concurrency cap. Expose notification pending/not_sent/uncertain and service health; API acceptance is not rendered-chat or business acceptance. When a user asks to view a task, show its returned chat.vscode_uri as a clickable Markdown link; codex_list recovers these links after restart. Do not claim exec tasks automatically appear in the extension history list. Opening history does not authorize a new turn. Exact capacity errors resume the same model/thread, at most six starts per rolling hour with no lifetime cap; scripts wait, not models. Independent matters in the same worktree run without a numeric concurrency cap. Only duplicate simultaneous turns for the same topic/session are excluded. Before dispatch, assess file/API dependencies; if tightly coupled, ask the user whether to use separate worktrees or wait for the prerequisite, never create worktrees silently. Coordinate shared Git index, branch changes and final integration serially; switching branches in one shared directory is not isolation. Use codex_list(active_only=true) on explicit progress requests to see all active tasks, not periodic polling. No auto-upgrades, model-based schedule/timer/status polling or unrelated-chat messages. Fifteen-second local outbox reconciliation does not call a model or send heartbeats. Stop automatic repair after three cumulative failed rounds or two execution rounds without verified progress in the same unfinished matter. A human_takeover handoff requires explaining why it failed and the most suitable remedy, then the actual human reply through plan_decision plus user_followup. Approval, exit zero and changing plans never reset the count. silence_alert is an authorized four-hour fallback: read the current receipt once, explain why no reply, the blockage, evidence, remaining work and next feedback time. Do not redispatch or cancel active work; transport acceptance is not rendered-user feedback.` };
   if (method === 'ping') return {};
   if (method === 'tools/list') return { tools: tools.map(tool => {
     if (broker.settings.allow_sandbox === true || !tool.inputSchema.properties.sandbox) return tool;
@@ -939,7 +983,7 @@ function dispatch(broker, request, signal) {
       case 'codex_start': value = broker.start(args); break;
       case 'codex_continue': {
         const parent = broker.get(args.job_id);
-        value = broker.start({ prompt: args.prompt, user_request: args.user_request, user_followup: args.user_followup, review_followup: args.review_followup, plan_decision: args.plan_decision, execution_followup: args.execution_followup, cwd: parent.cwd, sandbox: args.sandbox, parent_job_id: args.job_id }); break;
+        value = broker.start({ prompt: args.prompt, review_category: args.review_category, review_only: args.review_only, user_request: args.user_request, user_followup: args.user_followup, review_followup: args.review_followup, plan_decision: args.plan_decision, execution_followup: args.execution_followup, cwd: parent.cwd, sandbox: args.sandbox, parent_job_id: args.job_id }); break;
       }
       case 'codex_status': value = broker.status(args.job_id); break;
       case 'codex_result': value = broker.result(args.job_id, args.diagnostics === true); break;
@@ -972,7 +1016,7 @@ function serve(settings = config()) {
   lines.on('close', () => { setImmediate(() => { for (const controller of requests.values()) controller.abort(); }); });
 }
 
-module.exports = { reviewVersion, reviewOutcome, executionSandbox, finalHandoff, executionBlock, taskTitle, syncTaskTitle, latestProgress, chatAccess, toolResponse, nativeMetadata, worker, capacityRetryAt, isCapacity, capacityMessage, Broker, config, dispatch, tools, inside, read, save, terminal, childEnvironment, notificationEvents, publishNotification, notificationSummary, commandPhase, alive, takeFileClaim };
+module.exports = { liveReviewSettings, reviewRoute, reviewVersion, reviewOutcome, executionSandbox, finalHandoff, executionBlock, taskTitle, syncTaskTitle, latestProgress, chatAccess, toolResponse, nativeMetadata, worker, capacityRetryAt, isCapacity, capacityMessage, Broker, config, dispatch, tools, inside, read, save, terminal, childEnvironment, notificationEvents, publishNotification, notificationSummary, commandPhase, alive, takeFileClaim };
 if (require.main === module) {
   if (process.argv[2] === '--worker') worker(process.argv[3]).catch(error => {
     try { fs.writeFileSync(path.join(path.dirname(process.argv[3]), 'worker-error.txt'), `${error.stack}\n`, 'utf8'); } catch {}

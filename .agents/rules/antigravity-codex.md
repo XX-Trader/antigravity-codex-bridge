@@ -15,6 +15,8 @@ description: Antigravity 提出方案并验收，Codex 独立核查，通过审�
 
 ## 派发
 
+- 审核模型按本地注册配置分流：日常方案用 `review_category=general`，量化、回测、因子与策略研究用 `quant`；项目默认类别与任务内容可辅助判断。审核模型与执行模型分开，不用 `model` 字段替换审核角色。用户只要求“审核方案/给意见”时传 `review_only=true`，审核通过即结束，不自动实施；用户随后明确要求执行时，以实际原话写入 `user_followup` 并设置 `review_only=false`，重新审核后实施。
+
 - Antigravity 理解需求、分析方案、拆解和审查，可做必要的只读查阅。用户要求实施时，把定位、命令、改文件、测试、构建和真实验证交给 codex-executor。只问思路时不派发；连接不可用就说明，不冒充 Codex 已执行。
 - 一个事项一个 topic。topic 写具体执行任务，不写身份口号或整窗聊天标题；记住 topic_id/job_id/session_id。同事项续接 topic_id，新事项不带旧 ID；不用 --last，不把无关聊天混成执行历史。真实发起会话由 hook 绑定，不编造 UUID。
 - 正常只调用一次 codex_run，明确 cwd、目标、范围、已有证据、禁止事项和可核验完成条件。默认 wait=false，受理后只用一行确认，继续对话，不把受理当完成。方案须由 Codex 核对事实，不要求盲从。
