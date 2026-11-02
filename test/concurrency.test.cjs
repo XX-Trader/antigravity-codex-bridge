@@ -8,7 +8,7 @@ const cp = require('node:child_process');
 const originalSpawn = cp.spawn;
 cp.spawn = () => ({ pid: process.pid, on() {}, unref() {} });
 const { Broker, save, dispatch, finalHandoff, executionBlock, reviewVersion, reviewOutcome } = require('../src/server.cjs');
-const { reviewRoute, liveReviewSettings, config } = require('../src/server.cjs');
+const { contextReview, reviewRoute, liveReviewSettings, config } = require('../src/server.cjs');
 cp.spawn = originalSpawn;
 function fixture(t) {
   const base = fs.realpathSync(process.env.CODEX_EXECUTOR_TEST_ROOT), root = fs.mkdtempSync(path.join(base, 'concurrency-'));
@@ -137,7 +137,7 @@ test('review approval binds the exact task, original, followups, environment and
   assert.equal(revision.suggested_changes, '核对接口\n保留原目标');
 });
 
-test('technical review cannot be skipped through old parents, sessions, restarts or unrelated review IDs', async t => {
+test('missing genuine review context cannot be bypassed through old parents, sessions, restarts or unrelated review IDs', async t => {
   const f = fixture(t), thread = '12345678-1234-1234-1234-123456789abc';
   const first = f.broker.start({ prompt: '初始方案', user_request: '保留全部约束' });
   save(f.broker.jobPath(first.job_id), { ...f.broker.get(first.job_id), status: 'completed', thread_id: thread }); f.broker.unlock(first.job_id);
@@ -151,6 +151,29 @@ test('technical review cannot be skipped through old parents, sessions, restarts
   const revised = restarted.start({ prompt: '新的修订方案', parent_job_id: first.job_id, review_followup: { review_job_id: held.job_id, response: '已核对并修正接口' } });
   assert.equal(revised.plan_review.status, 'pending'); assert.equal(revised.stage, 'review');
   assert.equal(restarted.get(revised.job_id).request_context.original_text, '保留全部约束');
+});
+
+test('same-matter continuations reuse genuine review context; new sessions and explicit review-only retain independent review', t => {
+  const f = fixture(t), thread = '12345678-1234-1234-1234-123456789abc';
+  const first = f.broker.start({ prompt: '初始方案', user_request: '按原约束实施' });
+  const reviewed = { ...f.broker.get(first.job_id), status: 'review_revise', thread_id: thread,
+    plan_review: { ...first.plan_review, source: 'executor_report', reviewed_at: new Date().toISOString(), status: 'revise_required', reason: '核查后发现接口不符', evidence: ['实际接口列表'] },
+    handoff: { kind: 'review_revise', requires_user_decision: false, reason: '请修正接口调用' } };
+  save(f.broker.jobPath(first.job_id), reviewed); f.broker.unlock(first.job_id);
+  const next = f.broker.start({ prompt: '按实际接口修订，请结合上下文核查', topic_id: first.topic_id });
+  assert.equal(next.stage, 'execute'); assert.equal(next.plan_review.status, 'context');
+  assert.equal(next.context_review.job_id, first.job_id); assert.equal(next.context_review.feedback.reason, '请修正接口调用');
+  const saved = f.broker.get(next.job_id); assert.equal(saved.thread_id, thread); assert.equal(saved.parent_job_id, first.job_id);
+  assert.notEqual(reviewVersion(saved), reviewVersion({ ...saved, context_review: { ...saved.context_review, thread_id: 'other' } }));
+  assert.equal(contextReview({ ...saved, thread_id: 'other' }, [reviewed]), null);
+  assert.equal(contextReview({ ...saved, topic_id: 'other' }, [reviewed]), null);
+  assert.equal(contextReview({ ...saved, review_only: true }, [reviewed]), null);
+  save(f.broker.jobPath(next.job_id), { ...saved, status: 'completed' }); f.broker.unlock(next.job_id);
+  const restarted = new Broker(f.settings), only = restarted.start({ prompt: '这次只审核', topic_id: first.topic_id, review_only: true });
+  assert.equal(only.stage, 'review'); assert.equal(only.context_review, undefined);
+  assert.equal(only.plan_review.status, 'pending');
+  const fresh = restarted.start({ prompt: '另一事项', user_request: '原文', context_review: saved.context_review });
+  assert.equal(fresh.stage, 'review'); assert.equal(fresh.context_review, undefined);
 });
 
 test('explicit refusal survives restart and blocks topic, old-parent and native-session shortcuts', async t => {

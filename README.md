@@ -55,9 +55,9 @@ pwsh -NoProfile -File scripts/Setup.ps1 --project 'C:/work/my-project' --data 'C
 
 ## 常用工具
 
-每次派发同时提供用户原文 `user_request` 和规划建议 `prompt`，后续用户说明用 `user_followup` 逐字追加。Codex 先只读核查真实代码、日志和工具结果，返回审核依据与允许实施的范围；桥接核对本轮输入版本后，在同一原生会话自动发起执行，无需用户重复批准已授权事项。审核轮次和执行轮次分别保留输出及尝试记录，仍是同一个事项、同一个 job 和原生会话。
+新事项同时提供用户原文 `user_request` 和规划建议 `prompt`，后续用户说明用 `user_followup` 逐字追加。首轮由 Codex 独立只读核查真实代码、日志和工具结果，返回审核依据与允许实施的范围；桥接核对输入版本后在同一原生会话自动执行。后续方案续接原 topic/session，由 Codex 结合上下文自行核查，不再每次额外启动独立审核轮次。回执以 `context_review` 引用历史审核，`plan_review.status=context` 表示复用上下文，不表示新方案已经通过。
 
-审核结果缺失、版本不符、没有成功核查记录、原文缺失或没有明确范围时，任务停在 `review_needs_evidence`；技术方案需修订时为 `review_revise`。规划端按原事项传 `review_followup={review_job_id, response}` 回应，并提供修订后的 `prompt`，新版本重新审核。若涉及用户目标、明确约束、验收或授权变化，仍须真实用户决定，通过既有 `plan_decision` 续接。执行中新证据推翻假设时也会退回审核，保留已完成部分。
+审核结果缺失、版本不符、没有成功核查记录、原文缺失或没有明确范围时，任务停在 `review_needs_evidence`；技术方案需修订时为 `review_revise`。规划端在原事项提供修订后的 `prompt`，有真实审核上下文时可直接续接，也可用 `review_followup={review_job_id, response}` 逐项回应。仅审核模式或缺少可复用上下文时仍须独立审核。若涉及用户目标、明确约束、验收或授权变化，仍须真实用户决定，通过既有 `plan_decision` 续接。执行中新证据推翻假设时暂停受影响操作，修订后续接原会话自行核查，保留已完成部分。
 
 `plan_review` 记录输入 SHA-256、执行者的依据、`allowed_scope` 和状态；它是协议门禁和执行者判断，不是操作系统沙箱，也不能证明依据内容一定正确。完整访问下的只读核查仍由 Codex 遵守；桥接发现审核中的文件变更事件会暂停，但不能识别所有 shell 命令的副作用。审核通过不代替测试、运行回读或业务验收。
 

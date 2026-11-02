@@ -96,7 +96,7 @@ function eventMessage(job, event) {
   const restrictedWork = event.kind === 'terminal' && job.execution_constraints?.length;
   const refusal = event.kind === 'terminal' && handoff?.requires_user_decision;
   const review = event.kind === 'terminal' && !refusal && ['review_revise', 'review_needs_evidence'].includes(handoff?.kind);
-  const reviewControl = review ? `\n【独立审核未通过，未进入执行】先反馈具体原因、证据和未完成范围。技术问题由你与 Codex 在原事项讨论：把修订或新增证据写入 prompt，带 review_followup.review_job_id=${job.job_id} 和 response 逐项回应，再由 Codex 重新审核；不得把你的同意当成审核通过，不用新事项/旧会话跳过审核。能自行查明的事实先补证，不能编造用户原文。改变用户目标、约束、验收或授权时才交用户决定；已有用户决定门禁仍保留。执行中的新证据推翻假设时同样重新审核，已完成工作不重做。` : '';
+  const reviewControl = review ? `\n【方案需修订或补证，受影响操作未继续】先反馈具体原因、证据和未完成范围。技术问题由你与 Codex 在原事项讨论：把修订或新增证据写入 prompt，续接原 topic/session，由 Codex 结合上下文自行核查；可带 review_followup.review_job_id=${job.job_id} 和 response 逐项回应。仅审核模式或没有真实审核上下文时仍独立审核；不得把你的同意当成方案通过。能自行查明的事实先补证，不能编造用户原文。改变用户目标、约束、验收或授权时才交用户决定；已有用户决定门禁仍保留。执行中的新证据推翻假设时暂停受影响操作，修订后沿原会话自行核查，已完成工作不重做。` : '';
   const choice = event.kind === 'terminal' && !refusal && !execution && ['needs_input', 'blocked'].includes(event.status)
     ? `\n【需要判断/用户选择】${handoff?.question || handoff?.text || '请领取原回执查看具体问题。'}${handoff?.options?.length ? '\n选项：' + handoff.options.map((v, i) => `${i + 1}. ${v}`).join('\n') : ''}${handoff?.recommendation ? '\nCodex建议（不是用户授权）：' + handoff.recommendation : ''}\n只有已有明确授权能解决时才能继续；涉及用户偏好、范围、权限或不可逆选择须向用户原样展示问题/选项，等待回答。不得默认选推荐项。用户回答后用原 topic_id/session_id 续接一次，不重开事项。` : '';
   const background = event.kind === 'terminal' && (event.execution_state || job.execution_state) === 'background_unconfirmed'
@@ -111,7 +111,7 @@ function eventMessage(job, event) {
     : refusal
     ? `${handoff.original_plan ? '原计划：' + handoff.original_plan + '\n' : ''}执行端反馈：${handoff.reason || handoff.text}\n${handoff.impact ? '影响：' + handoff.impact + '\n' : ''}${handoff.question || '需要你决定是否修改方案；目前尚未解决。'}${handoff.options?.length ? '\n' + handoff.options.map((v, i) => `${i + 1}. ${v}`).join('\n') : ''}`
     : review
-      ? `审核意见：${handoff.reason || handoff.text}\n${handoff.evidence?.length ? '核查依据：' + handoff.evidence.join('；') + '\n' : ''}${handoff.suggested_changes ? '待修订/补证：' + handoff.suggested_changes + '\n' : ''}当前：受影响操作已暂停，尚未完成最终验收。下一步：在原事项补证或修订，重新审核后再执行。`
+      ? `审核意见：${handoff.reason || handoff.text}\n${handoff.evidence?.length ? '核查依据：' + handoff.evidence.join('；') + '\n' : ''}${handoff.suggested_changes ? '待修订/补证：' + handoff.suggested_changes + '\n' : ''}当前：受影响操作已暂停，尚未完成最终验收。下一步：在原会话补证或修订，由 Codex 结合上下文核查后处理。`
     : ['failed', 'timed_out', 'cancelled'].includes(event.status)
       ? `具体问题：${String(job.error || event.detail || '未提供原始错误，需要核对日志').slice(0, 3000)}\n${handoff?.completed ? '已完成：' + handoff.completed + '\n' : ''}当前：本轮已结束，最终验收未通过或未完成${background ? '；后台命令退出未确认' : ''}。\n下一步：保留已完成结果，核对原回执和失败日志后处理；只有需要改变目标或授权时才请你决定。`
     : restrictedWork

@@ -119,6 +119,7 @@ $text += ' acceptance_contract=' + $acceptanceContract
 $text += ' original_request=' + $prompt.Contains('USER_ORIGINAL_SENTINEL') + ' user_followup=' + $prompt.Contains('USER_FOLLOWUP_SENTINEL')
 $text += ' policy_contract=' + ($prompt.Contains('执行策略拒绝与方案不成立必须分开') -and $prompt.Contains('不自动重试、换壳、拆命令、改入口'))
 $text += ' execution_diag=' + $prompt.Contains('"intent":"diagnose"')
+$text += ' context_check=' + $prompt.Contains('本轮方案仍由你自行核查，不表示自动通过')
 if ($prompt.Contains('NEEDS_INPUT_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT] 请确认选择A还是B' }
 if ($prompt.Contains('STRUCTURED_QUESTION_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT]' + [Environment]::NewLine + '{"question":"选择工作树还是等待？","options":["工作树：隔离修改","等待：复用目录"],"recommendation":"等待","completed":"已定位文件范围"}' }
 if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { $text = '[CODEX_BACKGROUND_RUNNING] 测试命令 test-pending 退出结果未确认，请勿重跑。' }
@@ -200,7 +201,26 @@ exit 0
       const execution = await routed.run({ wait: true, topic_id: general.topic_id, prompt: 'REVIEW_VALID_FIXTURE 按已审核方案实施', review_only: false, user_followup: '现在按通过的方案实施。' });
       assert.equal(execution.status, 'completed'); assert.equal(execution.review_route.model, 'fixture-sol');
       assert.match(execution.final_response, /model=fixture-terra/);
-      assert.match(execution.plan_review.reason, /reviewer=fixture-sol/);
+      assert.equal(execution.plan_review.status, 'context'); assert.equal(execution.context_review.job_id, general.job_id);
+      assert.equal(execution.session_id, general.session_id); assert.match(execution.final_response, /context_check=True/);
+      const stages = result => fs.readFileSync(result.paths.events, 'utf8').trim().split('\n').map(JSON.parse).filter(e => e.type === 'bridge.attempt').map(e => e.stage);
+      assert.deepEqual(stages(execution), ['execute']);
+      const continued = await routed.run({ wait: true, topic_id: general.topic_id, prompt: '继续处理同一事项的后续方案，不额外审核' });
+      assert.equal(continued.session_id, general.session_id); assert.equal(continued.plan_review.status, 'context');
+      assert.deepEqual(stages(continued), ['execute']); assert.match(continued.final_response, /context_check=True/);
+      const legacyId = require('node:crypto').randomBytes(12).toString('hex');
+      const legacy = { job_id: legacyId, status: 'queued', stage: 'review', created_at: new Date().toISOString(),
+        cwd: settings.project, sandbox: 'danger-full-access', prompt: '旧连接派发的后续方案', timeout_seconds: 60, settings,
+        parent_job_id: continued.job_id, topic_id: general.topic_id, thread_id: general.session_id,
+        request_context: routed.get(continued.job_id).request_context };
+      legacy.plan_review = { status: 'pending', plan_sha256: require('../src/server.cjs').reviewVersion(legacy) };
+      const legacyFile = routed.jobPath(legacyId); fs.mkdirSync(path.dirname(legacyFile)); save(legacyFile, legacy);
+      await worker(legacyFile); const recovered = routed.receipt(legacyId);
+      assert.equal(recovered.status, 'completed'); assert.equal(recovered.plan_review.status, 'context');
+      assert.equal(recovered.session_id, general.session_id); assert.deepEqual(stages(recovered), ['execute']);
+      const explicit = await routed.run({ wait: true, topic_id: general.topic_id, prompt: 'REVIEW_VALID_FIXTURE 这次只审核新方案', review_only: true });
+      assert.equal(explicit.stage, 'review_complete'); assert.deepEqual(stages(explicit), ['review']);
+      assert.match(explicit.plan_review.reason, /reviewer=fixture-sol/);
     });
     await t.test('review gate: same native session, independent evidence, version binding and no execution before approval', async () => {
       const result = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 中文参数', topic: '审核通过自动执行' });
@@ -224,12 +244,13 @@ exit 0
       const missing = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 缺少用户原文', user_request: undefined });
       assert.equal(missing.status, 'review_needs_evidence'); assert.match(missing.handoff.reason, /用户原文/);
     });
-    await t.test('technical revision and evidence requests return to the same matter for fresh review; user decisions remain mandatory', async () => {
+    await t.test('technical revisions reuse session context without a mandatory review turn; user decisions remain mandatory', async () => {
       for (const [fixture, status] of [['REVIEW_REVISE_FIXTURE', 'review_revise'], ['REVIEW_EVIDENCE_FIXTURE', 'review_needs_evidence']]) {
         const held = await broker.run({ wait: true, prompt: fixture, topic: fixture });
         assert.equal(held.status, status); assert.equal(held.handoff.requires_user_decision, false);
-        await assert.rejects(broker.run({ prompt: '直接执行', topic_id: held.topic_id }), /CODEX_REVIEW_FOLLOWUP_REQUIRED/);
-        const revised = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 已按当前接口修订并补充日志', topic_id: held.topic_id, review_followup: { review_job_id: held.job_id, response: '回应全部待修订/补证项，保留原目标与约束。' } });
+        const revised = await broker.run({ wait: true, prompt: '已按当前接口修订并补充日志，请结合上下文核查后处理', topic_id: held.topic_id });
+        assert.equal(revised.plan_review.status, 'context'); assert.equal(revised.context_review.job_id, held.job_id);
+        assert.deepEqual(fs.readFileSync(revised.paths.events, 'utf8').trim().split('\n').map(JSON.parse).filter(e => e.type === 'bridge.attempt').map(e => e.stage), ['execute']);
         assert.equal(revised.status, 'completed'); assert.equal(revised.session_id, held.session_id);
         assert.notEqual(revised.plan_review.plan_sha256, held.plan_review.plan_sha256);
         assert.equal(broker.get(held.job_id).plan_review.status, held.plan_review.status);
@@ -244,9 +265,9 @@ exit 0
       const held = await broker.run({ wait: true, prompt: 'EXECUTION_REVIEW_INVALIDATED_FIXTURE', topic: '执行中假设失效' });
       assert.equal(held.status, 'review_revise'); assert.equal(held.plan_review.status, 'revise_required');
       assert.equal(held.handoff.completed, '已完成只读检查'); assert.equal(held.stage, 'review_held');
-      await assert.rejects(broker.run({ prompt: '继续原执行', topic_id: held.topic_id }), /CODEX_REVIEW_FOLLOWUP_REQUIRED/);
       const continued = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 按新证据修订，不重复已做检查', topic_id: held.topic_id, review_followup: { review_job_id: held.job_id, response: '按实际接口重新设计，保留已完成部分。' } });
       assert.equal(continued.status, 'completed'); assert.equal(continued.session_id, held.session_id);
+      assert.equal(continued.plan_review.status, 'context'); assert.equal(continued.context_review.prior_status, 'revise_required');
     });
     await t.test('background completion, UTF-8 and restart-safe reads', async () => {
       first = broker.start({ prompt: '中文参数', user_request: 'USER_ORIGINAL_SENTINEL 原文：不要偷偷换路线。', sandbox: 'read-only' });

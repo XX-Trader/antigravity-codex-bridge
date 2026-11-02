@@ -56,6 +56,8 @@ $userFollowups = (@($job.request_context.followups | ForEach-Object { $_.text })
 $executionContinuationContext = if ($job.execution_followup) { @{ followup = $job.execution_followup; constraints = @($job.execution_constraints) } | ConvertTo-Json -Depth 10 -Compress } else { '无执行策略续接声明。' }
 $reviewContext = $job.plan_review | ConvertTo-Json -Depth 12 -Compress
 $reviewReply = if ($job.review_followup) { $job.review_followup | ConvertTo-Json -Depth 6 -Compress } else { '无审核修订答复。' }
+$executionIntro = if ($job.context_review) { '当前续接同一事项的原生会话（stage=execute），复用已有审核讨论上下文，不另开独立审核轮次。本轮方案仍由你自行核查，不表示自动通过。历史审核记录：' + ($job.context_review | ConvertTo-Json -Depth 8 -Compress) + '。本轮修订说明：' + $reviewReply } else { '当前是已通过审核的执行阶段（stage=execute）。审核记录：' + $reviewContext }
+$executionScope = if ($job.context_review) { '结合本会话历史、用户原文、最新补充及实际代码/日志自行审核本轮建议；先处理历史未解决的修订与补证问题。能在用户既有授权内自行查明或修正的技术问题直接处理，再继续执行，不为每个后续方案额外安排审核轮次。不能把历史 approved、allowed_scope 或 context 状态当作新方案已经通过；先核实变化及当前授权。证据不足或方案仍不成立时返回具体问题、依据和修订建议；需要改变用户目标、明确限制、验收或授权时仍须用户决定。' } else { '只执行该版本和 allowed_scope 内、用户已经授权的工作；按审核依据完成必要验证，不重复要求用户批准已授权事项。' }
 $approvalBoundary = if ($job.review_only) { '本次仅审核，缺少用户原文或关键证据不能通过；无需实施授权，allowed_scope 只列只读审核范围。通过表示审核完成，不是实施批准，桥接不会进入实施。' } else { '缺少用户原文、关键证据或实施授权时不能通过；审核通过本身不创造业务授权。桥接会记录通过结果，在同一原生会话自动发起执行，无需用户重复批准。' }
 $reviewInstruction = if ($reviewing) {
 @"
@@ -70,9 +72,9 @@ $reviewInstruction = if ($reviewing) {
 "@
 } else {
 @"
-当前是已通过审核的执行阶段（stage=execute）。审核记录：$reviewContext
+$executionIntro
 正常执行结果末尾另起一行 [CODEX_EXECUTION_REPORT]，后接单个 JSON：outcome（accepted/progress/failed/no_progress）、reason（本轮具体完成或失败原因）、evidence_outputs（本轮成功命令输出中逐字摘取的有效证据字符串数组，每条至少16字符；也可用 evidence_commands 提供完整实际命令或 evidence_item_ids 提供已知真实ID）、remaining_checks（尚未完成的原始验收项字符串数组）。仅在全部原始要求取得真实验收证据且 remaining_checks 为空时用 accepted；部分有实质进展用 progress，测试/实现失败用 failed，仅计划、自述或未实施用 no_progress。不得编造 ID、把审核工具当作执行证据，或用局部检查冒充整体验收。缺少有效报告视为无可核验进展；审核通过、正常退出和换方案均不清除累计失败。不能凭成功命令证明所有业务要求；reason 必须说明对应验收结果。
-只执行该版本和 allowed_scope 内、用户已经授权的工作；按审核依据完成必要验证，不重复要求用户批准已授权事项。审核通过不等于业务验收通过。若新的代码、日志或运行结果推翻关键假设，暂停受影响操作，首行 [CODEX_REVIEW_REVISE] 并说明 reason、evidence、suggested_changes、decision_scope（technical 或 user）；保留已完成部分，交回修订后重新审核。涉及用户目标、明确约束、验收或权限变化仍须用户决定，不自行扩大授权。执行策略受阻使用 [CODEX_EXECUTION_BLOCKED]，不能用技术重审清除策略拒绝。
+$executionScope 审核判断不等于业务验收通过。若新的代码、日志或运行结果推翻关键假设，暂停受影响操作，首行 [CODEX_REVIEW_REVISE] 并说明 reason、evidence、suggested_changes、decision_scope（technical 或 user）；保留已完成部分，修订后续接原会话自行核查。涉及用户目标、明确约束、验收或权限变化仍须用户决定，不自行扩大授权。执行策略受阻使用 [CODEX_EXECUTION_BLOCKED]，不能用技术重审清除策略拒绝。
 "@
 }
 $instruction = @"

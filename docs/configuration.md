@@ -115,17 +115,19 @@ worker 先保存终态再释放事项登记；状态更新与崩溃恢复共用�
 
 MCP 和 Sidecar 分别加载。配置写入后检查真实进程路径及 `notification.service`，不要把配置文件更新当成旧 MCP 已热加载。恢复时保留原任务与产物，没有 Sidecar 仍可手动领取结果，但不能承诺自动提醒。
 
-## 先审核再执行
+## 首轮审核与会话续接
+
+新事项首轮独立审核；同一事项且同一原生会话已有真实审核记录时，后续方案直接续接，由 Codex 自行核查，不额外启动独立审核轮次。`context_review` 引用历史任务、原生会话和审核依据，`plan_review.status=context` 与 approved 分开，不把历史通过当成新版本已经通过。换事项、换会话或缺少真实审核上下文仍走首轮审核；调用方不能自行注入上下文批准。普通续接可直接传修订后的 prompt，review_followup 可选；用户决定、执行策略、失败接管和四小时反馈门禁保持。
 
 审核模型与执行模型独立。`CODEX_EXECUTOR_REVIEW_MODEL` 设置日常审核模型，`CODEX_EXECUTOR_QUANT_REVIEW_MODEL` 设置量化审核模型，均接受本机别名；未设置时继承执行模型，不在代码中固定个人模型 ID。项目条目可设 `review_category: "quant"`，普通项目默认为 `general`。调用时可显式传 `review_category`；未指定时结合项目、原事项和量化/回测/因子等任务内容判断。量化事项续接保留类别；只有显式指定类别才覆盖。容量不足仍等待原审核模型，不自动切回其他模型。`model` 保留执行模型，实际审核选择见 `review_route`，两阶段的尝试记录保存各自实际模型。
 
-用户单独交方案要求审核时，调用 `codex_run` 并设 `review_only=true`。审核通过后返回 `stage=review_complete`、`execution_state=review_only`，不会启动执行阶段，也不再发送未完成业务的四小时提醒。审核修订仍沿原事项续接并保留只审核模式。用户明确要求实施后，以逐字 `user_followup` 加 `review_only=false` 续接，重新审核新版本；只在规划摘要中写“现在执行”不能解除该边界。审核模型、类别和只审核模式也绑定到方案版本中。
+用户单独交方案要求审核时，调用 `codex_run` 并设 `review_only=true`。审核通过后返回 `stage=review_complete`、`execution_state=review_only`，不会启动执行阶段，也不再发送未完成业务的四小时提醒。审核修订仍沿原事项续接并保留只审核模式。用户明确要求实施后，以逐字 `user_followup` 加 `review_only=false` 续接，在原会话结合上下文核查后实施；只在规划摘要中写“现在执行”不能解除该边界。审核模型、类别和只审核模式也绑定到方案版本中。
 
-新 worker 也兼容旧连接的派发：缺少审核路由时，按 `CODEX_EXECUTOR_REVIEW_CONFIG`（旧注册使用默认 MCP 配置路径）回读同一安装、同一注册项目的当前审核策略，只更新审核模型与类别，不导入执行模型、CLI 或权限。已有执行阶段不热切换。旧连接仍需刷新工具定义，才能传入新增的只审核字段。
+新 worker 也兼容旧连接的派发：缺少审核路由时，按 `CODEX_EXECUTOR_REVIEW_CONFIG`（旧注册使用默认 MCP 配置路径）回读同一安装、同一注册项目的当前审核策略，只更新审核模型与类别，不导入执行模型、CLI 或权限。待启动的旧连接任务若保留同事项、同会话的真实审核上下文，新 worker 会转为上下文续接；正在执行的阶段不热切换。旧 MCP 进程仍可能在派发前要求 review_followup，需刷新 MCP 连接并重新加载规则，才能完整使用可选修订字段和新的编排说明。
 
 自动修订有上限：同一未完成事项累计失败 3 轮，或连续 2 个执行轮次无可核验进展，worker 保存 `needs_input` / `handoff.blocker_type=human_takeover`，不再调用模型实施。历史 job 是计数依据，重启、换方案、审核通过及 CLI 退出 0 不清零。按整个原始事项保守累计，不能把失败的验收项换个名字清零；只完成部分要求时继续保留累计失败。旧客户端派发也经过新 worker 的入口检查。
 
-执行结果末尾的 `[CODEX_EXECUTION_REPORT]` 报告 `outcome`、原因、剩余验收与本轮证据。桥接把 `evidence_outputs` 的逐字输出摘录、`evidence_commands` 的完整命令或 `evidence_item_ids` 与本轮成功工具事件核对；缺失或不匹配视为无可核验进展。只有 `accepted`、无剩余验收、实际证据匹配且 CLI 正常完成才标记 `accepted_with_evidence` 并重置；这仍是执行者的验收判断，不是对业务正确性的独立证明。容量等待、取消和策略拒绝不作为普通修订失败；用户实际回答接管问题后，以原 `plan_decision` 和逐字 `user_followup` 重置循环并重新审核，不清除执行策略拒绝。
+执行结果末尾的 `[CODEX_EXECUTION_REPORT]` 报告 `outcome`、原因、剩余验收与本轮证据。桥接把 `evidence_outputs` 的逐字输出摘录、`evidence_commands` 的完整命令或 `evidence_item_ids` 与本轮成功工具事件核对；缺失或不匹配视为无可核验进展。只有 `accepted`、无剩余验收、实际证据匹配且 CLI 正常完成才标记 `accepted_with_evidence` 并重置；这仍是执行者的验收判断，不是对业务正确性的独立证明。容量等待、取消和策略拒绝不作为普通修订失败；用户实际回答接管问题后，以原 `plan_decision` 和逐字 `user_followup` 重置循环并续接核查，不清除执行策略拒绝。
 
 接管回执要求先解释失败根因、证据与未知项，给出最合适的解决建议，再请用户决定。历史审核终态若被旧客户端覆盖为固定的通用 worker 错误，仅在保存的审核结果与原终态通知身份一致时恢复，不重发已受理通知。
 
@@ -139,9 +141,9 @@ MCP 和 Sidecar 分别加载。配置写入后检查真实进程路径及 `notif
 
 审核最终返回 `[CODEX_REVIEW_APPROVED]`、`[CODEX_REVIEW_REVISE]` 或 `[CODEX_REVIEW_NEEDS_EVIDENCE]` 及 JSON。所有审核回执须原样带回 `plan_sha256`；通过结果还须有非空 `evidence`、`allowed_scope` 和成功工具核查记录。输入版本绑定本任务、cwd、环境、方案、用户原文与后续补充、审核答复及执行策略约束，调用方不能通过参数自行批准。审核阶段出现文件变更事件时暂停；回执缺失、无效、版本不符或后台核查命令退出未确认时不启动执行。
 
-通过后桥接在同一 job、同一原生会话自动续接 `stage=execute`，将审核范围交给执行者；不要求用户再次批准已授权工作。审核输出为 `review-attempt-N.result.txt`，执行输出为 `attempt-N.result.txt`；审核尝试保存在 `plan_review.attempts`，执行尝试仍在 `attempts`，usage 包含两阶段。最终回执、列表和终态通知保留审核结果。每次修改方案或补充要求后重新审核，不复用另一任务或旧版本的批准。
+通过后桥接在同一 job、同一原生会话自动续接 `stage=execute`，将审核范围交给执行者；不要求用户再次批准已授权工作。审核输出为 `review-attempt-N.result.txt`，执行输出为 `attempt-N.result.txt`；审核尝试保存在 `plan_review.attempts`，执行尝试仍在 `attempts`，usage 包含两阶段。最终回执、列表和终态通知保留审核结果。同事项后续方案按上文复用原会话上下文自行核查，不重复独立审核；历史批准仍不能冒充新版本通过。
 
-技术问题用 `decision_scope=technical`，任务结束为 `review_revise` 或 `review_needs_evidence`。规划端领取回执并回应后，按原 topic/session 续接：
+技术问题用 `decision_scope=technical`，任务结束为 `review_revise` 或 `review_needs_evidence`。规划端领取回执后，按原 topic/session 发回修订方案。下例的 review_followup 在普通上下文续接时可省略，仅审核模式或缺少可复用上下文时须提供：
 
 ```json
 {

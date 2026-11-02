@@ -104,13 +104,14 @@ test('saved review terminal is repaired only with exact durable evidence, with n
   save(f.file, { ...job, topic_id: 'ffffffffffffffffffffffff', status: 'failed', error: 'Worker exited before recording completion' });
   assert.equal(f.broker.get(id).status, 'failed');
 });
-test('review feedback reports the actual issue and routes technical revisions to fresh review, not user approval', t => {
+test('review feedback reports the issue and resumes contextual checks while preserving explicit review-only', t => {
   const f = fixture(t, 'review_revise');
   const handoff = { kind: 'review_revise', reason: '方案调用不存在的接口', evidence: ['已核对当前接口列表'], suggested_changes: '按当前接口重新设计', requires_user_decision: false };
   const job = { ...f.job, handoff, stage: 'review_held', plan_review: { status: 'revise_required' } };
   const message = eventMessage(job, { schema: 2, kind: 'terminal', status: 'review_revise', handoff, created_at: new Date().toISOString() });
   assert.match(message, /方案调用不存在的接口/); assert.match(message, /已核对当前接口列表/);
-  assert.match(message, /review_followup.review_job_id/); assert.match(message, /重新审核/);
+  assert.match(message, /可带 review_followup.review_job_id/); assert.match(message, /结合上下文自行核查/);
+  assert.match(message, /仅审核模式或没有真实审核上下文时仍独立审核/);
   assert.doesNotMatch(message, /【方案被执行端拒绝，必须反馈用户】/);
 });
 function fixture(t, status = 'running', schema = 2) {
