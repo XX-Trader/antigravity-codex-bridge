@@ -48,6 +48,33 @@ test('four-hour fallback still asks why after a failed or timed-out worker, with
   }
 });
 
+test('new feedback policy does not wake historical terminal chats or replay their pending legacy alerts', async t => {
+  const now = Date.now();
+  for (const status of ['failed', 'timed_out', 'completed']) {
+    const f = fixture(t, status), { loop_guard, ...legacy } = f.job;
+    legacy.created_at = new Date(now - 3 * 86400000).toISOString();
+    if (status === 'completed') legacy.execution_state = 'background_unconfirmed';
+    save(f.file, legacy);
+    assert.deepEqual(auditSilence(f.broker, [legacy], now), []);
+    f.emit('old-policy-alert', 'silence_alert');
+    assert.equal(await deliver(f.broker, id, async () => { throw Error('must not wake a historical chat'); }), false);
+    assert.equal(notificationSummary(f.file).latest.state, 'superseded');
+  }
+});
+
+test('active legacy supervision survives activation, restart, failure and normal CLI completion without acceptance', async t => {
+  const now = Date.now(), hour = 3600000;
+  for (const status of ['failed', 'completed']) {
+    const f = fixture(t), { loop_guard, ...legacy } = f.job;
+    legacy.created_at = new Date(now - 3 * 86400000).toISOString(); save(f.file, legacy);
+    assert.deepEqual(auditSilence(f.broker, [legacy], now), []);
+    const ended = { ...legacy, status }; save(f.file, ended);
+    assert.deepEqual(auditSilence(new Broker({ data: f.root }), [ended], now + 3 * hour), []);
+    assert.deepEqual(auditSilence(new Broker({ data: f.root }), [ended], now + 4 * hour), [id]);
+    assert.equal(await deliver(f.broker, id, async () => ({})), true, 'A tracked task still needs a cause question until actual acceptance');
+  }
+});
+
 test('sidecar reconciliation actually emits a due silence question without touching the active worker', async t => {
   const f = fixture(t), now = Date.now(), job = { ...f.job, created_at: new Date(now - 4 * 3600000).toISOString() }; save(f.file, job);
   let sent = 0;
@@ -84,7 +111,7 @@ function fixture(t, status = 'running', schema = 2) {
   const root = fs.mkdtempSync(path.join(base, 'notices-'));
   t.after(() => { const real = fs.realpathSync(root); assert.ok(real.startsWith(base + path.sep)); fs.rmSync(real, { recursive: true, force: true }); });
   const broker = new Broker({ data: root }), file = broker.jobPath(id); fs.mkdirSync(path.dirname(file));
-  const job = { job_id: id, status, notification_schema: schema, conversation_id: chat, topic_id: id, topic: 'fixture task', thread_id: '22222222-2222-2222-2222-222222222222', created_at: new Date().toISOString(), worker_pid: process.pid };
+  const job = { job_id: id, status, notification_schema: schema, conversation_id: chat, topic_id: id, topic: 'fixture task', thread_id: '22222222-2222-2222-2222-222222222222', created_at: new Date().toISOString(), worker_pid: process.pid, loop_guard: { failures: 0, consecutive_no_progress: 0 } };
   save(file, job); return { root, broker, job, file, emit: (key, kind, detail) => publishNotification(file, read(file), key, kind, detail) };
 }
 function changed(dir, trigger, predicate) {

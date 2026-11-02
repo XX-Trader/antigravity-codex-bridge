@@ -139,6 +139,11 @@ async function deliverEvent(job, event, deliveryFile, send, options) {
   try {
     const previous = fs.existsSync(deliveryFile) ? read(deliveryFile) : null;
     if (['sent', 'accepted', 'superseded', 'suppressed'].includes(previous?.state)) return false;
+    if (event.kind === 'silence_alert' && !job.loop_guard && terminal.has(job.status) && (!previous || previous.state === 'not_sent')) {
+      const ledgerFile = path.resolve(path.dirname(deliveryFile), '../../..', 'feedback-watch.json');
+      const tracked = fs.existsSync(ledgerFile) && read(ledgerFile).topics?.[job.conversation_id + ':' + job.topic_id]?.armed_at;
+      if (!tracked) { save(deliveryFile, { ...previous, event_id: event.event_id, state: 'superseded', reason: 'Legacy terminal predates feedback supervision; no retrospective wakeup.' }); return false; }
+    }
     if (['sending', 'uncertain'].includes(previous?.state)) {
       if (await options.reconcile?.(event)) { save(deliveryFile, { ...previous, state: 'accepted', reconciled_at: new Date().toISOString() }); return false; }
       save(deliveryFile, { ...previous, state: 'uncertain', action_required: 'No positive host receipt. Inspect recipient history before explicitly replaying; automatic replay is disabled.' }); return false;
@@ -294,6 +299,7 @@ function auditSilence(broker, jobs, now = Date.now()) {
     for (const [key, rows] of groups) {
       rows.sort((a, b) => a.created_at.localeCompare(b.created_at) || a.job_id.localeCompare(b.job_id));
       const latest = rows.at(-1);
+      let previous = ledger.topics[key];
       const settled = latest.handoff?.requires_user_decision || ['needs_input', 'blocked', 'execution_blocked', 'cancelled'].includes(latest.status) ||
         (latest.verification_state === 'accepted_with_evidence' && latest.execution_report?.outcome === 'accepted');
       if (settled) {
@@ -307,13 +313,22 @@ function auditSilence(broker, jobs, now = Date.now()) {
         }
         continue;
       }
+      // Enabling a new policy must not wake old chats whose terminal feedback may
+      // already have been handled. Continue watching legacy work only if we saw
+      // it active; new workers persist loop_guard before invoking the CLI.
+      if (!latest.loop_guard && terminal.has(latest.status) && !previous?.armed_at) continue;
       const unfinished = !terminal.has(latest.status) || ['failed', 'timed_out'].includes(latest.status) || ['review_revise', 'review_needs_evidence'].includes(latest.handoff?.kind) ||
-        latest.execution_state === 'background_unconfirmed' || ['progress', 'no_progress', 'failed'].includes(latest.execution_report?.outcome);
+        latest.execution_state === 'background_unconfirmed' || ['progress', 'no_progress', 'failed'].includes(latest.execution_report?.outcome) ||
+        (latest.status === 'completed' && previous?.armed_at);
       if (!unfinished) continue; // Legacy completed rounds have unknown business state.
+      if (!previous?.armed_at) {
+        previous = { ...previous, armed_at: now, ...(!latest.loop_guard ? { legacy_start_at: now } : {}) };
+        ledger.topics[key] = previous; changed = true;
+      }
       let anchor = Date.parse(rows[0].created_at);
       for (const job of rows) if ((job.verification_state === 'accepted_with_evidence' && job.execution_report?.outcome === 'accepted') ||
           job.request_context?.followups?.some(f => f.job_id === job.job_id && f.text?.trim())) anchor = Date.parse(job.created_at);
-      const previous = ledger.topics[key];
+      if (previous.legacy_start_at) anchor = Math.max(anchor, previous.legacy_start_at);
       if (previous?.anchor === anchor && previous.event_file) {
         const dfile = previous.event_file.replace(/\.json$/, '.delivery.json');
         const delivery = fs.existsSync(dfile) ? read(dfile) : null;
@@ -325,7 +340,7 @@ function auditSilence(broker, jobs, now = Date.now()) {
       const bucket = Math.floor((now - anchor) / period);
       const event = publishNotification(broker.jobPath(latest.job_id), latest, `silence-${anchor}-${bucket}`, 'silence_alert',
         `距原事项/真实用户补充已超过四小时，内部续跑与通知接口 accepted 均不证明用户已得到答复。当前 job=${latest.job_id}，状态=${latest.status}；请读取一次该原回执，解释为什么这么久没有回复、当前卡点及最合适的解决方式。不得另开任务或中止现有进程。`);
-      if (event) { ledger.topics[key] = { anchor, created_at: now, job_id: latest.job_id, event_file: event.file }; changed = true; due.push(latest.job_id); }
+      if (event) { ledger.topics[key] = { armed_at: previous.armed_at, ...(previous.legacy_start_at ? { legacy_start_at: previous.legacy_start_at } : {}), anchor, created_at: now, job_id: latest.job_id, event_file: event.file }; changed = true; due.push(latest.job_id); }
     }
     if (changed) save(file, ledger);
     return due;

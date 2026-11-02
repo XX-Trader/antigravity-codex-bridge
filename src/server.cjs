@@ -745,6 +745,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       job.request_context?.followups?.some(f => f.job_id === job.job_id && f.text?.trim());
     if (humanReset) update({ loop_reset: { human_reply_job_id: job.job_id, refusal_job_id: resetRef } });
     const priorGuard = loopState(humanReset ? [...history, job] : history);
+    update({ loop_guard: priorGuard });
     if (priorGuard.trigger) {
       const handoff = takeover(priorGuard);
       fs.writeFileSync(path.join(dir, 'result.txt'), '[CODEX_NEEDS_INPUT]\n' + JSON.stringify(handoff), 'utf8');
