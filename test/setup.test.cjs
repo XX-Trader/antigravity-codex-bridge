@@ -128,6 +128,12 @@ test('model IDs and optional account-local aliases are not hard coded', () => {
     assert.equal(config({ ...env, CODEX_EXECUTOR_MODEL: 'quick', CODEX_EXECUTOR_MODEL_ALIASES: '{"quick":"account-model"}' }).model, 'account-model');
     assert.throws(() => config({ ...env, CODEX_EXECUTOR_MODEL_ALIASES: '[]' }), /aliases/);
     assert.throws(() => config({ ...env, CODEX_EXECUTOR_SERVICE_TIER: 'unknown' }), /tier/);
+    const policy = { ...env, CODEX_EXECUTOR_EXECUTION_MODELS: JSON.stringify({ simple: 'small', standard: 'normal', complex: 'deep' }), CODEX_EXECUTOR_REVIEW_MODEL: 'review-general', CODEX_EXECUTOR_QUANT_REVIEW_MODEL: 'review-quant' };
+    assert.equal(config(policy).model, 'normal');
+    assert.throws(() => config({ ...policy, CODEX_EXECUTOR_MODEL: 'other' }), /default model/);
+    assert.throws(() => config({ ...policy, CODEX_EXECUTOR_EXECUTION_MODELS: '{"simple":"small"}' }), /exactly simple/);
+    assert.throws(() => config({ ...policy, CODEX_EXECUTOR_MODELS_CACHE: 'relative.json' }), /absolute/);
+    assert.throws(() => config({ ...policy, CODEX_EXECUTOR_QUANT_REVIEW_MODEL: '' }), /both general and quant/);
   } finally { f.done(); }
 });
 

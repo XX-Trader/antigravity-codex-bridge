@@ -46,10 +46,38 @@ test('review model routing is separate from execution and preserves quant contex
   assert.notEqual(reviewVersion(saved), reviewVersion({ ...saved, review_route: { ...saved.review_route, model: 'another' } }));
 });
 
+test('execution tiers enforce role membership, availability, stable continuation and schema before creating jobs', t => {
+  const f = fixture(t), cache = path.join(f.root, 'models.json');
+  save(cache, { models: ['exec-small', 'exec-normal', 'exec-deep', 'review-general', 'review-quant'].map(slug => ({ slug })) });
+  Object.assign(f.settings, { model: 'exec-normal', model_aliases: { quick: 'exec-small', regular: 'exec-normal', deep: 'exec-deep', reviewer: 'review-quant' },
+    execution_models: { simple: 'exec-small', standard: 'exec-normal', complex: 'exec-deep' }, models_cache_file: cache,
+    review_models: { general: 'review-general', quant: 'review-quant' } });
+  const schema = dispatch(f.broker, { method: 'tools/list' }).tools;
+  for (const name of ['codex_run', 'codex_start', 'codex_continue']) assert.deepEqual(schema.find(s => s.name === name).inputSchema.properties.execution_tier.enum, ['simple', 'standard', 'complex']);
+  const allowed = schema.find(s => s.name === 'codex_run').inputSchema.properties.model.enum;
+  assert.ok(allowed.includes('quick')); assert.ok(!allowed.includes('reviewer')); assert.ok(!allowed.includes('gpt-5.4'));
+  for (const input of [{ model: 'gpt-5.4' }, { model: 'reviewer' }, { execution_tier: 'guess' }, { execution_tier: 'simple', model: 'regular' }]) {
+    assert.throws(() => f.broker.start({ prompt: '新事项', ...input }), /MODEL_CONFIGURATION/);
+  }
+  assert.equal(f.broker.list().length, 0, 'Invalid selection creates no job or worker');
+  const first = f.broker.start({ prompt: '复杂定位', user_request: '只按原边界定位', execution_tier: 'complex' });
+  assert.equal(first.model, 'exec-deep'); assert.equal(first.review_route.model, 'review-general'); assert.equal(first.execution_route.tier, 'complex');
+  save(f.broker.jobPath(first.job_id), { ...f.broker.get(first.job_id), status: 'completed', thread_id: '12345678-1234-1234-1234-123456789abc' }); f.broker.unlock(first.job_id);
+  assert.throws(() => f.broker.start({ prompt: '自动降档', topic_id: first.topic_id, execution_tier: 'simple' }), /actual human instruction/);
+  const next = f.broker.start({ prompt: '继续', topic_id: first.topic_id }); assert.equal(next.model, 'exec-deep');
+  save(f.broker.jobPath(next.job_id), { ...f.broker.get(next.job_id), status: 'completed' }); f.broker.unlock(next.job_id);
+  const changed = f.broker.start({ prompt: '按用户要求切换', topic_id: first.topic_id, execution_tier: 'simple', user_followup: '这轮明确改用小模型处理。' }); assert.equal(changed.model, 'exec-small');
+  save(cache, { models: [{ slug: 'exec-normal' }] });
+  assert.throws(() => f.broker.start({ prompt: '审核模型不可用' }), /account model cache/);
+  assert.throws(() => f.broker.start({ prompt: '执行模型不可用', execution_tier: 'complex' }), /account model cache/);
+  fs.unlinkSync(cache); assert.throws(() => f.broker.start({ prompt: '缓存不可读' }), /Cannot read/);
+});
+
 test('review configuration binds project categories; legacy workers read only matching installation policy', t => {
   const f = fixture(t), other = path.join(f.root, 'other-project'), otherData = path.join(f.root, 'other-data'); fs.mkdirSync(other); fs.mkdirSync(otherData);
   const env = { CODEX_EXECUTOR_PROJECT: f.project, CODEX_EXECUTOR_DATA: f.data, CODEX_EXECUTOR_ENTRY: process.execPath,
     CODEX_EXECUTOR_MODEL: 'executor', CODEX_EXECUTOR_MODEL_ALIASES: JSON.stringify({ sol: 'review-sol', astra: 'review-astra' }), CODEX_EXECUTOR_REVIEW_MODEL: 'sol', CODEX_EXECUTOR_QUANT_REVIEW_MODEL: 'astra',
+    CODEX_EXECUTOR_EXECUTION_MODELS: JSON.stringify({ simple: 'smaller', standard: 'executor', complex: 'deeper' }),
     CODEX_EXECUTOR_PROJECTS: JSON.stringify([{ project: f.project, data: f.data }, { project: other, data: otherData, review_category: 'quant' }]) };
   const configured = config(env);
   assert.equal(configured.projects[0].review_category, 'general'); assert.equal(configured.projects[1].review_category, 'quant');
@@ -61,6 +89,7 @@ test('review configuration binds project categories; legacy workers read only ma
   const live = liveReviewSettings(legacy);
   assert.equal(live.model, 'keep-executor'); assert.equal(live.entry, legacy.entry);
   assert.deepEqual(live.review_models, { general: 'review-sol', quant: 'review-astra' });
+  assert.deepEqual(live.execution_models, { simple: 'smaller', standard: 'executor', complex: 'deeper' });
   doc.mcpServers['codex-executor'].args = ['another-server.cjs']; save(file, doc);
   assert.equal(liveReviewSettings(legacy), legacy, 'Unrelated servers cannot supply policy');
 });

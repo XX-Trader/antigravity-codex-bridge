@@ -78,6 +78,7 @@ function eventMessage(job, event) {
   const view = link ? `[查看任务](${link.vscode_uri})` : '';
   const draft = (label, content) => `<用户通知草稿>\n${notificationHeading(job, event, label)}\n${content}\n${view}\n</用户通知草稿>`;
   const internal = text => `<内部控制信息，禁止展示>\n${metadata}\n${text}\n</内部控制信息>`;
+  if (event.kind === 'terminal' && job.configuration_error?.kind === 'model_configuration') return `${internal('领取一次 codex_result，说明选定模型不符合角色配置或账户不可用，本轮业务未启动；不计业务失败，不自动换模型或重派。修正派发档位/本机配置后，保留原用户决定和权限门禁再续接。')}\n${draft('模型配置错误', job.configuration_error.reason)}\n${compact}`;
   if (event.kind === 'terminal' && job.review_only && job.stage === 'review_complete') return `${internal('仅调用一次 codex_result 领取审核意见，报告结论、证据、风险和建议；本次只审核，不能派发实施。实施必须等待用户实际指令。')}\n${draft('方案审核完成', '只读审核已通过，本次未进入实施。请查看审核依据、风险与建议。')}\n${compact}`;
   if (event.kind === 'notification_check') return internal('本地通知检查，不回复、不展示编号、不调用工具、不派发或续跑业务。');
   if (event.kind === 'session_ready') return `${internal('首次任务会话建立，不调用任何工具；不调用 codex_run、不轮询。')}\n${draft('已启动', '已开始处理这项工作，详细过程可打开原任务查看。')}\n${compact}`;

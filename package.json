@@ -1,6 +1,6 @@
 {
   "name": "antigravity-codex-bridge",
-  "version": "1.5.2",
+  "version": "1.6.0",
   "description": "Let Codex independently review Antigravity plans before executing local tasks through MCP.",
   "license": "MIT",
   "type": "commonjs",

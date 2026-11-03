@@ -5,6 +5,7 @@
 ## 代码与入口
 
 - `src/server.cjs`：协议、任务 worker、持久化、权限、原生会话与标题。
+- `src/model-policy.cjs`：执行档位、角色边界和本机账户模型快照校验。
 - `src/router.cjs`：多项目选择、会话归属和 PreToolUse 身份绑定。
 - `src/notifier.cjs`：文件事件监听、一次性原生回执投递。
 - `src/invoke-codex.ps1`：真实 Codex 启动；不改全局 Codex 配置。

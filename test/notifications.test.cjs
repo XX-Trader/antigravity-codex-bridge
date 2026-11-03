@@ -16,6 +16,13 @@ test('approved review-only jobs finish with review feedback and do not wake impl
   assert.deepEqual(auditSilence(f.broker, [job], Date.now() + 8 * 3600000), []);
 });
 
+test('model configuration feedback does not invent business failure, user approval or automatic substitution', t => {
+  const f = fixture(t, 'blocked'), job = { ...f.job, configuration_error: { kind: 'model_configuration', reason: '指定模型不在执行档位中' } };
+  const message = eventMessage(job, { kind: 'terminal', status: 'blocked', created_at: job.created_at });
+  assert.match(message, /模型配置错误/); assert.match(message, /不计业务失败/); assert.match(message, /不自动换模型或重派/);
+  assert.match(message, /原用户决定和权限门禁/);
+});
+
 test('four-hour fallback asks why, survives continuation/restart, and never treats transport as a user reply', async t => {
   const f = fixture(t), at = Date.now(), hour = 3600000;
   const original = { ...f.job, created_at: new Date(at - 4 * hour).toISOString() }; save(f.file, original);

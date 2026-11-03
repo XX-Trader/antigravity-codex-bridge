@@ -33,6 +33,7 @@ function loopState(jobs) {
     if (job.loop_reset?.human_reply_job_id === job.job_id && job.plan_decision && job.request_context?.followups?.some(f => f.job_id === job.job_id && f.text?.trim())) {
       failures = 0; noProgress = 0; since = null; last = null;
     }
+    if (job.configuration_error?.kind === 'model_configuration') continue;
     if (job.handoff?.blocker_type === 'human_takeover' && !job.repair_round_failed && !job.execution_report) continue;
     if (job.execution_report?.outcome === 'accepted' && job.execution_report.evidence_item_ids?.length && job.status === 'completed' && job.verification_state === 'accepted_with_evidence') {
       failures = 0; noProgress = 0; since = null; last = null; continue;

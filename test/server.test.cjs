@@ -66,6 +66,11 @@ if ($argv -contains 'app-server') {
 $prompt = $input -join "\n"
 $argv = @($args)
 $implementationContract = $prompt.Contains('规划建议不构成用户硬性约束') -and $prompt.Contains('审核阶段仍只读') -and $prompt.Contains('用户边界内的技术错误由 Codex 自行纠正、实现并验证') -and $prompt.Contains('只审核、不改文件等限制及执行策略拒绝不因技术自主权解除') -and (-not $prompt.Contains('技术方案问题按审核交接修订')) -and (-not $prompt.Contains('建议与原文矛盾时按审核协议退回 technical'))
+if ($prompt.Contains('MODEL_NOT_FOUND_FIXTURE') -or ($prompt.Contains('MODEL_NOT_FOUND_EXEC_FIXTURE') -and -not $prompt.Contains('当前是独立审核阶段（stage=review）'))) {
+  $serviceError = @{ error = @{ code = 'model_not_found'; message = 'The selected model is not supported when using Codex with this account.' } } | ConvertTo-Json -Compress
+  @{ type = 'turn.failed'; error = @{ message = $serviceError } } | ConvertTo-Json -Depth 6 -Compress
+  exit 1
+}
 if ($prompt.Contains('当前是独立审核阶段（stage=review）')) {
   $oi = [Array]::IndexOf($argv, '-o')
   $version = [regex]::Match($prompt, '本轮方案版本：([a-f0-9]{64})').Groups[1].Value
@@ -227,6 +232,27 @@ exit 0
       const explicit = await routed.run({ wait: true, topic_id: general.topic_id, prompt: 'REVIEW_VALID_FIXTURE 这次只审核新方案', review_only: true });
       assert.equal(explicit.stage, 'review_complete'); assert.deepEqual(stages(explicit), ['review']);
       assert.match(explicit.plan_review.reason, /reviewer=fixture-sol/);
+    });
+    await t.test('controlled tiers reach the real wrapper and model errors never become business failures', async () => {
+      const strict = { ...settings, execution_models: { simple: 'fixture-luna', standard: 'fixture-terra', complex: 'fixture-sol' }, review_models: { general: 'fixture-sol', quant: 'fixture-astra' } };
+      const controlled = new Broker(strict);
+      for (const [tier, model] of Object.entries(strict.execution_models)) {
+        const result = await controlled.run({ wait: true, execution_tier: tier, prompt: 'REVIEW_VALID_FIXTURE 根据任务档位执行' });
+        assert.equal(result.status, 'completed'); assert.equal(result.execution_route.tier, tier);
+        assert.match(result.final_response, new RegExp('model=' + model)); assert.match(result.plan_review.reason, /reviewer=fixture-sol/);
+      }
+      for (const prompt of ['MODEL_NOT_FOUND_FIXTURE', 'MODEL_NOT_FOUND_EXEC_FIXTURE']) {
+        const held = await controlled.run({ wait: true, prompt });
+        assert.equal(held.status, 'blocked'); assert.equal(held.configuration_error.kind, 'model_configuration');
+        assert.equal(held.execution_report, null); assert.equal(controlled.get(held.job_id).repair_round_failed, undefined);
+        assert.equal(require('../src/loop-guard.cjs').loopState([controlled.get(held.job_id)]).failures, 0);
+      }
+      const id = require('node:crypto').randomBytes(12).toString('hex');
+      const legacy = { job_id: id, status: 'queued', stage: 'execute', created_at: new Date().toISOString(), cwd: settings.project,
+        topic_id: id, settings: { ...strict, model: 'not-in-role-policy', pwsh: path.join(root, 'never-launch.exe') }, prompt: '旧连接错误型号', timeout_seconds: 30 };
+      const file = controlled.jobPath(id); fs.mkdirSync(path.dirname(file)); save(file, legacy); await worker(file);
+      const blocked = controlled.receipt(id); assert.equal(blocked.status, 'blocked'); assert.equal(blocked.configuration_error.kind, 'model_configuration');
+      assert.equal(controlled.get(id).child_pid, undefined); assert.equal(fs.readFileSync(blocked.paths.events, 'utf8'), '');
     });
     await t.test('review gate: same native session, independent evidence, version binding and no execution before approval', async () => {
       const result = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 中文参数', topic: '审核通过自动执行' });

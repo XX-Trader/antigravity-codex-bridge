@@ -23,6 +23,12 @@ test('two execution rounds without evidence stop; review approval neither resets
   assert.equal(loopState([a, row(2, { execution_report: { outcome: 'progress' } }), b]).trigger, null);
 });
 
+test('model configuration errors neither add business failures nor erase earlier progress and failures', () => {
+  const prior = [rejected(1), row(2, { execution_report: { outcome: 'no_progress' } })];
+  const bad = row(3, { status: 'failed', configuration_error: { kind: 'model_configuration' }, repair_round_failed: true, execution_report: { outcome: 'no_progress' } });
+  assert.deepEqual(loopState([...prior, bad]), loopState(prior));
+});
+
 test('reports require exact successful execution evidence and all acceptance items', () => {
   const items = new Map([['actual1', 'pwsh verify.ps1']]);
   const report = fields => executionReport('结果\n[CODEX_EXECUTION_REPORT]\n' + JSON.stringify({ outcome: 'accepted', reason: '已回读全部目标', evidence_commands: ['pwsh verify.ps1'], remaining_checks: [], ...fields }), items);
