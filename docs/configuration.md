@@ -117,7 +117,7 @@ MCP 和 Sidecar 分别加载。配置写入后检查真实进程路径及 `notif
 
 ## 执行档位与模型边界
 
-设置 `CODEX_EXECUTOR_EXECUTION_MODELS` 为 JSON 对象，必须包含 simple、standard、complex 三个执行档位，值为本机别名或模型 ID；默认模型须与 standard 一致。同时设置 general/quant 两个审核模型。模型 ID 留在本机配置，项目代码不固定个人型号。调用方用 `execution_tier` 选择任务难度，默认 standard；同事项续接省略档位保留原模型，切换已选模型须带真实 user_followup。旧 model 参数仅接受执行档位映射内的模型，且不得与显式档位冲突；工具定义也列出允许值，审核角色不能越界选择执行模型。
+设置 `CODEX_EXECUTOR_EXECUTION_MODELS` 为 JSON 对象，必须包含 simple、standard、complex 三个执行档位，可额外配置 expert 处理极难问题；值为本机别名或模型 ID；默认模型须与 standard 一致。同时设置 general/quant 两个审核模型。模型 ID 留在本机配置，项目代码不固定个人型号。调用方用 `execution_tier` 选择任务难度，默认 standard；明确请求未配置的 expert 时直接报配置错误，不回落到其它档位；同事项续接省略档位保留原模型，切换已选模型须带真实 user_followup。旧 model 参数仅接受执行档位映射内的模型，且不得与显式档位冲突；工具定义也列出允许值，审核与执行分别按各自映射校验；同一模型可以同时用于 expert 执行和量化审核。
 
 可设 `CODEX_EXECUTOR_MODELS_CACHE` 指向当前账户的绝对路径模型缓存（models[].slug）。派发前检查所选模型在该快照中；缺失、不可读或服务端仍报告 model_not_found 时明确报模型配置错误，不静默替代。缓存是本机快照，不保证服务端实时可用。未配置执行档位的其它安装保留原来的默认继承行为。
 

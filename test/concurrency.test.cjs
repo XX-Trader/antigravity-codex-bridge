@@ -53,10 +53,10 @@ test('execution tiers enforce role membership, availability, stable continuation
     execution_models: { simple: 'exec-small', standard: 'exec-normal', complex: 'exec-deep' }, models_cache_file: cache,
     review_models: { general: 'review-general', quant: 'review-quant' } });
   const schema = dispatch(f.broker, { method: 'tools/list' }).tools;
-  for (const name of ['codex_run', 'codex_start', 'codex_continue']) assert.deepEqual(schema.find(s => s.name === name).inputSchema.properties.execution_tier.enum, ['simple', 'standard', 'complex']);
+  for (const name of ['codex_run', 'codex_start', 'codex_continue']) assert.deepEqual(schema.find(s => s.name === name).inputSchema.properties.execution_tier.enum, ['simple', 'standard', 'complex', 'expert']);
   const allowed = schema.find(s => s.name === 'codex_run').inputSchema.properties.model.enum;
   assert.ok(allowed.includes('quick')); assert.ok(!allowed.includes('reviewer')); assert.ok(!allowed.includes('gpt-5.4'));
-  for (const input of [{ model: 'gpt-5.4' }, { model: 'reviewer' }, { execution_tier: 'guess' }, { execution_tier: 'simple', model: 'regular' }]) {
+  for (const input of [{ model: 'gpt-5.4' }, { model: 'reviewer' }, { execution_tier: 'guess' }, { execution_tier: 'expert' }, { execution_tier: 'simple', model: 'regular' }]) {
     assert.throws(() => f.broker.start({ prompt: '新事项', ...input }), /MODEL_CONFIGURATION/);
   }
   assert.equal(f.broker.list().length, 0, 'Invalid selection creates no job or worker');
@@ -67,6 +67,18 @@ test('execution tiers enforce role membership, availability, stable continuation
   const next = f.broker.start({ prompt: '继续', topic_id: first.topic_id }); assert.equal(next.model, 'exec-deep');
   save(f.broker.jobPath(next.job_id), { ...f.broker.get(next.job_id), status: 'completed' }); f.broker.unlock(next.job_id);
   const changed = f.broker.start({ prompt: '按用户要求切换', topic_id: first.topic_id, execution_tier: 'simple', user_followup: '这轮明确改用小模型处理。' }); assert.equal(changed.model, 'exec-small');
+  save(f.broker.jobPath(changed.job_id), { ...f.broker.get(changed.job_id), status: 'completed' }); f.broker.unlock(changed.job_id);
+  assert.throws(() => f.broker.start({ prompt: '极难任务未配置', execution_tier: 'expert' }), /expert is not configured/);
+  f.settings.execution_models.expert = 'review-quant';
+  const expertAllowed = dispatch(f.broker, { method: 'tools/list' }).tools.find(s => s.name === 'codex_run').inputSchema.properties.model.enum;
+  assert.ok(expertAllowed.includes('reviewer'), 'A model may serve both expert execution and quant review');
+  assert.throws(() => f.broker.start({ prompt: '自动升档', topic_id: first.topic_id, execution_tier: 'expert' }), /actual human instruction/);
+  const expert = f.broker.start({ prompt: '极难问题', execution_tier: 'expert', review_category: 'quant' });
+  assert.equal(expert.model, 'review-quant'); assert.equal(expert.execution_route.tier, 'expert'); assert.equal(expert.review_route.model, 'review-quant');
+  save(f.broker.jobPath(expert.job_id), { ...f.broker.get(expert.job_id), status: 'completed', thread_id: '12345678-1234-1234-1234-123456789abd' }); f.broker.unlock(expert.job_id);
+  const inherited = f.broker.start({ prompt: '继续极难问题', topic_id: expert.topic_id }); assert.equal(inherited.model, 'review-quant');
+  const upgraded = f.broker.start({ prompt: '按用户要求使用极难档位', topic_id: first.topic_id, execution_tier: 'expert', user_followup: '这个极难问题改用极难档位处理。' });
+  assert.equal(upgraded.model, 'review-quant');
   save(cache, { models: [{ slug: 'exec-normal' }] });
   assert.throws(() => f.broker.start({ prompt: '审核模型不可用' }), /account model cache/);
   assert.throws(() => f.broker.start({ prompt: '执行模型不可用', execution_tier: 'complex' }), /account model cache/);

@@ -234,7 +234,7 @@ exit 0
       assert.match(explicit.plan_review.reason, /reviewer=fixture-sol/);
     });
     await t.test('controlled tiers reach the real wrapper and model errors never become business failures', async () => {
-      const strict = { ...settings, execution_models: { simple: 'fixture-luna', standard: 'fixture-terra', complex: 'fixture-sol' }, review_models: { general: 'fixture-sol', quant: 'fixture-astra' } };
+      const strict = { ...settings, execution_models: { simple: 'fixture-luna', standard: 'fixture-terra', complex: 'fixture-sol', expert: 'fixture-astra' }, review_models: { general: 'fixture-sol', quant: 'fixture-astra' } };
       const controlled = new Broker(strict);
       for (const [tier, model] of Object.entries(strict.execution_models)) {
         const result = await controlled.run({ wait: true, execution_tier: tier, prompt: 'REVIEW_VALID_FIXTURE 根据任务档位执行' });

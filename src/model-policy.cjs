@@ -1,7 +1,8 @@
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
-const tiers = ['simple', 'standard', 'complex'];
+const requiredTiers = ['simple', 'standard', 'complex'];
+const tiers = [...requiredTiers, 'expert'];
 class ModelPolicyError extends Error {
   constructor(message) { super('[CODEX_MODEL_CONFIGURATION] ' + message); this.code = 'MODEL_CONFIGURATION'; }
 }
@@ -16,8 +17,8 @@ function modelPolicy(env, aliases) {
   if (!env.CODEX_EXECUTOR_EXECUTION_MODELS) return {};
   let map;
   try { map = JSON.parse(env.CODEX_EXECUTOR_EXECUTION_MODELS); } catch { throw new ModelPolicyError('Execution models must be a JSON tier map'); }
-  if (!map || Array.isArray(map) || Object.keys(map).length !== tiers.length || tiers.some(k => !Object.hasOwn(map, k))) throw new ModelPolicyError('Configure exactly simple, standard and complex execution tiers');
-  const execution_models = Object.fromEntries(tiers.map(k => [k, selectedModel(map[k], aliases)]));
+  if (!map || Array.isArray(map) || typeof map !== 'object' || requiredTiers.some(k => !Object.hasOwn(map, k)) || Object.keys(map).some(k => !tiers.includes(k))) throw new ModelPolicyError('Configure simple, standard and complex execution tiers, with optional expert only');
+  const execution_models = Object.fromEntries(tiers.filter(k => Object.hasOwn(map, k)).map(k => [k, selectedModel(map[k], aliases)]));
   if (env.CODEX_EXECUTOR_MODELS_CACHE && !path.isAbsolute(env.CODEX_EXECUTOR_MODELS_CACHE)) throw new ModelPolicyError('Local account model cache path must be absolute');
   return { execution_models, models_cache_file: env.CODEX_EXECUTOR_MODELS_CACHE || null };
 }
@@ -29,12 +30,13 @@ function assertAvailable(settings, model) {
   if (!Array.isArray(cache.models) || !cache.models.some(row => row.slug === model)) throw new ModelPolicyError(`Model ${model} is absent from the local account model cache; refresh account availability, do not substitute another model`);
 }
 function assertExecution(settings, model) {
-  if (settings.execution_models && !Object.values(settings.execution_models).includes(model)) throw new ModelPolicyError(`Execution model ${model} is outside the configured execution tiers; use execution_tier=simple|standard|complex`);
+  if (settings.execution_models && !Object.values(settings.execution_models).includes(model)) throw new ModelPolicyError(`Execution model ${model} is outside the configured execution tiers; use execution_tier=simple|standard|complex|expert`);
 }
 function executionRoute(input, settings, parent) {
-  if (input.execution_tier !== undefined && !tiers.includes(input.execution_tier)) throw new ModelPolicyError('execution_tier must be simple, standard or complex');
+  if (input.execution_tier !== undefined && !tiers.includes(input.execution_tier)) throw new ModelPolicyError('execution_tier must be simple, standard, complex or expert');
   const map = settings.execution_models;
   if (input.execution_tier && !map) throw new ModelPolicyError('No execution tier map is configured');
+  if (input.execution_tier && !Object.hasOwn(map, input.execution_tier)) throw new ModelPolicyError(`Execution tier ${input.execution_tier} is not configured; do not substitute another tier`);
   const explicit = input.model !== undefined ? selectedModel(input.model, settings.model_aliases) : null;
   if (input.execution_tier && explicit && map[input.execution_tier] !== explicit) throw new ModelPolicyError('model conflicts with execution_tier');
   const model = (input.execution_tier && map[input.execution_tier]) || explicit || parent?.settings?.model || (map ? map.standard : settings.model);
