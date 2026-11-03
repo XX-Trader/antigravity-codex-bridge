@@ -16,7 +16,7 @@ class Broker extends RealBroker {
 
 const { originHook, deliver, watch } = require('../src/notifier.cjs');
 const fixtureAliases = { astra: 'fixture-astra', luna: 'fixture-luna', terra: 'fixture-terra', sol: 'fixture-sol' };
-const fixtureEnv = { CODEX_EXECUTOR_MODEL: 'terra', CODEX_EXECUTOR_MODEL_ALIASES: JSON.stringify(fixtureAliases), CODEX_EXECUTOR_SERVICE_TIER: 'fast' };
+const fixtureEnv = { CODEX_EXECUTOR_MODEL: 'terra', CODEX_EXECUTOR_MODEL_ALIASES: JSON.stringify(fixtureAliases), CODEX_EXECUTOR_SERVICE_TIER: 'fast', CODEX_EXECUTOR_NORMAL_MODE_MODELS: '["astra"]' };
 Object.assign(process.env, fixtureEnv);
 const config = env => parseConfig({ ...fixtureEnv, ...env });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -76,6 +76,7 @@ if ($prompt.Contains('当前是独立审核阶段（stage=review）')) {
   $version = [regex]::Match($prompt, '本轮方案版本：([a-f0-9]{64})').Groups[1].Value
   $review = @{ plan_sha256 = $version; evidence = @('已实际读取 fixture README 并核对目标'); allowed_scope = @('仅按测试要求实施，不扩大任务范围'); reason = 'fixture 审核通过'; decision_scope = 'technical' }
   $review.reason += ' reviewer=' + $argv[[Array]::IndexOf($argv, '-m')+1]
+  $review.reason += ' normal_mode=' + (($argv -contains 'service_tier="default"') -and ($argv -contains 'features.fast_mode=false') -and (-not ($argv -contains 'service_tier="fast"')) -and (-not ($argv -contains 'features.fast_mode=true')))
   $review.reason += ' self_repair=' + $implementationContract
   $marker = 'APPROVED'
   if ($prompt.Contains('REVIEW_REVISE_FIXTURE')) { $marker = 'REVISE'; $review.reason = '方案调用不存在的接口'; $review.suggested_changes = '依据当前接口修订'; $review.Remove('allowed_scope') }
@@ -122,6 +123,7 @@ $liveWeb = $argv -contains 'web_search="live"'
 $nativeAgents = $argv -contains 'features.multi_agent=true'
 $acceptanceContract = $prompt.Contains('逐项验收') -and $prompt.Contains('假设与证实根因分开报告') -and $prompt.Contains('一次只提出一个阻塞问题') -and $prompt.Contains('普通追问、补充信息或另一个独立任务不表示取消本事项')
 $text = 'FAKE_OK resume=' + ($argv -contains 'resume') + ' unicode=' + $prompt.Contains('中文参数') + ' model=' + $argv[$mi+1] + ' effort=' + ($ec -join ',') + ' fast=' + $fast + ' sandbox=' + $argv[$si+1] + ' web_live=' + $liveWeb + ' native_subagents=' + $nativeAgents
+$text += ' normal_mode=' + (($argv -contains 'service_tier="default"') -and ($argv -contains 'features.fast_mode=false') -and (-not ($argv -contains 'service_tier="fast"')) -and (-not ($argv -contains 'features.fast_mode=true')))
 $text += ' acceptance_contract=' + $acceptanceContract
 $text += ' original_request=' + $prompt.Contains('USER_ORIGINAL_SENTINEL') + ' user_followup=' + $prompt.Contains('USER_FOLLOWUP_SENTINEL')
 $text += ' policy_contract=' + ($prompt.Contains('执行策略拒绝与方案不成立必须分开') -and $prompt.Contains('不自动重试、换壳、拆命令、改入口'))
@@ -204,7 +206,7 @@ exit 0
       assert.match(general.plan_review.reason, /self_repair=True/);
       assert.doesNotMatch(fs.readFileSync(general.paths.events, 'utf8'), /"stage":"execute"/);
       const quant = await routed.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 量化因子回测方案审核', review_only: true });
-      assert.equal(quant.review_route.model, 'fixture-astra'); assert.match(quant.plan_review.reason, /reviewer=fixture-astra/);
+      assert.equal(quant.review_route.model, 'fixture-astra'); assert.match(quant.plan_review.reason, /reviewer=fixture-astra/); assert.match(quant.plan_review.reason, /normal_mode=True/);
       assert.equal(quant.stage, 'review_complete');
       await assert.rejects(routed.run({ topic_id: general.topic_id, prompt: '擅自实施', review_only: false }), /actual human instruction/);
       const execution = await routed.run({ wait: true, topic_id: general.topic_id, prompt: 'REVIEW_VALID_FIXTURE 按已审核方案实施', review_only: false, user_followup: '现在按通过的方案实施。' });
@@ -240,6 +242,12 @@ exit 0
         const result = await controlled.run({ wait: true, execution_tier: tier, prompt: 'REVIEW_VALID_FIXTURE 根据任务档位执行' });
         assert.equal(result.status, 'completed'); assert.equal(result.execution_route.tier, tier);
         assert.match(result.final_response, new RegExp('model=' + model)); assert.match(result.plan_review.reason, /reviewer=fixture-sol/);
+        assert.match(result.final_response, new RegExp('normal_mode=' + (tier === 'expert' ? 'True' : 'False')));
+        assert.match(result.plan_review.reason, /normal_mode=False/);
+        if (tier === 'expert') {
+          const continued = await controlled.run({ wait: true, topic_id: result.topic_id, prompt: '中文参数 继续极难事项' });
+          assert.equal(continued.session_id, result.session_id); assert.match(continued.final_response, /normal_mode=True/); assert.match(continued.final_response, /fast=False/);
+        }
       }
       for (const prompt of ['MODEL_NOT_FOUND_FIXTURE', 'MODEL_NOT_FOUND_EXEC_FIXTURE']) {
         const held = await controlled.run({ wait: true, prompt });

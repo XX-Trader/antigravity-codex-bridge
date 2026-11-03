@@ -90,6 +90,7 @@ test('review configuration binds project categories; legacy workers read only ma
   const env = { CODEX_EXECUTOR_PROJECT: f.project, CODEX_EXECUTOR_DATA: f.data, CODEX_EXECUTOR_ENTRY: process.execPath,
     CODEX_EXECUTOR_MODEL: 'executor', CODEX_EXECUTOR_MODEL_ALIASES: JSON.stringify({ sol: 'review-sol', astra: 'review-astra' }), CODEX_EXECUTOR_REVIEW_MODEL: 'sol', CODEX_EXECUTOR_QUANT_REVIEW_MODEL: 'astra',
     CODEX_EXECUTOR_EXECUTION_MODELS: JSON.stringify({ simple: 'smaller', standard: 'executor', complex: 'deeper' }),
+    CODEX_EXECUTOR_NORMAL_MODE_MODELS: '["astra"]',
     CODEX_EXECUTOR_PROJECTS: JSON.stringify([{ project: f.project, data: f.data }, { project: other, data: otherData, review_category: 'quant' }]) };
   const configured = config(env);
   assert.equal(configured.projects[0].review_category, 'general'); assert.equal(configured.projects[1].review_category, 'quant');
@@ -99,6 +100,7 @@ test('review configuration binds project categories; legacy workers read only ma
   const file = path.join(f.root, 'mcp.json'), doc = { mcpServers: { 'codex-executor': { args: [path.resolve(__dirname, '../src/server.cjs')], env } } }; save(file, doc);
   const legacy = { ...f.settings, model: 'keep-executor', review_config_file: file };
   const live = liveReviewSettings(legacy);
+  assert.deepEqual(live.normal_mode_models, ['review-astra']);
   assert.equal(live.model, 'keep-executor'); assert.equal(live.entry, legacy.entry);
   assert.deepEqual(live.review_models, { general: 'review-sol', quant: 'review-astra' });
   assert.deepEqual(live.execution_models, { simple: 'smaller', standard: 'executor', complex: 'deeper' });

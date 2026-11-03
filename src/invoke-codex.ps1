@@ -34,8 +34,12 @@ $result = Join-Path (Split-Path -Parent $RequestPath) $resultName
 $commandShell = Join-Path $PSHOME 'pwsh.exe'
 $cliArgs = @('--no-daemon', 'exec', '-C', $job.cwd, '--json', '--color', 'never', '--sandbox', $job.sandbox, '-o', $result,
     '-c', 'approval_policy="never"', '-c', 'web_search="live"', '-c', 'features.apps=false', '-c', 'features.prefer_mxc=true', '-c', 'features.multi_agent=true')
-if ($job.settings.service_tier -eq 'fast') { $cliArgs += @('-c', 'service_tier="fast"', '-c', 'features.fast_mode=true') }
 $stageModel = if ($reviewing -and $job.review_route.model) { $job.review_route.model } else { $job.settings.model }
+if ($stageModel -and @($job.settings.normal_mode_models) -contains $stageModel) {
+    $cliArgs += @('-c', 'service_tier="default"', '-c', 'features.fast_mode=false')
+} elseif ($job.settings.service_tier -eq 'fast') {
+    $cliArgs += @('-c', 'service_tier="fast"', '-c', 'features.fast_mode=true')
+}
 if ($stageModel) { $cliArgs += @('-m', $stageModel) }
 $effort = if ($job.settings.reasoning_effort) { $job.settings.reasoning_effort } else { 'medium' }
 $cliArgs += @('-c', ('model_reasoning_effort=' + (ConvertTo-Json -InputObject $effort -Compress)))

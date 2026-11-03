@@ -124,6 +124,8 @@ test('model IDs and optional account-local aliases are not hard coded', () => {
   const f = fixture(); try {
     const env = { CODEX_EXECUTOR_PROJECT: f.options.project, CODEX_EXECUTOR_DATA: f.options.data, CODEX_EXECUTOR_ENTRY: process.execPath };
     assert.equal(config(env).model, null);
+    assert.deepEqual(config({ ...env, CODEX_EXECUTOR_MODEL_ALIASES: '{"reviewer":"normal-only"}', CODEX_EXECUTOR_NORMAL_MODE_MODELS: '["reviewer","normal-only"]' }).normal_mode_models, ['normal-only']);
+    for (const invalid of ['{}', 'null', '["bad model"]', 'invalid']) assert.throws(() => config({ ...env, CODEX_EXECUTOR_NORMAL_MODE_MODELS: invalid }), /Normal-mode|model/);
     assert.equal(config({ ...env, CODEX_EXECUTOR_MODEL: 'provider/model-v1' }).model, 'provider/model-v1');
     assert.equal(config({ ...env, CODEX_EXECUTOR_MODEL: 'quick', CODEX_EXECUTOR_MODEL_ALIASES: '{"quick":"account-model"}' }).model, 'account-model');
     assert.throws(() => config({ ...env, CODEX_EXECUTOR_MODEL_ALIASES: '[]' }), /aliases/);

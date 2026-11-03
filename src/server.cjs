@@ -801,6 +801,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
   let policySettings;
   try {
     policySettings = liveReviewSettings(job.settings);
+    if (JSON.stringify(job.settings.normal_mode_models) !== JSON.stringify(policySettings.normal_mode_models)) update({ settings: { ...job.settings, normal_mode_models: policySettings.normal_mode_models } });
     if (policySettings.execution_models) {
       if (job.stage === 'review' && !job.review_route) update({ review_route: reviewRoute(job, policySettings) });
       validateJobModels(job, policySettings);

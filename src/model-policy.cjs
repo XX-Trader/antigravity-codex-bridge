@@ -14,13 +14,20 @@ function selectedModel(value, aliases = {}) {
   return resolved;
 }
 function modelPolicy(env, aliases) {
-  if (!env.CODEX_EXECUTOR_EXECUTION_MODELS) return {};
+  let normal = [];
+  if (env.CODEX_EXECUTOR_NORMAL_MODE_MODELS) {
+    try { normal = JSON.parse(env.CODEX_EXECUTOR_NORMAL_MODE_MODELS); } catch { throw new ModelPolicyError('Normal-mode models must be a JSON array'); }
+    if (!Array.isArray(normal) || normal.length > 20) throw new ModelPolicyError('Normal-mode models must be a JSON array of at most 20 models');
+    normal = [...new Set(normal.map(value => selectedModel(value, aliases)))];
+  }
+  const modePolicy = { normal_mode_models: normal };
+  if (!env.CODEX_EXECUTOR_EXECUTION_MODELS) return modePolicy;
   let map;
   try { map = JSON.parse(env.CODEX_EXECUTOR_EXECUTION_MODELS); } catch { throw new ModelPolicyError('Execution models must be a JSON tier map'); }
   if (!map || Array.isArray(map) || typeof map !== 'object' || requiredTiers.some(k => !Object.hasOwn(map, k)) || Object.keys(map).some(k => !tiers.includes(k))) throw new ModelPolicyError('Configure simple, standard and complex execution tiers, with optional expert only');
   const execution_models = Object.fromEntries(tiers.filter(k => Object.hasOwn(map, k)).map(k => [k, selectedModel(map[k], aliases)]));
   if (env.CODEX_EXECUTOR_MODELS_CACHE && !path.isAbsolute(env.CODEX_EXECUTOR_MODELS_CACHE)) throw new ModelPolicyError('Local account model cache path must be absolute');
-  return { execution_models, models_cache_file: env.CODEX_EXECUTOR_MODELS_CACHE || null };
+  return { ...modePolicy, execution_models, models_cache_file: env.CODEX_EXECUTOR_MODELS_CACHE || null };
 }
 function assertAvailable(settings, model) {
   if (!settings.models_cache_file) return;
