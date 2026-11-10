@@ -77,6 +77,7 @@ if ($prompt.Contains('当前是独立审核阶段（stage=review）')) {
   $review = @{ plan_sha256 = $version; evidence = @('已实际读取 fixture README 并核对目标'); allowed_scope = @('仅按测试要求实施，不扩大任务范围'); reason = 'fixture 审核通过'; decision_scope = 'technical' }
   $review.reason += ' reviewer=' + $argv[[Array]::IndexOf($argv, '-m')+1]
   $review.reason += ' normal_mode=' + (($argv -contains 'service_tier="default"') -and ($argv -contains 'features.fast_mode=false') -and (-not ($argv -contains 'service_tier="fast"')) -and (-not ($argv -contains 'features.fast_mode=true')))
+  $review.reason += ' sandbox=' + $argv[[Array]::IndexOf($argv, '--sandbox')+1]
   $review.reason += ' self_repair=' + $implementationContract
   $marker = 'APPROVED'
   if ($prompt.Contains('REVIEW_REVISE_FIXTURE')) { $marker = 'REVISE'; $review.reason = '方案调用不存在的接口'; $review.suggested_changes = '依据当前接口修订'; $review.Remove('allowed_scope') }
@@ -235,6 +236,33 @@ exit 0
       assert.equal(explicit.stage, 'review_complete'); assert.deepEqual(stages(explicit), ['review']);
       assert.match(explicit.plan_review.reason, /reviewer=fixture-sol/);
     });
+    await t.test('review-only role is sandboxed and cannot leak into execution or legacy launches', async () => {
+      const policy = { ...settings, review_only_models: ['fixture-astra'], execution_models: { simple: 'fixture-luna', standard: 'fixture-terra', complex: 'fixture-sol', expert: 'fixture-astra' }, review_models: { general: 'fixture-sol', quant: 'fixture-astra' } };
+      const guarded = new Broker(policy);
+      assert.throws(() => guarded.start({ prompt: '拒绝审核模型执行', model: 'astra' }), /review-only/);
+      assert.throws(() => guarded.start({ prompt: '拒绝审核模型档位', execution_tier: 'expert' }), /review-only/);
+      const schema = dispatch(guarded, { method: 'tools/list' }).tools.find(t => t.name === 'codex_run').inputSchema.properties;
+      assert.ok(!schema.model.enum.includes('fixture-astra')); assert.ok(!schema.model.enum.includes('astra'));
+      const review = await guarded.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 量化只读审核', review_only: true });
+      assert.equal(review.status, 'completed'); assert.match(review.plan_review.reason, /sandbox=read-only/);
+      assert.match(review.plan_review.reason, /normal_mode=True/);
+      // Reproduce the old persisted review that stored its reviewer as executor.
+      const saved = guarded.get(review.job_id);
+      saved.settings.model = 'fixture-astra'; saved.execution_route.model = 'fixture-astra';
+      save(guarded.jobPath(review.job_id), saved);
+      const execution = await guarded.run({ wait: true, topic_id: review.topic_id, review_only: false, user_followup: '审核完后使用默认执行模型实施', prompt: '中文参数 实施' });
+      assert.equal(execution.status, 'completed'); assert.equal(execution.model, 'fixture-terra');
+      assert.match(execution.final_response, /normal_mode=True/); assert.match(execution.final_response, /sandbox=danger-full-access/);
+      const id = require('node:crypto').randomBytes(12).toString('hex'), file = guarded.jobPath(id);
+      fs.mkdirSync(path.dirname(file));
+      const legacy = { job_id: id, status: 'queued', stage: 'execute', created_at: new Date().toISOString(), cwd: settings.project, sandbox: 'danger-full-access', topic_id: id, settings: { ...policy, model: 'fixture-astra' }, prompt: '旧保存任务', timeout_seconds: 30 };
+      save(file, legacy);
+      const direct = spawnSync(settings.pwsh, ['-NoProfile', '-File', path.resolve('src/invoke-codex.ps1'), '-RequestPath', file], { encoding: 'utf8', timeout: 15000, env: childEnvironment() });
+      assert.equal(direct.status, 1); assert.match(direct.stderr, /Review-only model cannot enter execution/);
+      await worker(file); const held = guarded.receipt(id);
+      assert.equal(held.status, 'blocked'); assert.equal(held.configuration_error.kind, 'model_configuration');
+      assert.equal(guarded.get(id).child_pid, undefined); assert.equal(fs.readFileSync(held.paths.events, 'utf8'), '');
+    });
     await t.test('controlled tiers reach the real wrapper and model errors never become business failures', async () => {
       const strict = { ...settings, execution_models: { simple: 'fixture-luna', standard: 'fixture-terra', complex: 'fixture-sol', expert: 'fixture-astra' }, review_models: { general: 'fixture-sol', quant: 'fixture-astra' } };
       const controlled = new Broker(strict);
@@ -242,8 +270,8 @@ exit 0
         const result = await controlled.run({ wait: true, execution_tier: tier, prompt: 'REVIEW_VALID_FIXTURE 根据任务档位执行' });
         assert.equal(result.status, 'completed'); assert.equal(result.execution_route.tier, tier);
         assert.match(result.final_response, new RegExp('model=' + model)); assert.match(result.plan_review.reason, /reviewer=fixture-sol/);
-        assert.match(result.final_response, new RegExp('normal_mode=' + (tier === 'expert' ? 'True' : 'False')));
-        assert.match(result.plan_review.reason, /normal_mode=False/);
+        assert.match(result.final_response, /normal_mode=True/);
+        assert.match(result.plan_review.reason, /normal_mode=True/);
         if (tier === 'expert') {
           const continued = await controlled.run({ wait: true, topic_id: result.topic_id, prompt: '中文参数 继续极难事项' });
           assert.equal(continued.session_id, result.session_id); assert.match(continued.final_response, /normal_mode=True/); assert.match(continued.final_response, /fast=False/);
@@ -420,16 +448,16 @@ exit 0
       assert.ok((await broker.sessions({ include_native: false })).sessions.some(item => item.session_id === b.session_id));
     });
     await t.test('planner model selection, explicit Medium CLI args and per-matter background continuation', async () => {
-      assert.equal(settings.model, 'fixture-terra'); assert.equal(settings.reasoning_effort, 'medium'); assert.equal(settings.service_tier, 'fast');
+      assert.equal(settings.model, 'fixture-terra'); assert.equal(settings.reasoning_effort, 'medium'); assert.equal(settings.service_tier, 'default');
       for (const input of [{ model: 'bad model' }, { model: '__proto__' }, { reasoning_effort: 'max' }, { wait: 'false' }, { topic: '' }]) {
         assert.throws(() => broker.start({ prompt: 'x', ...input }), /model|reasoning_effort|wait|topic/);
       }
       const chat = 'abababab-abab-abab-abab-abababababab';
       const a = await broker.run({ prompt: '中文参数', topic: '事项A 查询', model: 'luna', sandbox: 'read-only', conversation_id: chat });
-      assert.equal(a.status, 'queued'); assert.equal(a.model, 'fixture-luna'); assert.equal(a.reasoning_effort, 'medium'); assert.equal(a.service_tier, 'fast'); assert.ok(a.topic_id);
+      assert.equal(a.status, 'queued'); assert.equal(a.model, 'fixture-luna'); assert.equal(a.reasoning_effort, 'medium'); assert.equal(a.service_tier, 'default'); assert.ok(a.topic_id);
       await assert.rejects(broker.run({ topic_id: a.topic_id, prompt: '不能重复派发' }), /still running/);
       const ra = await broker.wait(a.job_id);
-      assert.match(ra.final_response, /model=fixture-luna effort=model_reasoning_effort="medium" fast=True/);
+      assert.match(ra.final_response, /model=fixture-luna effort=model_reasoning_effort="medium" fast=False/);
       const b = await broker.run({ prompt: 'SECOND_SESSION 中文参数', topic: '事项B 实现', model: 'terra', sandbox: 'read-only', conversation_id: chat });
       const rb = await broker.wait(b.job_id);
       assert.equal(b.model, 'fixture-terra'); assert.notEqual(a.topic_id, b.topic_id); assert.notEqual(ra.session_id, rb.session_id);
@@ -437,10 +465,11 @@ exit 0
       await assert.rejects(broker.run({ prompt: 'x', topic_id: a.topic_id, topic: '另一个事项' }), /different matter/);
       const resumed = await broker.run({ topic_id: a.topic_id, prompt: '中文参数' });
       assert.equal(resumed.model, 'fixture-luna'); assert.equal(resumed.topic, a.topic); assert.equal(resumed.topic_id, a.topic_id);
-      const rr = await broker.wait(resumed.job_id); assert.equal(rr.status, 'completed'); assert.match(rr.final_response, /fast=True/); assert.equal(rr.session_id, ra.session_id); assert.match(rr.final_response, /resume=True/);
-      const sol = await broker.run({ topic_id: b.topic_id, prompt: '中文参数', model: 'sol' });
+      const rr = await broker.wait(resumed.job_id); assert.equal(rr.status, 'completed'); assert.match(rr.final_response, /fast=False/); assert.equal(rr.session_id, ra.session_id); assert.match(rr.final_response, /resume=True/);
+      await assert.rejects(broker.run({ topic_id: b.topic_id, prompt: '不能自行换模型', model: 'sol' }), /actual human instruction/);
+      const sol = await broker.run({ topic_id: b.topic_id, prompt: '中文参数', model: 'sol', user_followup: '此事项改用复杂执行模型' });
       assert.equal(sol.model, 'fixture-sol'); assert.equal(sol.reasoning_effort, 'medium');
-      assert.match((await broker.wait(sol.job_id)).final_response, /model=fixture-sol effort=model_reasoning_effort="medium" fast=True/);
+      assert.match((await broker.wait(sol.job_id)).final_response, /model=fixture-sol effort=model_reasoning_effort="medium" fast=False/);
       const known = await broker.sessions({ include_native: false });
       assert.ok(known.sessions.some(x => x.topic_id === a.topic_id && x.model === 'fixture-luna'));
     });

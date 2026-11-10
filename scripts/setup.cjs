@@ -74,7 +74,8 @@ function buildPlan(options) {
   Object.assign(env, { CODEX_EXECUTOR_PROJECT: env.CODEX_EXECUTOR_PROJECT || project, CODEX_EXECUTOR_DATA: env.CODEX_EXECUTOR_DATA || data, CODEX_EXECUTOR_PROJECTS: JSON.stringify(projects), CODEX_EXECUTOR_ENTRY: codex, CODEX_EXECUTOR_PWSH: pwsh, CODEX_EXECUTOR_REASONING_EFFORT: env.CODEX_EXECUTOR_REASONING_EFFORT || 'medium', CODEX_EXECUTOR_REVIEW_CONFIG: mcp, CODEX_EXECUTOR_BUILD: digest(['server.cjs', 'router.cjs', 'notifier.cjs', 'loop-guard.cjs', 'model-policy.cjs', 'invoke-codex.ps1'].map(n => fs.readFileSync(path.join(root, 'src', n), 'utf8'))) });
   if (options.model) env.CODEX_EXECUTOR_MODEL = options.model;
   if (options.aliases) env.CODEX_EXECUTOR_MODEL_ALIASES = options.aliases;
-  if (options.tier) env.CODEX_EXECUTOR_SERVICE_TIER = options.tier;
+  if (options.tier && !['default', 'fast'].includes(options.tier)) throw new Error('service tier must be default; fast is disabled');
+  env.CODEX_EXECUTOR_SERVICE_TIER = 'default';
   const entry = { ...previous, command: process.execPath, args: [path.join(root, 'src', 'server.cjs')], env, timeoutSeconds: 14460, disabled: false, enabledTools: ['codex_run', 'codex_wait', 'codex_sessions', 'codex_result', 'codex_cancel', 'codex_list'] };
   const changes = [];
   const change = (file, parts, value) => {
@@ -168,7 +169,7 @@ module.exports = { buildPlan, apply, restore, getAt, digest, target, parse };
 if (require.main === module) {
   try {
     const options = parse(process.argv.slice(2));
-    if (options.help) console.log('pwsh -NoProfile -File scripts/Setup.ps1 --project ABS_PROJECT --data ABS_RUNTIME --codex ABS_CODEX [--pwsh ABS_PWSH] [--agentapi ABS_LANGUAGE_SERVER] [--model MODEL] [--model-aliases JSON] [--service-tier fast] [--apply --trust-full-access]\nRestore: pwsh -NoProfile -File scripts/Setup.ps1 --restore INSTALL_STATE_JSON');
+    if (options.help) console.log('pwsh -NoProfile -File scripts/Setup.ps1 --project ABS_PROJECT --data ABS_RUNTIME --codex ABS_CODEX [--pwsh ABS_PWSH] [--agentapi ABS_LANGUAGE_SERVER] [--model MODEL] [--model-aliases JSON] [--service-tier default] [--apply --trust-full-access]\nRestore: pwsh -NoProfile -File scripts/Setup.ps1 --restore INSTALL_STATE_JSON');
     else if (options.restore) console.log(JSON.stringify(restore(path.resolve(options.restore)), null, 2));
     else {
       const plan = buildPlan(options);

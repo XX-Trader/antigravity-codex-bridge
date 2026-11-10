@@ -69,8 +69,10 @@ test('setup preview does not write configuration and arbitrary absolute storage 
     assert.ok(plan.changes.length >= 5);
     assert.equal(fs.existsSync(plan.mcp), false);
     const settings = config({ ...plan.entry.env });
-    assert.equal(settings.model, null); assert.equal(settings.service_tier, null);
+    assert.equal(settings.model, null); assert.equal(settings.service_tier, 'default');
     assert.equal(settings.data, fs.realpathSync(f.options.data));
+    assert.equal(plan.entry.env.CODEX_EXECUTOR_SERVICE_TIER, 'default');
+    assert.equal(buildPlan({ ...f.options, tier: 'fast' }).entry.env.CODEX_EXECUTOR_SERVICE_TIER, 'default');
     assert.equal(plan.entry.env.CODEX_EXECUTOR_MODEL, undefined);
   } finally { f.done(); }
 });

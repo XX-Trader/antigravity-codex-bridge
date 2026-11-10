@@ -61,7 +61,7 @@ worker 先保存终态再释放事项登记；状态更新与崩溃恢复共用�
 
 可选 `--model-aliases '{"quick":"MODEL_ID","deep":"OTHER_MODEL_ID"}'` 定义本机别名，再用 `--model quick`。不要将账号专有的映射硬编码到公共规则中。
 
-思考强度默认 Medium，支持 low/medium/high。Fast 不默认强制开启；明确传 `--service-tier fast` 才请求 Fast，并保留请求值用于回执，不将请求档位冒充实测速度或实际费用。其它情况继承 Codex 配置。
+思考强度默认 Medium，支持 low/medium/high。所有审核、执行与续接统一使用普通模式：启动层始终传入 `service_tier="default"` 和 `features.fast_mode=false`，覆盖 Codex 全局 Fast 设置。安装器将旧的 Fast 配置归一为 default；旧 `--service-tier fast` 参数仅兼容解析，不再开启 Fast。
 
 ## 手动 MCP 配置
 
@@ -117,13 +117,15 @@ MCP 和 Sidecar 分别加载。配置写入后检查真实进程路径及 `notif
 
 ## 执行档位与模型边界
 
-设置 `CODEX_EXECUTOR_EXECUTION_MODELS` 为 JSON 对象，必须包含 simple、standard、complex 三个执行档位，可额外配置 expert 处理极难问题；值为本机别名或模型 ID；默认模型须与 standard 一致。同时设置 general/quant 两个审核模型。模型 ID 留在本机配置，项目代码不固定个人型号。调用方用 `execution_tier` 选择任务难度，默认 standard；明确请求未配置的 expert 时直接报配置错误，不回落到其它档位；同事项续接省略档位保留原模型，切换已选模型须带真实 user_followup。旧 model 参数仅接受执行档位映射内的模型，且不得与显式档位冲突；工具定义也列出允许值，审核与执行分别按各自映射校验；同一模型可以同时用于 expert 执行和量化审核。
+设置 `CODEX_EXECUTOR_EXECUTION_MODELS` 为 JSON 对象，必须包含 simple、standard、complex 三个执行档位，可额外配置 expert 处理极难问题；值为本机别名或模型 ID；默认模型须与 standard 一致。同时设置 general/quant 两个审核模型。模型 ID 留在本机配置，项目代码不固定个人型号。调用方用 `execution_tier` 选择任务难度，默认 standard；明确请求未配置的 expert 时直接报配置错误，不回落到其它档位；同事项续接省略档位保留原模型，切换已选模型须带真实 user_followup。旧 model 参数仅接受执行档位映射内的模型，且不得与显式档位冲突；工具定义也列出允许值，审核与执行分别按各自映射校验；通过 `CODEX_EXECUTOR_REVIEW_ONLY_MODELS`（模型 ID 或别名的 JSON 数组）指定仅审核模型。名单内模型只能作为审核角色，不能通过档位、旧 model 参数、继承或保存的旧任务进入执行；报模型配置错误，不自动换型号。
 
 可设 `CODEX_EXECUTOR_MODELS_CACHE` 指向当前账户的绝对路径模型缓存（models[].slug）。派发前检查所选模型在该快照中；缺失、不可读或服务端仍报告 model_not_found 时明确报模型配置错误，不静默替代。缓存是本机快照，不保证服务端实时可用。未配置执行档位的其它安装保留原来的默认继承行为。
 
 新派发的越界参数在创建 job 前拒绝；旧连接派发的新 worker 也会按同安装、同注册项目的当前角色配置，在启动 CLI 前复核，不热切换运行中的任务。启动前的模型错误记为 configuration_error，保留原用户决定和执行策略边界；CLI 在任何业务工具执行前返回明确 model_not_found 时也单独归类，不计业务失败或无进展轮次，不清空此前累计失败。修正参数后沿原事项续接，不自动重跑，不改历史回执。刷新 MCP 和规则后使用新的档位字段。
 
-可设 `CODEX_EXECUTOR_NORMAL_MODE_MODELS` 为模型 ID 或本机别名的 JSON 数组，指定只使用正常模式的模型。启动包装层按当前审核或执行阶段实际使用的模型检查；命中时显式传入 `service_tier="default"` 和 `features.fast_mode=false`，覆盖桥接及 Codex 全局 Fast 设置。同会话续接同样生效，其他模型保留原有模式配置。不改变推理强度。新 worker 会读取同安装的当前配置；不重启或改变正在执行中的任务。
+`CODEX_EXECUTOR_NORMAL_MODE_MODELS` 仍兼容解析，普通模式现已对所有模型强制生效，无需逐个列出。仅审核名单中的模型在审核阶段还强制使用 CLI `read-only` 沙箱，执行阶段在启动前拒绝；不能用完整访问配置放宽。审核意见仍需实际证据，沙箱不能代替业务审核。
+
+只审核任务不再向后续执行传递执行模型；用户明确要求实施后，执行恢复本机默认档位或用户明确选择的合法执行模型。真实执行任务已保存的禁用模型不会静默替换，须带真实 `user_followup` 显式切换。派发和 worker 读取同安装、同项目的当前角色策略；不会修改正在运行的 CLI 进程。配置更新后仍需在宿主刷新 MCP，以更新工具定义和已加载入口。
 
 ## 首轮审核与会话续接
 

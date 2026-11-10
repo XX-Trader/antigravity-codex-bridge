@@ -53,7 +53,7 @@ test('execution tiers enforce role membership, availability, stable continuation
     execution_models: { simple: 'exec-small', standard: 'exec-normal', complex: 'exec-deep' }, models_cache_file: cache,
     review_models: { general: 'review-general', quant: 'review-quant' } });
   const schema = dispatch(f.broker, { method: 'tools/list' }).tools;
-  for (const name of ['codex_run', 'codex_start', 'codex_continue']) assert.deepEqual(schema.find(s => s.name === name).inputSchema.properties.execution_tier.enum, ['simple', 'standard', 'complex', 'expert']);
+  for (const name of ['codex_run', 'codex_start', 'codex_continue']) assert.deepEqual(schema.find(s => s.name === name).inputSchema.properties.execution_tier.enum, ['simple', 'standard', 'complex']);
   const allowed = schema.find(s => s.name === 'codex_run').inputSchema.properties.model.enum;
   assert.ok(allowed.includes('quick')); assert.ok(!allowed.includes('reviewer')); assert.ok(!allowed.includes('gpt-5.4'));
   for (const input of [{ model: 'gpt-5.4' }, { model: 'reviewer' }, { execution_tier: 'guess' }, { execution_tier: 'expert' }, { execution_tier: 'simple', model: 'regular' }]) {
@@ -70,6 +70,7 @@ test('execution tiers enforce role membership, availability, stable continuation
   save(f.broker.jobPath(changed.job_id), { ...f.broker.get(changed.job_id), status: 'completed' }); f.broker.unlock(changed.job_id);
   assert.throws(() => f.broker.start({ prompt: '极难任务未配置', execution_tier: 'expert' }), /expert is not configured/);
   f.settings.execution_models.expert = 'review-quant';
+  assert.ok(dispatch(f.broker, { method: 'tools/list' }).tools.find(s => s.name === 'codex_run').inputSchema.properties.execution_tier.enum.includes('expert'));
   const expertAllowed = dispatch(f.broker, { method: 'tools/list' }).tools.find(s => s.name === 'codex_run').inputSchema.properties.model.enum;
   assert.ok(expertAllowed.includes('reviewer'), 'A model may serve both expert execution and quant review');
   assert.throws(() => f.broker.start({ prompt: '自动升档', topic_id: first.topic_id, execution_tier: 'expert' }), /actual human instruction/);

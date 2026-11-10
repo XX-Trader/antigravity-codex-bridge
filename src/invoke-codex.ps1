@@ -27,32 +27,31 @@ if ($AppServer) {
 }
 if (-not $RequestPath) { throw 'RequestPath is required for task execution' }
 $job = Get-Content -LiteralPath $RequestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-$attempt = if ($job.attempt) { [int]$job.attempt } else { 1 }
 $reviewing = $job.stage -eq 'review'
+$stageModel = if ($reviewing -and $job.review_route.model) { $job.review_route.model } else { $job.settings.model }
+$reviewModelOnly = $stageModel -and @($job.settings.review_only_models) -contains $stageModel
+if ($reviewModelOnly -and -not $reviewing) { throw 'Review-only model cannot enter execution' }
+$stageSandbox = if ($reviewModelOnly) { 'read-only' } else { $job.sandbox }
+$attempt = if ($job.attempt) { [int]$job.attempt } else { 1 }
 $resultName = if ($reviewing) { "review-attempt-$attempt.result.txt" } else { "attempt-$attempt.result.txt" }
 $result = Join-Path (Split-Path -Parent $RequestPath) $resultName
 $commandShell = Join-Path $PSHOME 'pwsh.exe'
-$cliArgs = @('--no-daemon', 'exec', '-C', $job.cwd, '--json', '--color', 'never', '--sandbox', $job.sandbox, '-o', $result,
+$cliArgs = @('--no-daemon', 'exec', '-C', $job.cwd, '--json', '--color', 'never', '--sandbox', $stageSandbox, '-o', $result,
     '-c', 'approval_policy="never"', '-c', 'web_search="live"', '-c', 'features.apps=false', '-c', 'features.prefer_mxc=true', '-c', 'features.multi_agent=true')
-$stageModel = if ($reviewing -and $job.review_route.model) { $job.review_route.model } else { $job.settings.model }
-if ($stageModel -and @($job.settings.normal_mode_models) -contains $stageModel) {
-    $cliArgs += @('-c', 'service_tier="default"', '-c', 'features.fast_mode=false')
-} elseif ($job.settings.service_tier -eq 'fast') {
-    $cliArgs += @('-c', 'service_tier="fast"', '-c', 'features.fast_mode=true')
-}
+$cliArgs += @('-c', 'service_tier="default"', '-c', 'features.fast_mode=false')
 if ($stageModel) { $cliArgs += @('-m', $stageModel) }
 $effort = if ($job.settings.reasoning_effort) { $job.settings.reasoning_effort } else { 'medium' }
 $cliArgs += @('-c', ('model_reasoning_effort=' + (ConvertTo-Json -InputObject $effort -Compress)))
-if ($job.sandbox -eq 'workspace-write') {
+if ($stageSandbox -eq 'workspace-write') {
     $writableRoots = ConvertTo-Json -InputObject @($job.settings.data) -Compress
     $cliArgs += @('-c', ('sandbox_workspace_write.writable_roots=' + $writableRoots))
 }
 if ($job.parent_job_id -or $job.resumed_session -or (-not $reviewing -and $job.plan_review.status -eq 'approved') -or ($attempt -gt 1 -and $job.thread_id)) { $cliArgs += @('resume', $job.thread_id) }
 $cliArgs += '-'
-$environment = if ($job.sandbox -eq 'danger-full-access') {
+$environment = if ($stageSandbox -eq 'danger-full-access') {
     '宿主机当前用户环境。进程、运行目录、端口和本地接口排查使用真实宿主机视图，不自动提权。'
 } else {
-    "本地配置已启用的隔离环境（$($job.sandbox)）。沙箱内的进程、网络或路径缺失不能证明宿主机目标不存在。"
+    "当前阶段强制使用的隔离环境（$stageSandbox）。沙箱内的进程、网络或路径缺失不能证明宿主机目标不存在。"
 }
 $delivery = '按任务类型交付：只读诊断仅报告真实结果、必要证据和未完成项，不为模板额外扫描仓库、检查 Git 或运行无关测试；修改任务报告实际改动、相关验证、Git 状态和必要回滚依据。'
 $originalRequest = if ($null -ne $job.request_context.original_text) { $job.request_context.original_text } else { '未提供用户原文；不能把下方规划端摘要冒充原话。对影响目标或授权的歧义先核实。' }

@@ -20,7 +20,13 @@ function modelPolicy(env, aliases) {
     if (!Array.isArray(normal) || normal.length > 20) throw new ModelPolicyError('Normal-mode models must be a JSON array of at most 20 models');
     normal = [...new Set(normal.map(value => selectedModel(value, aliases)))];
   }
-  const modePolicy = { normal_mode_models: normal };
+  let reviewOnly = [];
+  if (env.CODEX_EXECUTOR_REVIEW_ONLY_MODELS) {
+    try { reviewOnly = JSON.parse(env.CODEX_EXECUTOR_REVIEW_ONLY_MODELS); } catch { throw new ModelPolicyError('Review-only models must be a JSON array'); }
+    if (!Array.isArray(reviewOnly) || reviewOnly.length > 20) throw new ModelPolicyError('Review-only models must be a JSON array of at most 20 models');
+    reviewOnly = [...new Set(reviewOnly.map(value => selectedModel(value, aliases)))];
+  }
+  const modePolicy = { normal_mode_models: normal, review_only_models: reviewOnly };
   if (!env.CODEX_EXECUTOR_EXECUTION_MODELS) return modePolicy;
   let map;
   try { map = JSON.parse(env.CODEX_EXECUTOR_EXECUTION_MODELS); } catch { throw new ModelPolicyError('Execution models must be a JSON tier map'); }
@@ -37,6 +43,7 @@ function assertAvailable(settings, model) {
   if (!Array.isArray(cache.models) || !cache.models.some(row => row.slug === model)) throw new ModelPolicyError(`Model ${model} is absent from the local account model cache; refresh account availability, do not substitute another model`);
 }
 function assertExecution(settings, model) {
+  if (settings.review_only_models?.includes(model)) throw new ModelPolicyError(`Model ${model} is restricted to review-only and cannot execute`);
   if (settings.execution_models && !Object.values(settings.execution_models).includes(model)) throw new ModelPolicyError(`Execution model ${model} is outside the configured execution tiers; use execution_tier=simple|standard|complex|expert`);
 }
 function executionRoute(input, settings, parent) {
@@ -46,21 +53,20 @@ function executionRoute(input, settings, parent) {
   if (input.execution_tier && !Object.hasOwn(map, input.execution_tier)) throw new ModelPolicyError(`Execution tier ${input.execution_tier} is not configured; do not substitute another tier`);
   const explicit = input.model !== undefined ? selectedModel(input.model, settings.model_aliases) : null;
   if (input.execution_tier && explicit && map[input.execution_tier] !== explicit) throw new ModelPolicyError('model conflicts with execution_tier');
-  const model = (input.execution_tier && map[input.execution_tier]) || explicit || parent?.settings?.model || (map ? map.standard : settings.model);
+  const parentModel = parent?.review_only ? null : parent?.settings?.model;
+  const model = (input.execution_tier && map[input.execution_tier]) || explicit || parentModel || (map ? map.standard : settings.model);
   assertExecution(settings, model);
-  const parentAllowed = parent?.settings?.model && (!map || Object.values(map).includes(parent.settings.model));
-  if (map && parentAllowed && model !== parent.settings.model && !input.user_followup?.trim()) throw new ModelPolicyError('Changing the model of an existing matter requires the actual human instruction in user_followup; otherwise omit the tier and keep its model');
+  if (parentModel && model !== parentModel && !input.user_followup?.trim()) throw new ModelPolicyError('Changing the model of an existing matter requires the actual human instruction in user_followup; otherwise omit the tier and keep its model');
   return { model: model || null, tier: map ? tiers.find(k => map[k] === model) : null,
-    source: input.execution_tier ? 'task_tier' : explicit ? 'compatible_model_parameter' : parent?.settings?.model ? 'session_inherited' : 'default_tier' };
+    source: input.execution_tier ? 'task_tier' : explicit ? 'compatible_model_parameter' : parentModel ? 'session_inherited' : 'default_tier' };
 }
 function validateJobModels(job, settings) {
-  if (!settings.execution_models) return;
-  assertExecution(settings, job.settings.model);
-  if (job.execution_route && job.execution_route.model !== job.settings.model) throw new ModelPolicyError('Saved execution model disagrees with its route');
+  if (job.stage !== 'review') assertExecution(settings, job.settings.model);
+  if (settings.execution_models && job.execution_route && job.execution_route.model !== job.settings.model) throw new ModelPolicyError('Saved execution model disagrees with its route');
   if (job.stage === 'review') {
     const category = job.review_route?.category;
-    const expected = settings.review_models?.[category];
-    if (!expected || job.review_route.model !== expected) throw new ModelPolicyError('Review model does not match the configured general/quant role');
+    const expected = settings.review_models?.[category] || (!settings.execution_models ? settings.review_models?.general || settings.model : null);
+    if ((settings.execution_models && !expected) || (job.review_route?.model || null) !== (expected || null)) throw new ModelPolicyError('Review model does not match the configured general/quant role');
     assertAvailable(settings, expected);
   } else if (!job.review_only) assertAvailable(settings, job.settings.model);
 }
