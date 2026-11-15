@@ -45,9 +45,9 @@ function recordedReceipt(directory, event) {
   return false;
 }
 const checks = new Set(['notification_check', 'parallel_check', 'subagent_check']);
-const important = new Set(['terminal', 'execution_alert', 'notification_alert', 'silence_alert']);
+const important = new Set(['terminal', 'execution_alert', 'notification_alert']);
 function notificationPolicy(job, event, now = Date.now()) {
-  if (event.kind === 'notification_check') return 'silent';
+  if (['notification_check', 'silence_alert'].includes(event.kind)) return 'silent';
   if (checks.has(event.kind) || important.has(event.kind) || !event.schema) return 'send';
   // A continuation already has a saved chat link. Never replay old startup banners.
   if (event.kind === 'session_ready' && !job.parent_job_id && !job.resumed_session && job.topic_id === job.job_id && now - Date.parse(event.created_at) <= 120000) return 'send';
@@ -84,7 +84,6 @@ function eventMessage(job, event) {
   if (event.kind === 'session_ready') return `${internal('首次任务会话建立，不调用任何工具；不调用 codex_run、不轮询。')}\n${draft('已启动', '已开始处理这项工作，详细过程可打开原任务查看。')}\n${compact}`;
   if (['notification_alert', 'notification_recovered'].includes(event.kind)) return `${internal(event.detail + '\n不重派、不盲目重发。')}\n${draft('结果通知异常', '任务结果通知未能确认送达，已有结果仍保存在原任务中，请查看详情。')}\n${compact}`;
   if (event.kind === 'execution_alert') return `${internal(event.detail + '\n请领取一次原回执核查所属进程；不重派、不盲目终止PID。')}\n${draft('需要核查', '执行器已退出，后台命令是否结束尚未确认，需要核对原命令和日志。')}\n${compact}`;
-  if (event.kind === 'silence_alert') return `${internal(event.detail + '\n这是用户要求的四小时兜底。只领取一次当前 codex_result（diagnostics=true，核对原始日志尾部），先向用户解释：为什么这么久没有回复？当前卡在哪里？哪些原因有日志支持，哪些仍未知？已完成/未完成什么，如何解决最合适、何时再反馈？先反馈再诊断，不重派、不取消、不重跑仍活动的命令，不把收到本事件当成已答复用户。')}\n${draft('长时间未反馈，需要说明原因', '这项工作已达到四小时反馈兜底，需要核对当前执行与通知记录，解释迟迟未回复的原因、当前卡点和下一步。原因尚未核实，不能只报“仍在运行”。')}\n${compact}`;
   const resume = event.detail?.match(/(?:^|\s)CHECK_ID=([a-f0-9]{24}:\d+)/)?.[1];
   const checkId = resume?.startsWith(job.job_id + ':') ? resume : event.event_id;
   const action = event.kind === 'subagent_check' ? `这是用户明确授权的 Codex 原生子agent 验收。当前执行根=${JSON.stringify(job.cwd)}，MCP服务名见事件说明。仅调用一次 codex_run，wait=false，新 topic“Codex原生子agent只读验收”，不带旧 topic_id/session_id，也不要手填 conversation_id，让本机 hook 绑定真实会话。prompt 必须包含 SUBAGENT_CHECK=${checkId}；要求这个 Codex 执行者实际调用自己的原生 spawn_agent 创建1名只读子agent，让子agent用 PowerShell7 读取 README.md 前60行并输出 CODEX_NATIVE_SUBAGENT_OK，父agent 等待其真实结果，汇总原生子agent ID、来源和返回内容。父agent不能自己读文件冒充委派，不经本MCP递归，不新开CLI冒充子agent；如果原生能力不可用就如实返回 needs_input。所有命令和文件核查都由 Codex/其原生子agent执行；你不能调用 Antigravity invoke_subagent、define_subagent、run_command 或写文件工具代做。只读、不提交、不切分支、不安装或重启、不读凭证；不升级模型。受理后展示job_id，终态再领取结果与查看链接。`
@@ -141,11 +140,6 @@ async function deliverEvent(job, event, deliveryFile, send, options) {
   try {
     const previous = fs.existsSync(deliveryFile) ? read(deliveryFile) : null;
     if (['sent', 'accepted', 'superseded', 'suppressed'].includes(previous?.state)) return false;
-    if (event.kind === 'silence_alert' && !job.loop_guard && terminal.has(job.status) && (!previous || previous.state === 'not_sent')) {
-      const ledgerFile = path.resolve(path.dirname(deliveryFile), '../../..', 'feedback-watch.json');
-      const tracked = fs.existsSync(ledgerFile) && read(ledgerFile).topics?.[job.conversation_id + ':' + job.topic_id]?.armed_at;
-      if (!tracked) { save(deliveryFile, { ...previous, event_id: event.event_id, state: 'superseded', reason: 'Legacy terminal predates feedback supervision; no retrospective wakeup.' }); return false; }
-    }
     if (['sending', 'uncertain'].includes(previous?.state)) {
       if (await options.reconcile?.(event)) { save(deliveryFile, { ...previous, state: 'accepted', reconciled_at: new Date().toISOString() }); return false; }
       save(deliveryFile, { ...previous, state: 'uncertain', action_required: 'No positive host receipt. Inspect recipient history before explicitly replaying; automatic replay is disabled.' }); return false;
@@ -191,11 +185,15 @@ async function deliver(broker, id, send, options = {}) {
     try { const next = read(broker.jobPath(n)); return next.topic_id === job.topic_id && next.execution_followup?.intent === 'resume_after_resolution' && next.execution_followup.blocked_job_ids?.includes(id); } catch { return false; }
   });
   if (newer && (!job.handoff?.requires_user_decision || decisionRecorded) && (!job.execution_block || executionResolved)) {
-    for (const event of events.filter(e => !['notification_check', 'parallel_check', 'subagent_check', 'silence_alert'].includes(e.kind))) {
+    for (const event of events.filter(e => !['notification_check', 'parallel_check', 'subagent_check'].includes(e.kind))) {
       const file = event.file.replace(/\.json$/, '.delivery.json');
       if (!fs.existsSync(file) || read(file).state === 'not_sent') save(file, { state: 'superseded', event_id: event.event_id, reason: 'A newer job continued this matter.' });
     }
-    events = events.filter(e => ['notification_check', 'parallel_check', 'subagent_check', 'silence_alert'].includes(e.kind));
+    events = events.filter(e => {
+      if (['notification_check', 'parallel_check', 'subagent_check'].includes(e.kind)) return true;
+      const file = e.file.replace(/\.json$/, '.delivery.json');
+      return e.kind === 'silence_alert' && fs.existsSync(file) && ['sending', 'uncertain'].includes(read(file).state);
+    });
     if (!events.length) return false; // Explicit diagnostics may use an old job; stale business notices may not.
   }
   if (!events.length) {
@@ -229,7 +227,7 @@ async function deliver(broker, id, send, options = {}) {
       }
     }
     // A quick task can finish before the debounce; show one final receipt, not stale running alerts.
-    if (event !== last && !['notification_check', 'parallel_check', 'subagent_check', 'silence_alert'].includes(event.kind) && (last.kind === 'terminal' || (event.kind === 'started' && last.kind === 'session_ready')) && (!fs.existsSync(file) || read(file).state === 'not_sent')) { save(file, { state: 'superseded', event_id: event.event_id, superseded_by: last.event_id }); continue; }
+    if (event !== last && !['notification_check', 'parallel_check', 'subagent_check'].includes(event.kind) && (last.kind === 'terminal' || (event.kind === 'started' && last.kind === 'session_ready')) && (!fs.existsSync(file) || read(file).state === 'not_sent')) { save(file, { state: 'superseded', event_id: event.event_id, superseded_by: last.event_id }); continue; }
     sent = await deliverEvent(job, event, file, send, options) || sent;
   }
   return sent;
@@ -283,75 +281,8 @@ function auditNotifications(broker, ids, options = {}) {
   if (changed) save(file, ledger);
   return ledger;
 }
-// Independent of worker liveness and per-CLI timeout. Never use routine progress,
-// proposal changes or transport acceptance as proof that the user saw a reply.
-function auditSilence(broker, jobs, now = Date.now()) {
-  const period = 4 * 3600000, groups = new Map(), due = [];
-  for (const job of jobs) {
-    if (!job.topic_id || !uuid(job.conversation_id)) continue;
-    const key = job.conversation_id + ':' + job.topic_id;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(job);
-  }
-  const file = path.join(path.dirname(broker.jobs), 'feedback-watch.json'), release = takeClaim(file + '.claim');
-  if (!release) return due;
-  try {
-    const ledger = fs.existsSync(file) ? read(file) : { schema: 1, topics: {} };
-    let changed = false;
-    for (const [key, rows] of groups) {
-      rows.sort((a, b) => a.created_at.localeCompare(b.created_at) || a.job_id.localeCompare(b.job_id));
-      const latest = rows.at(-1);
-      let previous = ledger.topics[key];
-      const settled = latest.handoff?.requires_user_decision || ['needs_input', 'blocked', 'execution_blocked', 'cancelled'].includes(latest.status) ||
-        (latest.verification_state === 'accepted_with_evidence' && latest.execution_report?.outcome === 'accepted') ||
-        (latest.review_only && latest.stage === 'review_complete' && latest.plan_review?.status === 'approved');
-      if (settled) {
-        const old = ledger.topics[key];
-        if (old?.event_file) {
-          const dfile = old.event_file.replace(/\.json$/, '.delivery.json'), claim = takeClaim(dfile + '.claim');
-          if (claim) try {
-            const delivery = fs.existsSync(dfile) ? read(dfile) : null;
-            if (!delivery || delivery.state === 'not_sent') save(dfile, { ...delivery, state: 'superseded', reason: 'Matter accepted, cancelled or waiting for the human; no stale silence question.' });
-          } finally { claim(); }
-        }
-        continue;
-      }
-      // Enabling a new policy must not wake old chats whose terminal feedback may
-      // already have been handled. Continue watching legacy work only if we saw
-      // it active; new workers persist loop_guard before invoking the CLI.
-      if (!latest.loop_guard && terminal.has(latest.status) && !previous?.armed_at) continue;
-      const unfinished = !terminal.has(latest.status) || ['failed', 'timed_out'].includes(latest.status) || ['review_revise', 'review_needs_evidence'].includes(latest.handoff?.kind) ||
-        latest.execution_state === 'background_unconfirmed' || ['progress', 'no_progress', 'failed'].includes(latest.execution_report?.outcome) ||
-        (latest.status === 'completed' && previous?.armed_at);
-      if (!unfinished) continue; // Legacy completed rounds have unknown business state.
-      if (!previous?.armed_at) {
-        previous = { ...previous, armed_at: now, ...(!latest.loop_guard ? { legacy_start_at: now } : {}) };
-        ledger.topics[key] = previous; changed = true;
-      }
-      let anchor = Date.parse(rows[0].created_at);
-      for (const job of rows) if ((job.verification_state === 'accepted_with_evidence' && job.execution_report?.outcome === 'accepted') ||
-          job.request_context?.followups?.some(f => f.job_id === job.job_id && f.text?.trim())) anchor = Date.parse(job.created_at);
-      if (previous.legacy_start_at) anchor = Math.max(anchor, previous.legacy_start_at);
-      if (previous?.anchor === anchor && previous.event_file) {
-        const dfile = previous.event_file.replace(/\.json$/, '.delivery.json');
-        const delivery = fs.existsSync(dfile) ? read(dfile) : null;
-        // No repeated wakeup while an earlier send is pending or uncertain.
-        if (!delivery || !['accepted', 'sent', 'suppressed', 'superseded'].includes(delivery.state)) { due.push(previous.job_id); continue; }
-      }
-      const last = previous?.anchor === anchor ? previous.created_at : anchor;
-      if (!Number.isFinite(anchor) || now - last < period) continue;
-      const bucket = Math.floor((now - anchor) / period);
-      const event = publishNotification(broker.jobPath(latest.job_id), latest, `silence-${anchor}-${bucket}`, 'silence_alert',
-        `距原事项/真实用户补充已超过四小时，内部续跑与通知接口 accepted 均不证明用户已得到答复。当前 job=${latest.job_id}，状态=${latest.status}；请读取一次该原回执，解释为什么这么久没有回复、当前卡点及最合适的解决方式。不得另开任务或中止现有进程。`);
-      if (event) { ledger.topics[key] = { armed_at: previous.armed_at, ...(previous.legacy_start_at ? { legacy_start_at: previous.legacy_start_at } : {}), anchor, created_at: now, job_id: latest.job_id, event_file: event.file }; changed = true; due.push(latest.job_id); }
-    }
-    if (changed) save(file, ledger);
-    return due;
-  } finally { release(); }
-}
-
 function watch(broker, send, options = {}) {
-  const pending = new Set(), timers = new Map(), offsets = new Map(), known = new Set(), tracked = new Set(), snapshots = new Map(); let draining = false, closed = false, interval, watcher;
+  const pending = new Set(), timers = new Map(), offsets = new Map(), known = new Set(), tracked = new Set(); let draining = false, closed = false, interval, watcher;
   const healthFile = path.join(path.dirname(broker.jobs), 'notification-health.json');
   const health = { pid: process.pid, generation: options.generation || null, interval_ms: options.reconcileMs ?? 15000, last_delivery_at: null, watch_error: null };
   const heartbeat = () => { if (fs.existsSync(path.dirname(healthFile))) save(healthFile, { ...health, checked_at: new Date().toISOString(), tracked_jobs: tracked.size, closed }); };
@@ -393,7 +324,6 @@ function watch(broker, send, options = {}) {
           adaptLegacy(id);
           if (await deliver(broker, id, send, options)) health.last_delivery_at = new Date().toISOString();
           const job = broker.get(id), rows = notificationEvents(broker.jobPath(id));
-          snapshots.set(id, job);
           // Worker status is saved before its terminal outbox event. Do not retire
           // that job in the gap, or a lost final callback will bypass reconciliation.
           const settled = terminal.has(job.status) && ((job.notification_schema !== 2 && rows.length === 0) || rows.some(e => e.kind === 'terminal')) && rows.every(e => {
@@ -421,8 +351,6 @@ function watch(broker, send, options = {}) {
       if (fs.existsSync(alertFile)) for (const g of Object.values(read(alertFile).groups)) if (g.state === 'open') for (const id of g.jobs) ids.add(id);
       const ledger = auditNotifications(broker, ids, options);
       for (const g of Object.values(ledger.groups)) if (g.state === 'open') ids.add(g.alert_job_id);
-      for (const id of ids) try { snapshots.set(id, broker.get(id)); } catch { /* A partial new job is retried. */ }
-      for (const id of auditSilence(broker, [...snapshots.values()], options.now ?? Date.now())) ids.add(id);
       for (const id of ids) { tracked.add(id); pending.add(id); }
       heartbeat(); void drain();
     } catch (error) { health.watch_error = error.message; heartbeat(); process.stderr.write(`Local reconciliation: ${error.message}\n`); }
@@ -459,7 +387,7 @@ function watch(broker, send, options = {}) {
   interval = setInterval(reconcile, health.interval_ms);
   heartbeat(); void drain(); return { close, reconcile };
 }
-module.exports = { originHook, deliver, watch, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications, auditSilence };
+module.exports = { originHook, deliver, watch, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
 if (require.main === module) {
   if (process.argv[2] === '--origin-hook') {
     let input = '';
