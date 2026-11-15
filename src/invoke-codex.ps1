@@ -42,7 +42,7 @@ $resultName = if ($reviewing) { "review-attempt-$attempt.result.txt" } else { "a
 $result = Join-Path (Split-Path -Parent $RequestPath) $resultName
 $commandShell = Join-Path $PSHOME 'pwsh.exe'
 $cliArgs = @('--no-daemon', 'exec', '-C', $job.cwd, '--json', '--color', 'never', '--sandbox', $stageSandbox, '-o', $result,
-    '-c', 'approval_policy="never"', '-c', 'web_search="live"', '-c', 'features.apps=false', '-c', 'features.prefer_mxc=true', '-c', 'features.multi_agent=true')
+    '-c', 'approval_policy="on-request"', '-c', 'approvals_reviewer="auto_review"', '-c', 'web_search="live"', '-c', 'features.apps=false', '-c', 'features.prefer_mxc=true', '-c', 'features.multi_agent=true')
 $cliArgs += @('-c', 'service_tier="default"', '-c', 'features.fast_mode=false')
 # Kept for older CLIs. Modern CLIs may ignore this opt-out; never assume a
 # synchronous shell_command exists merely because the argument was accepted.

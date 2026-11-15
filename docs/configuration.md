@@ -89,7 +89,7 @@ worker 先保存终态再释放事项登记；状态更新与崩溃恢复共用�
 
 ## 权限
 
-后台执行默认使用宿主机当前用户环境：`danger-full-access`、`approval_policy="never"`、`web_search="live"`，不自动提权，也不更改 Codex 全局配置。普通工具接口不提供 `sandbox` 参数；旧调用若传 `read-only` 或 `workspace-write`，后端和派发钩子会在执行前拒绝，不静默改变所请求的环境。只读、不重启、不改文件等约束写进 `prompt`，与执行环境分开。
+后台执行默认使用宿主机当前用户环境：`danger-full-access`、`approval_policy="on-request"`、`approvals_reviewer="auto_review"`、`web_search="live"`，不自动提权，也不更改 Codex 全局配置。非交互执行中，符合条件的审批请求由自动审核处理；已有权限的操作不会因此全部触发审批。被策略拒绝时保留原始证据并按 `execution_blocked` 交接，不绕过拒绝。普通工具接口不提供 `sandbox` 参数；旧调用若传 `read-only` 或 `workspace-write`，后端和派发钩子会在执行前拒绝，不静默改变所请求的环境。只读、不重启、不改文件等约束写进 `prompt`，与执行环境分开。
 
 真实调试使用问题实际发生的环境。本机进程、安装目录、监听端口和本地服务使用宿主机视图；不能根据沙箱内不可见就判断宿主机目标不存在。回执的 `execution_environment` 区分 `host` 与 `sandbox`，表示启动所用模式，实际可见性仍以运行证据为准。
 

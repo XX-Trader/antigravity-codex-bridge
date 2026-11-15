@@ -66,6 +66,7 @@ if ($argv -contains 'app-server') {
 $prompt = $input -join "\n"
 $argv = @($args)
 $implementationContract = $prompt.Contains('规划建议不构成用户硬性约束') -and $prompt.Contains('审核阶段仍只读') -and $prompt.Contains('用户边界内的技术错误由 Codex 自行纠正、实现并验证') -and $prompt.Contains('只审核、不改文件等限制及执行策略拒绝不因技术自主权解除') -and (-not $prompt.Contains('技术方案问题按审核交接修订')) -and (-not $prompt.Contains('建议与原文矛盾时按审核协议退回 technical'))
+if (-not (($argv -contains 'approval_policy="on-request"') -and ($argv -contains 'approvals_reviewer="auto_review"') -and (-not ($argv -contains 'approval_policy="never"')))) { throw 'Approval configuration mismatch' }
 if ($prompt.Contains('MODEL_NOT_FOUND_FIXTURE') -or ($prompt.Contains('MODEL_NOT_FOUND_EXEC_FIXTURE') -and -not $prompt.Contains('当前是独立审核阶段（stage=review）'))) {
   $serviceError = @{ error = @{ code = 'model_not_found'; message = 'The selected model is not supported when using Codex with this account.' } } | ConvertTo-Json -Compress
   @{ type = 'turn.failed'; error = @{ message = $serviceError } } | ConvertTo-Json -Depth 6 -Compress

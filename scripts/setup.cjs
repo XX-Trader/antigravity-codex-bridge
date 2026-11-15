@@ -175,7 +175,7 @@ if (require.main === module) {
       const plan = buildPlan(options);
       if (!options.apply) console.log(JSON.stringify({ state: 'preview', project: plan.project, data: plan.data, files: [...new Set(plan.changes.map(c => c.file))], sidecar: plan.sidecar, next: 'Review paths, then rerun with --apply --trust-full-access. No configuration was written.' }, null, 2));
       else {
-        if (!options['trust-full-access']) throw new Error('This bridge defaults to full filesystem/network access with no approval prompts; pass --trust-full-access only for trusted local projects');
+        if (!options['trust-full-access']) throw new Error('This bridge defaults to full filesystem/network access with automatic review of eligible approval requests; pass --trust-full-access only for trusted local projects');
         if (process.platform !== 'win32') throw new Error('Automatic installation is currently tested on native Windows only');
         console.log(JSON.stringify(apply(plan), null, 2));
       }
