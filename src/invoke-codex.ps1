@@ -1,10 +1,15 @@
 #requires -Version 7.0
 [CmdletBinding()]
-param([string]$RequestPath, [switch]$AppServer, [string]$CodexEntry, [switch]$OriginHook, [switch]$Notify, [string]$ProjectRoot, [string]$McpConfigPath, [string]$NodeEntry)
+param([string]$RequestPath, [switch]$AppServer, [string]$CodexEntry, [switch]$OriginHook, [switch]$Notify, [string]$ProjectRoot, [string]$McpConfigPath, [string]$NodeEntry, [string]$BackgroundRequest)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 $OutputEncoding = [Text.UTF8Encoding]::new($false)
+if ($BackgroundRequest) {
+    if (-not $env:CODEX_EXECUTOR_BACKGROUND_JOB -or -not $env:CODEX_EXECUTOR_BACKGROUND_NODE) { throw 'Background launcher requires a bridge-owned job environment' }
+    & $env:CODEX_EXECUTOR_BACKGROUND_NODE (Join-Path $PSScriptRoot 'background.cjs') --start $BackgroundRequest
+    exit $LASTEXITCODE
+}
 if (($OriginHook -or $Notify) -and -not $NodeEntry) {
     if ($McpConfigPath) {
         $mcp = Get-Content -LiteralPath $McpConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -39,6 +44,9 @@ $commandShell = Join-Path $PSHOME 'pwsh.exe'
 $cliArgs = @('--no-daemon', 'exec', '-C', $job.cwd, '--json', '--color', 'never', '--sandbox', $stageSandbox, '-o', $result,
     '-c', 'approval_policy="never"', '-c', 'web_search="live"', '-c', 'features.apps=false', '-c', 'features.prefer_mxc=true', '-c', 'features.multi_agent=true')
 $cliArgs += @('-c', 'service_tier="default"', '-c', 'features.fast_mode=false')
+# Kept for older CLIs. Modern CLIs may ignore this opt-out; never assume a
+# synchronous shell_command exists merely because the argument was accepted.
+$cliArgs += @('-c', 'features.unified_exec=false')
 if ($stageModel) { $cliArgs += @('-m', $stageModel) }
 $effort = if ($job.settings.reasoning_effort) { $job.settings.reasoning_effort } else { 'medium' }
 $cliArgs += @('-c', ('model_reasoning_effort=' + (ConvertTo-Json -InputObject $effort -Compress)))
@@ -59,6 +67,18 @@ $userFollowups = (@($job.request_context.followups | ForEach-Object { $_.text })
 $executionContinuationContext = if ($job.execution_followup) { @{ followup = $job.execution_followup; constraints = @($job.execution_constraints) } | ConvertTo-Json -Depth 10 -Compress } else { '无执行策略续接声明。' }
 $reviewContext = $job.plan_review | ConvertTo-Json -Depth 12 -Compress
 $reviewReply = if ($job.review_followup) { $job.review_followup | ConvertTo-Json -Depth 6 -Compress } else { '无审核修订答复。' }
+$backgroundRoot = Join-Path (Split-Path -Parent $RequestPath) 'background'
+$backgroundContext = if ($job.background_result) { $job.background_result | ConvertTo-Json -Depth 8 -Compress } else { '无已收集的托管命令。' }
+$backgroundInstruction = if ($reviewing) { '审核阶段不允许启动受控后台命令；所有核查命令必须取得退出结果。' } else {
+@"
+长命令等待契约：不要猜测耗时。秒级命令直接取得退出结果；测试、构建、回测、全量扫描、训练、数据处理等耗时不确定的命令使用下述受控托管，Python 等任何可执行程序均适用。禁止用 exec_command/write_stdin 反复轮询或等待期间播报。features.unified_exec=false 在新版本可能被忽略；只有实际 schema 提供 shell_command/timeout_ms 时才可使用，默认同步超时较短，非秒级命令必须显式传充足 timeout_ms，绝不伪造不存在的参数或宣称已切换同步工具。
+受控启动：在 $backgroundRoot 内写一个无 BOM UTF-8 JSON 请求文件，格式为 {"executable":"现有解释器或程序的绝对路径","args":["各个原样参数"],"cwd":"当前任务目录或其子目录"}。使用参数数组，不拼接 shell 命令；Python 脚本仍由指定 python.exe 原样执行，Node 只托管进程。运行 & '$commandShell' -NoProfile -File '$PSCommandPath' -BackgroundRequest '请求文件绝对路径'，该快速交接命令显式使用 yield_time_ms=30000 取得提交结果。包装器仅提交请求，返回 [CODEX_BACKGROUND_WAIT] 及 {"id":"真实生成的命令ID"}，此时不代表业务进程已启动；必须原样作为本轮最终回复立即结束，不再读日志、轮询、播报或运行下一步，也不附执行报告。CLI退出后才由worker启动业务进程，避免后台进程拖延CLI退出。提交报错或结果未知时核对原登记，不重放提交。不得自行拼造PID或交接ID。普通未知后台命令继续用 [CODEX_BACKGROUND_RUNNING]，不能自动接管。
+此后 worker 在本地每60秒检查，期间不调用模型；完成文件落盘立即响应。等待受本任务剩余总时限保护，取消只终止身份匹配的所属进程树。完成后自动 resume 本会话。
+最近已收集的托管结果：$backgroundContext
+续跑时先核对上述真实退出码、状态和日志尾部，再执行后续步骤；严禁重复启动已经收集的命令。exit_code=null 表示退出未确认，应诊断，不能当成功。
+托管结果中的 id 只是后台命令ID，不是 CLI 工具 item ID，禁止填入 evidence_item_ids。最终报告优先用本轮成功命令逐字输出的 evidence_outputs；只有真正已知的本轮 CLI item ID 才可作为证据ID，不能用后台ID或会话ID代替。
+"@
+}
 $executionIntro = if ($job.context_review) { '当前续接同一事项的原生会话（stage=execute），复用已有审核讨论上下文，不另开独立审核轮次。本轮方案仍由你自行核查，不表示自动通过。历史审核记录：' + ($job.context_review | ConvertTo-Json -Depth 8 -Compress) + '。本轮修订说明：' + $reviewReply } else { '当前是已通过审核的执行阶段（stage=execute）。审核记录：' + $reviewContext }
 $implementationAuthority = '规划建议不构成用户硬性约束。用户明确的目标、限制、验收条件和授权必须保留；规划端自行提出的函数、伪代码、线程/锁顺序和根因假设仅是待核查建议，不因用户同意总体目标就升级为用户指定技术路线。用户边界内的技术错误由 Codex 自行纠正、实现并验证，不仅因建议写法有错就退回。审核阶段仍只读：能核实并在原用户授权内给出可行修正时，将修正依据和实施边界记录在审核结论与 allowed_scope，通过后才实施；不能仅口头同意或无证据批准。执行阶段先暂停受错误假设影响的动作，完成必要核查后自行修正并继续；只有确实缺少关键证据且无法自行补齐、没有可行修正，或需改变用户目标/明确限制/验收/授权时才交回讨论或请求用户决定。只审核、不改文件等限制及执行策略拒绝不因技术自主权解除。'
 $executionScope = if ($job.context_review) { '结合本会话历史、用户原文、最新补充及实际代码/日志自行审核本轮建议；先处理历史未解决的修订与补证问题。能在用户既有授权内自行查明或修正的技术问题直接处理，再继续执行，不为每个后续方案额外安排审核轮次。不能把历史 approved、allowed_scope 或 context 状态当作新方案已经通过；先核实变化及当前授权。证据不足或方案仍不成立时返回具体问题、依据和修订建议；需要改变用户目标、明确限制、验收或授权时仍须用户决定。' } else { '在本轮用户授权与 allowed_scope 的边界内实施；技术写法可按实际证据自行纠正，说明调整依据并完成必要验证，不重复要求用户批准已授权事项。' }
@@ -84,6 +104,8 @@ $executionScope 审核判断不等于业务验收通过。若新的代码、日�
 $instruction = @"
 你是由 Antigravity 委派的 Codex 执行者。负责实际读取、定位、改动、命令、测试和证据回读，不把工作再次转交给 Antigravity 或调用本桥接递归委派。
 $reviewInstruction
+$backgroundInstruction
+本轮累计执行时限为 $($job.timeout_seconds) 秒（容量等待不计入）；及时保留必要证据并在时限内反馈。检索仅按任务需要进行；查询前核对入口是否会自动重建索引，优先使用工具支持的仅查现有索引模式。索引过期或缺失时如实说明，需要重建则单独评估工作量和剩余时限，不把重建藏在普通查询中。已确定阻塞时，可选检索或索引刷新不得拖延最终阻塞反馈。必需证据和既有验收门禁不得跳过或降低。
 $implementationAuthority
 验收分工：Antigravity 根据用户确认的待办提供业务验收要求，你负责实现、设计必要技术测试并运行验证；区分用户明确要求与规划端建议的技术测试，不把后者自动升级为用户不可变条件，也不为过关删除合理检查或隐去失败，不默认另开专门审核 agent。按风险覆盖正常、异常、边界、重试/取消/重启恢复、组合回归及必要的资源/性能场景；发现标准遗漏时主动补充，不能降低已有门槛。分别记录通过、失败、跳过和未测；真实运行目标不能只用 mock 或单元测试代替。已有子 agent 能力保留，仅在任务确实需要或用户明确要求时使用，不为验收额外增加审核角色。
 需要细分时允许由你调用 Codex 自己的原生 spawn_agent、wait 等子 agent 工具，子 agent 也必须是 Codex 执行端。明确子任务文件范围并汇总真实子 agent ID、结果和未完成项；不能让 Antigravity 原生 invoke_subagent/define_subagent 代执行，也不能把多个顶层 CLI 会话冒充原生子 agent。禁止通过本 MCP 再次调用 Codex 的防递归保护不等于禁止 Codex 原生子 agent。原生能力不可用时如实报告，不能用 Antigravity 执行冒充。

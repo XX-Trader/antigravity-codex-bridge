@@ -131,6 +131,16 @@ $text += ' policy_contract=' + ($prompt.Contains('执行策略拒绝与方案不
 $text += ' execution_diag=' + $prompt.Contains('"intent":"diagnose"')
 $text += ' context_check=' + $prompt.Contains('本轮方案仍由你自行核查，不表示自动通过')
 $text += ' self_repair=' + $implementationContract
+$text += ' controlled_contract=' + (($argv -contains 'features.unified_exec=false') -and $prompt.Contains('禁止用 exec_command/write_stdin 反复轮询') -and $prompt.Contains('Python 等任何可执行程序均适用'))
+if ($prompt.Contains('CONTROLLED_BACKGROUND_FIXTURE') -and -not $prompt.Contains('"status_file"')) {
+  $bgRoot = Join-Path (Split-Path -Parent $env:CODEX_EXECUTOR_BACKGROUND_JOB) 'background'
+  $requestFile = Join-Path $bgRoot 'fixture-request.json'
+  $delay = if ($prompt.Contains('CONTROLLED_CANCEL') -or $prompt.Contains('CONTROLLED_TIMEOUT')) { 120000 } else { 4000 }
+  $request = @{ executable = $env:CODEX_EXECUTOR_BACKGROUND_NODE; args = @('-e', ('setTimeout(()=>{console.log("CONTROLLED_COMMAND_COMPLETE")},' + $delay + ')')); cwd = (Get-Location).Path }
+  [IO.File]::WriteAllText($requestFile, ($request | ConvertTo-Json -Depth 5 -Compress), [Text.UTF8Encoding]::new($false))
+  $text = (& $env:CODEX_EXECUTOR_BACKGROUND_NODE '${path.join(__dirname, '../src/background.cjs').replace(/'/g, "''")}' --start $requestFile) -join [Environment]::NewLine
+  if ($LASTEXITCODE -ne 0) { throw 'controlled fixture startup failed' }
+}
 if ($prompt.Contains('NEEDS_INPUT_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT] 请确认选择A还是B' }
 if ($prompt.Contains('STRUCTURED_QUESTION_FIXTURE')) { $text = '[CODEX_NEEDS_INPUT]' + [Environment]::NewLine + '{"question":"选择工作树还是等待？","options":["工作树：隔离修改","等待：复用目录"],"recommendation":"等待","completed":"已定位文件范围"}' }
 if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { $text = '[CODEX_BACKGROUND_RUNNING] 测试命令 test-pending 退出结果未确认，请勿重跑。' }
@@ -587,6 +597,41 @@ exit 0
       assert.deepEqual(both.handoff.options, ['补齐原方案', '修改要求']);
       assert.equal(new Broker(host.settings).result(reported.job_id).status, 'execution_blocked');
     });
+    await t.test('controlled command waits locally then resumes the same thread without an intermediate terminal', { timeout: 120000 }, async () => {
+      const job = await broker.run({ prompt: 'CONTROLLED_BACKGROUND_FIXTURE', topic: '受控后台闭环', timeout_seconds: 90 });
+      const result = await broker.wait(job.job_id);
+      assert.equal(result.status, 'completed');
+      assert.equal(result.attempt_total, 2);
+      assert.match(result.final_response, /resume=True/);
+      assert.match(result.final_response, /controlled_contract=True/);
+      const saved = broker.get(job.job_id);
+      assert.equal(saved.background_result.exit_code, 0);
+      assert.match(saved.background_result.output_tail, /CONTROLLED_COMMAND_COMPLETE/);
+      assert.equal(saved.loop_guard.failed_rounds || 0, 0);
+      const events = fs.readFileSync(result.paths.events, 'utf8').trim().split('\n').map(JSON.parse);
+      const begin = events.findIndex(e => e.type === 'bridge.background.wait');
+      const end = events.findIndex(e => e.type === 'bridge.background.completed');
+      assert.ok(begin > 0 && end > begin);
+      assert.ok(events.slice(begin + 1, end).every(e => e.type === 'bridge.background.check'));
+      assert.equal(events[end].thread_id, result.session_id);
+      assert.equal(events.filter(e => e.type === 'bridge.attempt' && e.stage === 'execute').length, 2);
+      const notices = saved.job_id && fs.readdirSync(path.dirname(broker.jobPath(job.job_id))).filter(n => n.startsWith('notification'));
+      assert.ok(notices);
+    });
+    await t.test('worker controlled cancellation and total deadline stop the owned tree without resume', { timeout: 180000 }, async () => {
+      for (const mode of ['CANCEL', 'TIMEOUT']) {
+        const initial = await broker.run({ prompt: 'CONTROLLED_BACKGROUND_FIXTURE CONTROLLED_' + mode, topic: '受控边界' + mode, timeout_seconds: 30 });
+        if (mode === 'CANCEL') {
+          for (let n = 0; n < 200 && broker.get(initial.job_id).status !== 'waiting_background'; n++) await sleep(100);
+          assert.equal(broker.get(initial.job_id).status, 'waiting_background');
+          broker.cancel(initial.job_id);
+        }
+        const result = await broker.wait(initial.job_id), saved = broker.get(initial.job_id);
+        assert.equal(result.status, mode === 'CANCEL' ? 'cancelled' : 'timed_out');
+        assert.equal(saved.termination.requested, true);
+        assert.equal(saved.attempts.length, 1, 'no model resume on cancellation/deadline');
+      }
+    });
     await t.test('structured question resumes exact topic/session with user answer; background command is not verified', async () => {
       const paused = await broker.run({ wait: true, prompt: 'STRUCTURED_QUESTION_FIXTURE', topic: '选择题交接' });
       assert.equal(paused.status, 'needs_input'); assert.equal(paused.handoff.question, '选择工作树还是等待？');
@@ -696,6 +741,12 @@ exit 0
 
 
 test('native chat links are restart-stable and reject URI injection', async () => {
+  const offline = toolResponse({ notification: { service: { online: false } } });
+  assert.equal(offline.isError, false);
+  assert.match(offline.content[1].text, /通知服务当前离线/);
+  assert.match(offline.content[1].text, /不要因此重派/);
+  assert.equal(toolResponse({ notification: { service: { online: true } } }).content.length, 1);
+  assert.equal(toolResponse({ notification: { service: { online: null } } }).content.length, 1);
   const id = '00000000-0000-0000-0000-000000000003';
   const expected = 'vscode://openai.chatgpt/local/' + id;
   assert.equal(chatAccess(id).vscode_uri, expected);
@@ -753,6 +804,18 @@ test('persisted chat links, progress and long results survive broker restart wit
     const progress = latestProgress(path.join(jobDir, 'events.jsonl'));
     assert.equal(progress.event_type, 'item.started'); assert.equal(progress.text.length, 2000); assert.equal(progress.text_truncated, true);
     assert.equal(latestProgress(path.join(root, 'missing.jsonl')), null);
+    const oldId = '1234567890abcdef12345679';
+    fs.mkdirSync(path.dirname(b.jobPath(oldId)));
+    save(b.jobPath(oldId), { job_id: oldId, status: 'timed_out', timeout_seconds: 1800, cwd: root, created_at: '2026-10-30T00:00:00Z' });
+    const oldReceipt = restarted.receipt(oldId);
+    assert.equal(oldReceipt.termination.requested, null);
+    assert.match(oldReceipt.termination.note, /无法确认/);
+    const takeoverId = '1234567890abcdef12345670';
+    fs.mkdirSync(path.dirname(b.jobPath(takeoverId)));
+    save(b.jobPath(takeoverId), { job_id: takeoverId, status: 'needs_input', prior_status: 'timed_out', timeout_seconds: 30, termination: { requested: true, note: '已请求终止所属进程树，不能证明全部进程已退出。' }, cwd: root, created_at: '2026-10-30T00:00:00Z' });
+    const takeoverReceipt = restarted.receipt(takeoverId);
+    assert.equal(takeoverReceipt.stop_reason, 'execution_time_limit');
+    assert.equal(takeoverReceipt.termination.requested, true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -781,4 +844,58 @@ test('native task titles use the concrete task and metadata only, preserving man
   await assert.rejects(syncTaskTitle(job, async (_s, method) => { if (method === 'thread/read') return { thread: { id, cwd } }; throw Error('metadata unavailable'); }), /metadata unavailable/);
   const pending = await syncTaskTitle({ ...job, thread_id: null }, () => { throw Error('No native request without ID'); });
   assert.equal(pending.status, 'pending');
+});
+
+test('worker timeout diagnostics', async t => {
+  const root = fs.mkdtempSync(path.join(process.env.CODEX_EXECUTOR_TEST_ROOT, 'timeout-'));
+  const project = path.join(root, 'project'), data = path.join(root, 'data'), entry = path.join(root, 'slow-codex.ps1');
+  fs.mkdirSync(project); fs.mkdirSync(data);
+  fs.writeFileSync(entry, '[Console]::In.ReadToEnd() | Out-Null\nStart-Sleep -Seconds 60\n', 'utf8');
+  const settings = config({ CODEX_EXECUTOR_PROJECT: project, CODEX_EXECUTOR_DATA: data, CODEX_EXECUTOR_ENTRY: entry, CODEX_EXECUTOR_PWSH: process.env.CODEX_EXECUTOR_PWSH, CODEX_EXECUTOR_ALLOW_SANDBOX: '1' });
+  const broker = new Broker(settings);
+  try {
+    await t.test('exhausted execution budget persists a timeout receipt and specific terminal notice', async () => {
+      const id = require('node:crypto').randomBytes(12).toString('hex'), file = broker.jobPath(id);
+      fs.mkdirSync(path.dirname(file));
+      save(file, { job_id: id, status: 'queued', created_at: new Date().toISOString(), cwd: project,
+        sandbox: 'read-only', prompt: '预算耗尽', request_context: { original_text: '预算耗尽', followups: [] },
+        topic_id: id, conversation_id: '00000000-0000-0000-0000-000000000003', timeout_seconds: 30, execution_used_ms: 30000, settings });
+      fs.writeFileSync(path.join(path.dirname(file), 'events.jsonl'), JSON.stringify({ type: 'item.started', item: { type: 'command_execution', command: 'x'.repeat(3000), aggregated_output: '最近进度' } }) + '\n');
+      await worker(file);
+      const receipt = broker.receipt(id);
+      assert.equal(receipt.status, 'timed_out');
+      assert.equal(receipt.stop_reason, 'execution_time_limit');
+      assert.equal(receipt.timeout_seconds, 30);
+      assert.equal(receipt.termination.requested, false);
+      assert.match(receipt.unconfirmed_commands_note, /最终结果/);
+      assert.equal(receipt.progress.text, '最近进度');
+      assert.equal(receipt.progress.command.length, 2000);
+      assert.equal(receipt.progress.command_truncated, true);
+      const persisted = JSON.parse(fs.readFileSync(receipt.paths.receipt, 'utf8'));
+      assert.equal(persisted.stop_reason, 'execution_time_limit');
+      assert.equal(persisted.progress.text, '最近进度');
+      const notices = require('../src/server.cjs').notificationEvents(file);
+      assert.ok(notices.some(event => event.kind === 'terminal' && /30 秒/.test(event.detail)));
+    });
+    await t.test('running mock process times out and records the termination request', { timeout: 90000 }, async () => {
+      const id = require('node:crypto').randomBytes(12).toString('hex'), file = broker.jobPath(id);
+      fs.mkdirSync(path.dirname(file));
+      save(file, { job_id: id, status: 'queued', created_at: new Date().toISOString(), cwd: project,
+        sandbox: 'read-only', prompt: 'SLOW_FIXTURE', request_context: { original_text: '测试运行中超时', followups: [] },
+        topic_id: id, conversation_id: '00000000-0000-0000-0000-000000000003', timeout_seconds: 30, execution_used_ms: 27000, settings });
+      await worker(file);
+      const receipt = broker.receipt(id);
+      assert.equal(receipt.status, 'timed_out');
+      assert.equal(receipt.stop_reason, 'execution_time_limit');
+      assert.equal(receipt.timeout_seconds, 30);
+      assert.equal(receipt.termination.requested, true);
+      assert.match(receipt.termination.note, /不能证明全部进程已退出/);
+      const persisted = JSON.parse(fs.readFileSync(receipt.paths.receipt, 'utf8'));
+      assert.equal(persisted.stop_reason, 'execution_time_limit');
+      assert.equal(persisted.termination.requested, true);
+      assert.match(persisted.termination.note, /不能证明全部进程已退出/);
+      const notices = require('../src/server.cjs').notificationEvents(file);
+      assert.ok(notices.some(event => event.kind === 'terminal' && /30 秒/.test(event.detail)));
+    });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

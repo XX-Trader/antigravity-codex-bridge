@@ -9,6 +9,7 @@ const crypto = require('node:crypto');
 const readline = require('node:readline');
 const { spawn, spawnSync } = require('node:child_process');
 const { executionReport, loopState, takeover } = require('./loop-guard.cjs');
+const backgroundTask = require('./background.cjs');
 const { ModelPolicyError, selectedModel, modelPolicy, executionRoute, assertAvailable, validateJobModels, unsupportedModel } = require('./model-policy.cjs');
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'timed_out', 'needs_input', 'blocked', 'execution_blocked', 'review_revise', 'review_needs_evidence']);
@@ -144,13 +145,14 @@ function reviewOutcome(text, job, violation = '') {
     handoff: status === 'approved' ? null : { ...finalHandoff(text), requires_user_decision: body.decision_scope === 'user' } };
 }
 function finalHandoff(text = '') {
-  const match = text.trimStart().match(/^\[CODEX_(NEEDS_INPUT|BLOCKED|PLAN_REJECTED|EXECUTION_BLOCKED|BACKGROUND_RUNNING|REVIEW_REVISE|REVIEW_NEEDS_EVIDENCE)\]\s*([\s\S]*)$/);
+  const match = text.trimStart().match(/^\[CODEX_(NEEDS_INPUT|BLOCKED|PLAN_REJECTED|EXECUTION_BLOCKED|BACKGROUND_RUNNING|BACKGROUND_WAIT|REVIEW_REVISE|REVIEW_NEEDS_EVIDENCE)\]\s*([\s\S]*)$/);
   if (!match) return null;
   const body = match[2].trim(), structured = handoffObject(body);
   const execution = match[1] === 'EXECUTION_BLOCKED' || (match[1] !== 'PLAN_REJECTED' && structured?.blocker_type === 'execution_policy');
-  const kind = execution ? 'execution_blocked' : { NEEDS_INPUT: 'needs_input', BLOCKED: 'blocked', PLAN_REJECTED: 'blocked', BACKGROUND_RUNNING: 'background_running', REVIEW_REVISE: 'review_revise', REVIEW_NEEDS_EVIDENCE: 'review_needs_evidence' }[match[1]];
+  const kind = execution ? 'execution_blocked' : { NEEDS_INPUT: 'needs_input', BLOCKED: 'blocked', PLAN_REJECTED: 'blocked', EXECUTION_BLOCKED: 'execution_blocked', BACKGROUND_RUNNING: 'background_running', BACKGROUND_WAIT: 'background_wait', REVIEW_REVISE: 'review_revise', REVIEW_NEEDS_EVIDENCE: 'review_needs_evidence' }[match[1]];
   const handoff = { kind, text: body.slice(0, 8000) };
   if (structured && typeof structured === 'object' && !Array.isArray(structured)) {
+    if (kind === 'background_wait') handoff.controlled_id = structured.id;
     for (const key of ['question', 'recommendation', 'completed', 'reason', 'original_plan', 'impact', 'blocked_action', 'reported_cause', 'decision_scope', 'suggested_changes']) if (typeof structured[key] === 'string') handoff[key] = structured[key].slice(0, 3000);
     for (const key of ['options', 'known_facts', 'unknowns', 'affected_checks', 'evidence']) if (Array.isArray(structured[key])) handoff[key] = structured[key].filter(v => typeof v === 'string').slice(0, 12).map(v => v.slice(0, 1000));
     if (Array.isArray(structured.completed)) handoff.completed = structured.completed.filter(v => typeof v === 'string').slice(0, 12).map(v => v.slice(0, 1000)).join('\n');
@@ -410,7 +412,7 @@ function latestProgress(file) {
     if (!item || !['agent_message', 'command_execution'].includes(item.type)) continue;
     const text = item.text || item.aggregated_output || '';
     return { event_type: event.type, item_type: item.type, ...(item.id ? { item_id: item.id } : {}),
-      ...(item.command ? { command: item.command } : {}), text: text.slice(-2000), text_truncated: text.length > 2000,
+      ...(item.command ? { command: String(item.command).slice(0, 2000), command_truncated: String(item.command).length > 2000 } : {}), text: text.slice(-2000), text_truncated: text.length > 2000,
       ...(item.exit_code !== undefined ? { exit_code: item.exit_code } : {}),
       note: 'Last persisted event, not a live heartbeat or proof that the task succeeded.' };
   }
@@ -419,6 +421,7 @@ function latestProgress(file) {
 function toolResponse(value) {
   const content = [{ type: 'text', text: JSON.stringify(value) }];
   const rows = Array.isArray(value) ? value : Array.isArray(value?.sessions) ? value.sessions : [value];
+  if (rows.some(row => row?.notification?.service?.online === false)) content.push({ type: 'text', text: '自动通知服务当前离线，不能承诺完成后自动提醒。任务记录仍可读取；请在宿主中恢复 Sidecar，再核对通知健康状态。不要因此重派原任务。' });
   const seen = new Set();
   for (const row of rows) {
     const chat = row?.chat;
@@ -477,6 +480,7 @@ class Broker {
       job = current;
       if (!fs.existsSync(crashFile) && (Date.now() - Date.parse(job.created_at) <= 15000 || alive(job.worker_pid || workerPid))) return job;
       // Keep the exact session owned while its child may still run; other matters remain independent.
+      if (job.background_wait) return { ...job, status: 'orphaned', error: 'Worker exited during owned background wait; preserve registration and session, never replay the command' };
       if (alive(job.child_pid)) return { ...job, status: 'orphaned', error: 'Worker exited but Codex may still run; inspect this owned job before retrying' };
       const dir = path.dirname(file), result = path.join(dir, 'result.txt');
       const handoff = fs.existsSync(result) ? finalHandoff(fs.readFileSync(result, 'utf8')) : null;
@@ -517,7 +521,7 @@ class Broker {
     } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
   summary(job) {
-    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'chat_title', 'notification_error', 'concurrency', 'handoff', 'plan_decision', 'stage', 'plan_review', 'review_followup', 'execution_block', 'execution_followup', 'execution_constraints', 'execution_state', 'verification_state', 'background_commands', 'execution_route', 'configuration_error', 'context_review', 'review_route', 'review_only', 'loop_guard', 'loop_reset', 'execution_report', 'repair_round_failed'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), request_context: requestContextSummary(job), execution_environment: job.sandbox === 'danger-full-access' ? 'host' : 'sandbox', chat: chatAccess(job.thread_id), notification: job.job_id ? notificationSummary(this.jobPath(job.job_id)) : null, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
+    return { ...Object.fromEntries(['job_id', 'status', 'cwd', 'sandbox', 'thread_id', 'topic_id', 'topic', 'conversation_id', 'created_at', 'started_at', 'ended_at', 'exit_code', 'error', 'worker_pid', 'child_pid', 'parent_job_id', 'attempt', 'capacity_retry_at', 'execution_used_ms', 'timeout_seconds', 'termination', 'prior_status', 'chat_title', 'notification_error', 'concurrency', 'handoff', 'plan_decision', 'stage', 'plan_review', 'review_followup', 'execution_block', 'execution_followup', 'execution_constraints', 'execution_state', 'verification_state', 'background_commands', 'execution_route', 'configuration_error', 'context_review', 'review_route', 'review_only', 'loop_guard', 'loop_reset', 'execution_report', 'repair_round_failed'].filter(k => job[k] !== undefined).map(k => [k, job[k]])), request_context: requestContextSummary(job), execution_environment: job.sandbox === 'danger-full-access' ? 'host' : 'sandbox', chat: chatAccess(job.thread_id), notification: job.job_id ? notificationSummary(this.jobPath(job.job_id)) : null, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6) };
   }
   start(input, resumption = null) {
     if (process.env.CODEX_EXECUTOR_CHILD === '1') throw new Error('Recursive Codex delegation is disabled');
@@ -671,15 +675,19 @@ class Broker {
       }
     }
     const receiptFile = path.join(dir, 'receipt.json');
-    if (terminal.has(job.status) && !fs.existsSync(receiptFile)) createOnce(receiptFile, { ...this.summary(job), ...(job.conversation_id ? { conversation_id: job.conversation_id } : {}), ...(usage ? { usage } : {}), result_bytes: size, result_file: resultFile });
+    const progress = latestProgress(path.join(dir, 'events.jsonl'));
+    const timeoutDetails = (job.status === 'timed_out' || job.prior_status === 'timed_out') ? { stop_reason: 'execution_time_limit', timeout_seconds: job.timeout_seconds, termination: job.termination || { requested: null, note: '历史记录未保存终止请求状态，无法确认。' }, unconfirmed_commands_note: '列出的命令退出状态未确认；不得将最近进度视为最终结果。' } : {};
+    if (terminal.has(job.status) && !fs.existsSync(receiptFile)) createOnce(receiptFile, { ...this.summary(job), ...(job.conversation_id ? { conversation_id: job.conversation_id } : {}), ...(usage ? { usage } : {}), ...timeoutDetails, ...((job.status === 'timed_out' || job.prior_status === 'timed_out') ? { progress, background_commands: job.background_commands || [] } : {}), result_bytes: size, result_file: resultFile });
     return {
       job_id: id, status: job.status, sandbox: job.sandbox, execution_environment: job.sandbox === 'danger-full-access' ? 'host' : 'sandbox', cwd: job.cwd, session_id: job.thread_id || null, chat: chatAccess(job.thread_id), chat_title: job.chat_title || null, topic_id: job.topic_id || null, topic: job.topic || null,
       model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6), ...(job.capacity_retry_at ? { capacity_retry_at: job.capacity_retry_at } : {}),
       ...(job.conversation_id ? { conversation_id: job.conversation_id } : {}),
       exit_code: job.exit_code ?? null, ...(job.error ? { error: job.error } : {}),
+      background_wait: job.background_wait || null, background_result: job.background_result || null,
+      ...timeoutDetails,
       execution_route: job.execution_route || null, configuration_error: job.configuration_error || null, context_review: job.context_review || null, review_route: job.review_route || null, review_only: job.review_only === true, loop_guard: job.loop_guard || null, execution_report: job.execution_report || null, request_context: requestContextSummary(job), stage: job.stage || null, plan_review: job.plan_review || null, review_followup: job.review_followup || null, handoff: job.handoff || null, plan_decision: job.plan_decision || null, execution_block: job.execution_block || null, execution_followup: job.execution_followup || null, execution_constraints: job.execution_constraints || [], execution_state: job.execution_state || (terminal.has(job.status) ? 'cli_finished' : 'running'), verification_state: job.verification_state || 'not_verified', background_commands: job.background_commands || [],
       final_response: tail(resultFile, 8000), result_truncated: size > 8000,
-      progress: latestProgress(path.join(dir, 'events.jsonl')), notification: notificationSummary(this.jobPath(id)),
+      progress, notification: notificationSummary(this.jobPath(id)),
       ...(usage ? { usage } : {}),
       acceptance: 'CLI completion is not business acceptance; review the returned evidence.',
       paths: { receipt: path.join(dir, 'receipt.json'), result: resultFile, events: path.join(dir, 'events.jsonl'), stderr: path.join(dir, 'stderr.log') }
@@ -780,7 +788,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
   let job = read(file);
   const dir = path.dirname(file), broker = new Broker(job.settings);
   const events = fs.openSync(path.join(dir, 'events.jsonl'), 'a'), stderr = fs.openSync(path.join(dir, 'stderr.log'), 'a');
-  let stopReason, finalChanges = null;
+  let stopReason, finalChanges = null, terminationRequested = false;
   const update = changes => {
     if (finalChanges) { finalChanges = { ...finalChanges, ...changes }; job = { ...job, ...changes }; }
     else job = changeJob(file, current => ({ ...current, ...changes }));
@@ -799,6 +807,28 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
   };
   const configurationFailure = reason => finish({ status: 'blocked', configuration_error: { kind: 'model_configuration', reason }, error: reason, handoff: null, execution_state: 'model_not_started', verification_state: 'not_run', ended_at: stamp() });
   let executionUsed = job.execution_used_ms || 0;
+  const collectBackground = async id => {
+    if (!job.thread_id) throw new Error('Controlled background wait requires the original thread ID');
+    update({ status: 'waiting_background', child_pid: null, execution_state: 'waiting_background', verification_state: 'pending', execution_used_ms: executionUsed, background_wait: { id, started_at: stamp() } });
+    fs.writeSync(events, JSON.stringify({ type: 'bridge.background.wait', id, thread_id: job.thread_id, at: stamp() }) + '\n');
+    const activationStarted = Date.now();
+    if (fs.existsSync(path.join(dir, 'cancel')) || executionUsed >= job.timeout_seconds * 1000) {
+      stopReason = fs.existsSync(path.join(dir, 'cancel')) ? 'cancelled' : 'timed_out';
+      finish({ status: stopReason, termination: { requested: false, reason: 'Command was not started' }, ended_at: stamp() }); return false;
+    }
+    const activated = await backgroundTask.activate(file, id);
+    executionUsed += Date.now() - activationStarted;
+    const result = await backgroundTask.wait(file, id, { activated, timeoutMs: Math.max(0, job.timeout_seconds * 1000 - executionUsed),
+      ...(clock.backgroundIntervalMs !== undefined ? { intervalMs: clock.backgroundIntervalMs } : {}),
+      onCheck: check => fs.writeSync(events, JSON.stringify({ type: 'bridge.background.check', ...check }) + '\n') });
+    executionUsed += result.elapsed_ms;
+    fs.writeSync(events, JSON.stringify({ type: 'bridge.background.completed', ...result, output_tail: undefined, at: stamp(), thread_id: job.thread_id }) + '\n');
+    update({ background_result: result, background_wait: null, execution_used_ms: executionUsed });
+    if (result.reason) { stopReason = result.reason; finish({ status: stopReason, termination: result.termination, execution_state: stopReason, verification_state: 'pending', ended_at: stamp() }); return false; }
+    backgroundTask.release(file, id);
+    update({ status: 'running', execution_state: 'background_collected' });
+    return true;
+  };
   let policySettings;
   try {
     policySettings = liveReviewSettings(job.settings);
@@ -828,9 +858,16 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
     }
     if (job.stage !== 'execute' && !job.review_route) update({ review_route: reviewRoute(job, liveReviewSettings(job.settings)), stage: 'review' });
     if (!job.plan_review || (job.stage === 'review' && job.plan_review.status === 'pending' && job.plan_review.plan_sha256 !== reviewVersion(job))) update({ stage: 'review', plan_review: { status: 'pending', plan_sha256: reviewVersion(job), allowed_scope: [], evidence: [] } });
-    update({ status: 'running', started_at: stamp(), worker_pid: process.pid, attempts: [] });
+    const recovery = job.background_wait;
+    // Reattach an explicitly restarted owned worker to its saved wait. Never
+    // launch another model or replay the command before collecting that result.
+    update({ status: 'running', started_at: job.started_at || stamp(), worker_pid: process.pid, attempts: recovery ? job.attempts || [] : [] });
     notify('started', 'started', job.context_review ? '已续接原会话，由 Codex 结合上下文核查本轮方案。' : '已开始独立核查方案；审核通过后才进入执行。');
-    for (let attempt = 1; ; attempt++) {
+    if (recovery) {
+      executionUsed += Math.max(0, Date.now() - Date.parse(recovery.started_at));
+      if (!await collectBackground(recovery.id)) return;
+    }
+    for (let attempt = recovery ? (job.attempt || 0) + 1 : 1; ; attempt++) {
       if (fs.existsSync(path.join(dir, 'cancel'))) { stopReason = 'cancelled'; break; }
       if (executionUsed >= job.timeout_seconds * 1000) { stopReason = 'timed_out'; break; }
       const started = clock.now(), deadline = Date.now() + job.timeout_seconds * 1000 - executionUsed;
@@ -849,7 +886,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       const openCommands = new Map(), evidenceItems = new Map();
       const stop = reason => {
         if (killSent || !child || child.exitCode !== null) return;
-        stopReason = reason; killSent = true;
+        stopReason = reason; killSent = true; terminationRequested = true;
         if (process.platform === 'win32') {
           const killer = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, encoding: 'utf8' });
           fs.writeSync(stderr, '\nowned-child cancellation: exit=' + killer.status + '\n' + (killer.stdout || '') + (killer.stderr || ''));
@@ -857,9 +894,10 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       };
       let outcome;
       const stderrOffset = fs.fstatSync(stderr).size;
+      if (!reviewing) fs.mkdirSync(path.join(dir, 'background'), { recursive: true });
       try {
         child = spawn(job.settings.pwsh, ['-NoProfile', '-NonInteractive', '-File', path.join(__dirname, 'invoke-codex.ps1'), '-RequestPath', file], {
-          cwd: job.cwd, windowsHide: true, detached: process.platform !== 'win32', env: childEnvironment(), stdio: ['ignore', 'pipe', 'pipe']
+          cwd: job.cwd, windowsHide: true, detached: process.platform !== 'win32', env: { ...childEnvironment(), CODEX_EXECUTOR_BACKGROUND_JOB: file, CODEX_EXECUTOR_BACKGROUND_NODE: process.execPath }, stdio: ['ignore', 'pipe', 'pipe']
         });
         update({ child_pid: child.pid }); child.stderr.on('data', data => fs.writeSync(stderr, data));
         const lines = readline.createInterface({ input: child.stdout });
@@ -921,6 +959,10 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       let handoff = finalHandoff(final);
       const execution_block = executionBlock(handoff, attemptStderr, job.job_id);
       const background = [...openCommands.values()].slice(0, 20), pendingBackground = background.length > 0 || handoff?.kind === 'background_running';
+      if (!reviewing && successful && !execution_block && handoff?.kind === 'background_wait') {
+        if (!await collectBackground(handoff.controlled_id)) break;
+        continue;
+      }
       if (reviewing && !execution_block && !['needs_input', 'blocked', 'background_running'].includes(handoff?.kind) && (!stopReason || reviewWrite)) {
         const review = reviewOutcome(final, job, reviewWrite ? '审核阶段出现文件变更事件，已暂停；须先核对影响，未进入执行。' : pendingBackground ? '审核命令退出尚未确认，未进入执行；先核对原命令，不能重跑。' : !successful ? '审核轮次未正常结束；未进入执行。' : !observed ? '审核没有成功的独立工具核查记录；未进入执行。' : '');
         handoff = review.handoff;
@@ -943,7 +985,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
         }
       }
       if (['review_revise', 'review_needs_evidence'].includes(handoff?.kind)) update({ plan_review: { ...job.plan_review, status: handoff.kind === 'review_revise' ? 'revise_required' : 'needs_evidence', reason: handoff.reason || handoff.text }, stage: 'review_held' });
-      finish({ status: stopReason || (execution_block ? 'execution_blocked' : null) || (['needs_input', 'blocked', 'review_revise', 'review_needs_evidence'].includes(handoff?.kind) ? handoff.kind : null) || (successful ? 'completed' : 'failed'), handoff, execution_block, execution_state: pendingBackground ? 'background_unconfirmed' : execution_block ? 'policy_blocked' : handoff?.kind?.startsWith('review_') ? 'review_held' : 'cli_finished', verification_state: execution_block ? 'blocked' : pendingBackground ? 'pending' : 'not_verified', background_commands: background, execution_used_ms: executionUsed, exit_code: outcome.code, ended_at: stamp(), retrying_capacity: false,
+      finish({ ...(stopReason === 'timed_out' ? { termination: { requested: terminationRequested, note: terminationRequested ? '已请求终止所属进程树，不能证明全部进程已退出。' : '执行时限已耗尽；本次没有活动子进程可请求终止。' } } : {}), status: stopReason || (execution_block ? 'execution_blocked' : null) || (['needs_input', 'blocked', 'review_revise', 'review_needs_evidence'].includes(handoff?.kind) ? handoff.kind : null) || (successful ? 'completed' : 'failed'), handoff, execution_block, execution_state: pendingBackground ? 'background_unconfirmed' : execution_block ? 'policy_blocked' : handoff?.kind?.startsWith('review_') ? 'review_held' : 'cli_finished', verification_state: execution_block ? 'blocked' : pendingBackground ? 'pending' : 'not_verified', background_commands: background, execution_used_ms: executionUsed, exit_code: outcome.code, ended_at: stamp(), retrying_capacity: false,
         ...(!successful && !stopReason ? { error: lastError || 'Codex did not emit a successful turn.completed event' } : {}) });
       if (!reviewing && !execution_block && !pendingBackground && !['cancelled', 'timed_out'].includes(stopReason) && !handoff) {
         const report = executionReport(final, evidenceItems);
@@ -951,7 +993,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       }
       break;
     }
-    if (stopReason && !terminal.has(job.status)) finish({ status: stopReason, capacity_retry_at: null, ended_at: stamp() });
+    if (stopReason && !terminal.has(job.status)) finish({ status: stopReason, ...(stopReason === 'timed_out' ? { termination: { requested: false, note: '执行时限已耗尽；本次没有活动子进程可请求终止。' } } : {}), capacity_retry_at: null, ended_at: stamp() });
   } catch (error) {
     if (error.code === 'MODEL_CONFIGURATION') configurationFailure(error.message);
     else finish({ status: 'failed', error: error.stack, ended_at: stamp() });
@@ -966,7 +1008,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
         const finalFile = path.join(dir, 'result.txt'), original = fs.existsSync(finalFile) ? fs.readFileSync(finalFile, 'utf8') : job.error || '';
         const human = takeover(guard);
         fs.writeFileSync(finalFile, '[CODEX_NEEDS_INPUT]\n' + JSON.stringify(human) + '\n\n原始执行结果：\n' + original, 'utf8');
-        finish({ status: 'needs_input', handoff: human, prior_handoff: job.handoff, stage: 'human_held' });
+        finish({ status: 'needs_input', prior_status: job.status, handoff: human, prior_handoff: job.handoff, stage: 'human_held' });
       }
     }
     if (naming) await naming;
@@ -979,7 +1021,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
     fs.closeSync(events); fs.closeSync(stderr);
     if (terminal.has(job.status)) {
       broker.receipt(job.job_id);
-      notify('terminal', 'terminal', job.error || '执行轮次已结束，请核对原结果与业务验收条件。');
+      notify('terminal', 'terminal', (job.status === 'timed_out' || job.prior_status === 'timed_out') ? `执行达到配置时限 ${job.timeout_seconds} 秒而停止；进程树终止已请求与否及命令退出状态请查回执，最近进度不是最终结果。` : job.error || '执行轮次已结束，请核对原结果与业务验收条件。');
       if (job.conversation_id) createOnce(path.join(dir, 'notice.json'), { job_id: job.job_id, topic_id: job.topic_id, conversation_id: job.conversation_id, status: job.status, created_at: stamp() });
     }
     broker.unlock(job.job_id);
