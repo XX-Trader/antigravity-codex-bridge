@@ -152,7 +152,10 @@ if ($prompt.Contains('POLICY_REPORTED_FIXTURE')) { $text = '[CODEX_EXECUTION_BLO
 if ($prompt.Contains('POLICY_COMBINED_FIXTURE')) { $text = '[CODEX_PLAN_REJECTED]' + [Environment]::NewLine + '{"reason":"另有方案矛盾","question":"如何修正方案？","options":["补齐原方案","修改要求"]}' }
 if ($prompt.Contains('POLICY_MACHINE_FIXTURE') -or $prompt.Contains('POLICY_COMBINED_FIXTURE')) { [Console]::Error.WriteLine('2026-11-01T03:33:17.760090Z ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: "Rejected: blocked by policy" }') }
 if ($prompt.Contains('POLICY_QUOTED_FIXTURE')) { $text = '测试引用 Rejected: blocked by policy，不代表真的拒绝。' }
-if ($text.StartsWith('FAKE_OK')) { $text += [Environment]::NewLine + '[CODEX_EXECUTION_REPORT]' + [Environment]::NewLine + '{"outcome":"accepted","reason":"fixture 全部验收通过","evidence_commands":["fixture verify"],"remaining_checks":[]}' }
+if ($text.StartsWith('FAKE_OK')) {
+  $report = if ($prompt.Contains('CONTROLLED_BACKGROUND_FIXTURE') -and $prompt.Contains('"status_file"')) { '{"outcome":"accepted","reason":"后台结果已验证","evidence_outputs":["CONTROLLED_COMMAND_COMPLETE"],"remaining_checks":[]}' } else { '{"outcome":"accepted","reason":"fixture 全部验收通过","evidence_commands":["fixture verify"],"remaining_checks":[]}' }
+  $text += [Environment]::NewLine + '[CODEX_EXECUTION_REPORT]' + [Environment]::NewLine + $report
+}
 [IO.File]::WriteAllText($argv[$i+1], $text, [Text.UTF8Encoding]::new($false))
 $tid = '00000000-0000-0000-0000-000000000001'
 if ($argv -contains 'resume') { $tid = $argv[[Array]::IndexOf($argv, 'resume')+1] }
@@ -601,13 +604,15 @@ exit 0
     await t.test('controlled command waits locally then resumes the same thread without an intermediate terminal', { timeout: 120000 }, async () => {
       const job = await broker.run({ prompt: 'CONTROLLED_BACKGROUND_FIXTURE', topic: '受控后台闭环', timeout_seconds: 90 });
       const result = await broker.wait(job.job_id);
-      assert.equal(result.status, 'completed');
+      assert.equal(result.status, 'completed', JSON.stringify({ error: result.error, execution_state: result.execution_state, handoff: result.handoff }));
       assert.equal(result.attempt_total, 2);
       assert.match(result.final_response, /resume=True/);
       assert.match(result.final_response, /controlled_contract=True/);
       const saved = broker.get(job.job_id);
       assert.equal(saved.background_result.exit_code, 0);
       assert.match(saved.background_result.output_tail, /CONTROLLED_COMMAND_COMPLETE/);
+      assert.equal(saved.execution_report.outcome, 'accepted');
+      assert.equal(saved.verification_state, 'accepted_with_evidence');
       assert.equal(saved.loop_guard.failed_rounds || 0, 0);
       const events = fs.readFileSync(result.paths.events, 'utf8').trim().split('\n').map(JSON.parse);
       const begin = events.findIndex(e => e.type === 'bridge.background.wait');

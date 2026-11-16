@@ -76,7 +76,7 @@ $backgroundInstruction = if ($reviewing) { '审核阶段不允许启动受控后
 此后 worker 在本地每60秒检查，期间不调用模型；完成文件落盘立即响应。等待受本任务剩余总时限保护，取消只终止身份匹配的所属进程树。完成后自动 resume 本会话。
 最近已收集的托管结果：$backgroundContext
 续跑时先核对上述真实退出码、状态和日志尾部，再执行后续步骤；严禁重复启动已经收集的命令。exit_code=null 表示退出未确认，应诊断，不能当成功。
-托管结果中的 id 只是后台命令ID，不是 CLI 工具 item ID，禁止填入 evidence_item_ids。最终报告优先用本轮成功命令逐字输出的 evidence_outputs；只有真正已知的本轮 CLI item ID 才可作为证据ID，不能用后台ID或会话ID代替。
+托管结果中的 id 只是后台命令ID，不是 CLI 工具 item ID，禁止填入 evidence_item_ids。最终报告可用同一任务执行阶段成功命令或退出码为零的受控后台输出尾部逐字输出的 evidence_outputs；只有真正已知的本轮 CLI item ID 才可作为证据ID，不能用后台ID或会话ID代替。
 "@
 }
 $executionIntro = if ($job.context_review) { '当前续接同一事项的原生会话（stage=execute），复用已有审核讨论上下文，不另开独立审核轮次。本轮方案仍由你自行核查，不表示自动通过。历史审核记录：' + ($job.context_review | ConvertTo-Json -Depth 8 -Compress) + '。本轮修订说明：' + $reviewReply } else { '当前是已通过审核的执行阶段（stage=execute）。审核记录：' + $reviewContext }
@@ -97,7 +97,7 @@ $reviewInstruction = if ($reviewing) {
 } else {
 @"
 $executionIntro
-正常执行结果末尾另起一行 [CODEX_EXECUTION_REPORT]，后接单个 JSON：outcome（accepted/progress/failed/no_progress）、reason（本轮具体完成或失败原因）、evidence_outputs（本轮成功命令输出中逐字摘取的有效证据字符串数组，每条至少16字符；也可用 evidence_commands 提供完整实际命令或 evidence_item_ids 提供已知真实ID）、remaining_checks（尚未完成的原始验收项字符串数组）。仅在全部原始要求取得真实验收证据且 remaining_checks 为空时用 accepted；部分有实质进展用 progress，测试/实现失败用 failed，仅计划、自述或未实施用 no_progress。不得编造 ID、把审核工具当作执行证据，或用局部检查冒充整体验收。缺少有效报告视为无可核验进展；审核通过、正常退出和换方案均不清除累计失败。不能凭成功命令证明所有业务要求；reason 必须说明对应验收结果。
+正常执行结果末尾另起一行 [CODEX_EXECUTION_REPORT]，后接单个 JSON：outcome（accepted/progress/failed/no_progress）、reason（本轮具体完成或失败原因）、evidence_outputs（本轮成功命令输出中逐字摘取的有效证据字符串数组，每条至少16字符；也可用 evidence_commands 提供完整实际命令或 evidence_item_ids 提供已知真实ID）、remaining_checks（尚未完成的原始验收项字符串数组）。仅在全部原始要求取得真实验收证据且 remaining_checks 为空时用 accepted；部分有实质进展用 progress，测试/实现失败用 failed，仅计划、自述或未实施用 no_progress。不得编造 ID、把审核工具当作执行证据，或用局部检查冒充整体验收。缺少有效报告视为无可核验进展；有证据的进展或验收完成重置失败计数；审核通过、正常退出和换方案不重置。不能凭成功命令证明所有业务要求；reason 必须说明对应验收结果。
 $executionScope 审核判断不等于业务验收通过。若新的代码、日志或运行结果推翻关键假设，先暂停受影响操作并核实；用户边界内能自行解决就修正后继续，仅在确实无法解决或需要用户改变边界时返回 [CODEX_REVIEW_REVISE]，说明 reason、evidence、suggested_changes、decision_scope（technical 或 user），保留已完成部分。涉及用户目标、明确约束、验收或权限变化仍须用户决定，不自行扩大授权。执行策略受阻使用 [CODEX_EXECUTION_BLOCKED]，不能用技术重审清除策略拒绝。
 "@
 }

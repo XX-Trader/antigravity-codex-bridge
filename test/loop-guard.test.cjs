@@ -4,23 +4,27 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { loopState, executionReport, takeover } = require('../src/loop-guard.cjs');
-const { worker, save, Broker, reviewVersion } = require('../src/server.cjs');
+const { worker, save, Broker, reviewVersion, recordEvidence, recordBackgroundEvidence, restoreExecutionEvidence } = require('../src/server.cjs');
 const row = (n, fields = {}) => ({ job_id: n.toString(16).padStart(24, '0'), created_at: new Date(n * 1000).toISOString(), status: 'completed', ...fields });
 const rejected = n => row(n, { status: 'review_revise', handoff: { kind: 'review_revise', reason: '真实接口与方案不符' } });
 
-test('three failures persist across successful reviews, progress, restart and changed proposals', () => {
+test('verified progress resets previous failures; unsupported claims do not', () => {
   const rows = [rejected(1), row(2, { plan_review: { status: 'approved' }, execution_report: { outcome: 'progress' } }), rejected(3), rejected(4)];
   assert.equal(loopState(rows).failures, 3);
   assert.equal(loopState(JSON.parse(JSON.stringify(rows))).trigger, 'failed_rounds');
+  const verified = [rejected(1), rejected(2), row(3, { execution_report: { outcome: 'progress', evidence_item_ids: ['a'] } }), rejected(4), rejected(5)];
+  assert.equal(loopState(verified).failures, 2);
+  assert.equal(loopState(verified).trigger, null);
+  assert.equal(loopState([rejected(1), row(2, { status: 'review_needs_evidence', repair_round_failed: true }), rejected(3)]).failures, 2);
   assert.match(takeover(loopState(rows)).diagnostic_questions.join(" "), /原因是什么.*如何解决最合适/);
   assert.equal(loopState([...rows, row(5, { execution_report: { outcome: 'accepted', evidence_item_ids: ['a'] } })]).failures, 3, 'Bare accepted claim cannot reset');
   assert.equal(loopState([...rows, row(5, { execution_report: { outcome: 'accepted', evidence_item_ids: ['a'] }, verification_state: 'accepted_with_evidence' })]).failures, 0);
 });
 
-test('two execution rounds without evidence stop; review approval neither resets nor counts as progress', () => {
+test('three execution rounds without evidence stop; review approval neither resets nor counts as progress', () => {
   const a = row(1, { execution_report: { outcome: 'no_progress' } }), b = row(3, { execution_report: { outcome: 'no_progress' } });
-  assert.equal(loopState([a, row(2, { plan_review: { status: 'approved' } }), b]).trigger, 'no_progress');
-  assert.equal(loopState([a, row(2, { execution_report: { outcome: 'progress' } }), b]).trigger, null);
+  assert.equal(loopState([a, row(2, { plan_review: { status: 'approved' } }), b]).trigger, null);
+  assert.equal(loopState([a, row(2, { execution_report: { outcome: 'progress' } }), b, row(4, { execution_report: { outcome: 'no_progress' } })]).trigger, 'no_progress');
 });
 
 test('model configuration errors neither add business failures nor erase earlier progress and failures', () => {
@@ -37,6 +41,30 @@ test('reports require exact successful execution evidence and all acceptance ite
   assert.equal(executionReport('仅声称完成', items).outcome, 'no_progress');
   for (const raw of ['null', '[]', '7', '{"evidence_commands":{}}']) assert.equal(executionReport('结果\n[CODEX_EXECUTION_REPORT]\n' + raw, items).outcome, 'no_progress');
   assert.equal(executionReport('结果\n[CODEX_EXECUTION_REPORT]\n' + JSON.stringify({ outcome: 'progress', reason: '取得了新的定位证据', evidence_outputs: ['真实命令输出：验收回读成功且参数一致'], remaining_checks: ['真机测试'] }), new Map([['actual2', { output: '真实命令输出：验收回读成功且参数一致', command: 'probe' }]])).outcome, 'progress');
+});
+
+test('evidence preserves repeated IDs across attempts and admits only successful background output', async t => {
+  const items = new Map();
+  recordEvidence(items, 1, { id: 'item_0', type: 'command_execution', exit_code: 0, aggregated_output: 'first attempt actual verified output' });
+  recordEvidence(items, 2, { id: 'item_0', type: 'command_execution', exit_code: 0, aggregated_output: 'second attempt actual verified output' }, true);
+  recordBackgroundEvidence(items, { id: 'good', exit_code: 0, output_tail: 'background actual verified output' });
+  recordBackgroundEvidence(items, { id: 'bad', exit_code: 1, output_tail: 'failed background output must not match' });
+  recordBackgroundEvidence(items, { id: 'unknown', exit_code: null, output_tail: 'unknown background output must not match' });
+  const report = fields => executionReport('x\n[CODEX_EXECUTION_REPORT]\n' + JSON.stringify({ outcome: 'progress', reason: 'verified', remaining_checks: [], ...fields }), items);
+  assert.equal(report({ evidence_outputs: ['first attempt actual verified output', 'background actual verified output'] }).outcome, 'progress');
+  assert.equal(report({ evidence_item_ids: ['item_0'] }).outcome, 'progress');
+  assert.equal(report({ evidence_item_ids: ['bg:good'] }).outcome, 'no_progress');
+  assert.equal(report({ evidence_outputs: ['failed background output must not match'] }).outcome, 'no_progress');
+  assert.equal(report({ evidence_outputs: ['unknown background output must not match'] }).outcome, 'no_progress');
+  const root = fs.mkdtempSync(path.join(process.env.CODEX_EXECUTOR_TEST_ROOT, 'restore-evidence-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'job.json'); fs.writeFileSync(file, '{}');
+  const event = (type, extra = {}) => JSON.stringify({ type, ...extra });
+  fs.writeFileSync(path.join(root, 'events.jsonl'), [event('bridge.attempt', { stage: 'review', attempt: 1 }), event('item.completed', { item: { id: 'item_0', type: 'command_execution', exit_code: 0, aggregated_output: 'review secret evidence never allowed' } }), event('bridge.attempt', { stage: 'execute', attempt: 1 }), event('item.completed', { item: { id: 'item_0', type: 'command_execution', exit_code: 0, aggregated_output: 'restored execution output evidence' } })].join('\n'));
+  const restored = new Map(); await restoreExecutionEvidence(file, restored);
+  const make = output => executionReport('x\n[CODEX_EXECUTION_REPORT]\n' + JSON.stringify({ outcome: 'progress', reason: 'verified', remaining_checks: [], evidence_outputs: [output] }), restored);
+  assert.equal(make('restored execution output evidence').outcome, 'progress');
+  assert.equal(make('review secret evidence never allowed').outcome, 'no_progress');
 });
 
 test('human reset needs exact decision and appended real reply; policy denials never become repair failures', () => {
@@ -108,6 +136,7 @@ $text=if($prompt.Contains('FAIL_ROUND')){'[CODEX_REVIEW_REVISE]'+[Environment]::
   assert.equal(resumed.loop_guard.failures, 0); assert.ok(resumed.child_pid);
   const emptyTopic = 'bbbbbbbbbbbbbbbbbbbbbbbb';
   assert.equal((await run(emptyTopic, '空执行')).status, 'completed');
+  assert.equal((await run(emptyTopic, '空执行')).status, 'completed');
   const empty = await run(emptyTopic, '空执行');
-  assert.equal(empty.status, 'needs_input'); assert.equal(empty.loop_guard.consecutive_no_progress, 2);
+  assert.equal(empty.status, 'needs_input'); assert.equal(empty.loop_guard.consecutive_no_progress, 3);
 });

@@ -18,7 +18,7 @@ function executionReport(text, items) {
   const matched = [...commands.flatMap(c => matchesCommand(c).map(([id]) => id)), ...outputs.flatMap(o => matchesOutput(o).map(([id]) => id))];
   const evidence = [...new Set([...ids, ...matched])];
   if (at < 0 || !['accepted', 'progress', 'failed', 'no_progress'].includes(report.outcome) ||
-      !evidence.length || ids.some(id => typeof id !== 'string' || !items.has(id)) || commands.some(c => !matchesCommand(c).length) || outputs.some(o => !matchesOutput(o).length) ||
+      !evidence.length || ids.some(id => typeof id !== 'string' || !items.has(id) || items.get(id)?.explicit === false) || commands.some(c => !matchesCommand(c).length) || outputs.some(o => !matchesOutput(o).length) ||
       typeof report.reason !== 'string' || !report.reason.trim() ||
       !Array.isArray(report.remaining_checks) || report.remaining_checks.some(v => typeof v !== 'string') ||
       (report.outcome === 'accepted' && report.remaining_checks.length)) {
@@ -35,27 +35,29 @@ function loopState(jobs) {
     }
     if (job.configuration_error?.kind === 'model_configuration') continue;
     if (job.handoff?.blocker_type === 'human_takeover' && !job.repair_round_failed && !job.execution_report) continue;
-    if (job.execution_report?.outcome === 'accepted' && job.execution_report.evidence_item_ids?.length && job.status === 'completed' && job.verification_state === 'accepted_with_evidence') {
+    if (job.status === 'completed' && job.execution_report?.evidence_item_ids?.length && (job.execution_report.outcome === 'progress' || (job.execution_report.outcome === 'accepted' && job.verification_state === 'accepted_with_evidence'))) {
       failures = 0; noProgress = 0; since = null; last = null; continue;
     }
-    const rejected = ['review_revise', 'review_needs_evidence'].includes(job.handoff?.kind) || ['review_revise', 'review_needs_evidence'].includes(job.status);
-    const failed = job.repair_round_failed || rejected || (!job.execution_block && ['failed', 'timed_out'].includes(job.status)) || job.execution_report?.outcome === 'failed';
+    const needsEvidence = job.handoff?.kind === 'review_needs_evidence' || job.status === 'review_needs_evidence';
+    const rejected = job.handoff?.kind === 'review_revise' || job.status === 'review_revise';
+    const failed = !needsEvidence && !job.execution_block && (job.repair_round_failed || rejected || ['failed', 'timed_out'].includes(job.status) || job.execution_report?.outcome === 'failed');
     if (failed) { failures++; since ||= job.created_at; last = job; }
     // A review pass or an unexecuted plan is never progress. Legacy execution rounds
     // without reports are unknown; new workers explicitly save no_progress.
     if (job.execution_report) {
-      noProgress = job.execution_report.outcome === 'no_progress' ? noProgress + 1 : 0;
+      if (job.execution_report.outcome === 'no_progress') noProgress++;
+      else if (job.execution_report.outcome === 'failed') noProgress = 0;
       if (job.execution_report.outcome === 'no_progress') { since ||= job.created_at; last = job; }
     }
   }
-  return { failures, consecutive_no_progress: noProgress, since, trigger: failures >= 3 ? 'failed_rounds' : noProgress >= 2 ? 'no_progress' : null,
+  return { failures, consecutive_no_progress: noProgress, since, trigger: failures >= 3 ? 'failed_rounds' : noProgress >= 3 ? 'no_progress' : null,
     last_job_id: last?.job_id || null, last_reason: last?.execution_report?.reason || last?.plan_review?.reason || last?.handoff?.reason || last?.error || null };
 }
 
 function takeover(state) {
   return { kind: 'needs_input', blocker_type: 'human_takeover', requires_user_decision: true,
-    reason: `同一未完成事项累计失败 ${state.failures} 轮，连续无可核验进展 ${state.consecutive_no_progress} 轮，已停止自动修订和执行。`,
-    known_facts: [`原任务记录累计失败 ${state.failures} 轮，连续无可核验进展 ${state.consecutive_no_progress} 轮`],
+    reason: `同一未完成事项自上次可核验进展后失败 ${state.failures} 轮，连续无可核验进展 ${state.consecutive_no_progress} 轮，已停止自动修订和执行。`,
+    known_facts: [`自上次可核验进展后失败 ${state.failures} 轮，连续无可核验进展 ${state.consecutive_no_progress} 轮`],
     reported_cause: state.last_reason || '现有记录不足以确认失败根因',
     unknowns: ['为何反复失败或没有实质进展？需要补充哪些证据才能确定根因？'],
     diagnostic_questions: ['现在失败的原因是什么？哪些已证实、哪些仍是假设？', '如何解决最合适？建议有什么证据、影响和未完成项？'],
