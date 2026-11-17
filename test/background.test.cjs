@@ -53,6 +53,13 @@ test('owned supervisor completion, boundaries, cancellation and crashes', async 
         bg.release(file, id); outstanding = null;
       }
     });
+    await t.test('unlimited wait remains responsive to completion without busy polling', async () => {
+      const { id } = await launch('setTimeout(()=>console.log("UNLIMITED_DONE"),1200)'); outstanding = id;
+      let checks = 0;
+      const result = await bg.wait(file, id, { timeoutMs: null, intervalMs: 60000, onCheck: () => checks++ });
+      assert.equal(result.exit_code, 0); assert.match(result.output_tail, /UNLIMITED_DONE/); assert.ok(checks <= 3);
+      bg.release(file, id); outstanding = null;
+    });
     await t.test('registration nonce, status, symlink and arbitrary live PID cannot be adopted', async () => {
       const { id } = await launch('setTimeout(()=>{},120000)'); outstanding = id;
       const info = bg.inspect(file, id), launchFile = path.join(info.dir, 'launch.json');

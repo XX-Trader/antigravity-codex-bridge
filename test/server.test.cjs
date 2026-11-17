@@ -196,7 +196,9 @@ exit 0
       const schema = dispatch(broker, { method: 'tools/list' }).tools.find(x => x.name === 'codex_start').inputSchema.properties.sandbox;
       assert.equal(schema.default, 'danger-full-access'); assert.ok(schema.enum.includes('danger-full-access'));
       assert.throws(() => broker.start({ prompt: '' }), /prompt/);
-      assert.throws(() => broker.start({ prompt: 'x', timeout_seconds: 0 }), /timeout_seconds/);
+      for (const value of [-1, 1, 29, 1.5, 2147483648, Number.MAX_SAFE_INTEGER]) assert.throws(() => broker.start({ prompt: 'x', timeout_seconds: value }), /timeout_seconds/);
+      const timeoutSchema = dispatch(broker, { method: 'tools/list' }).tools.find(x => x.name === 'codex_start').inputSchema.properties.timeout_seconds;
+      assert.equal(timeoutSchema.default, 0); assert.equal(timeoutSchema.maximum, 2147483647);
       assert.throws(() => broker.status('../other'), /Invalid/);
       assert.equal(dispatch(broker, { method: 'tools/list' }).tools.length, 9);
       assert.equal(dispatch(broker, { method: 'initialize', params: { protocolVersion: '2025-03-26' } }).protocolVersion, '2025-03-26');
@@ -305,7 +307,8 @@ exit 0
       assert.equal(controlled.get(id).child_pid, undefined); assert.equal(fs.readFileSync(blocked.paths.events, 'utf8'), '');
     });
     await t.test('review gate: same native session, independent evidence, version binding and no execution before approval', async () => {
-      const result = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 中文参数', topic: '审核通过自动执行' });
+      const result = await broker.run({ wait: true, prompt: 'REVIEW_VALID_FIXTURE 中文参数', topic: '审核通过自动执行', timeout_seconds: 14401 });
+      assert.equal(broker.get(result.job_id).timeout_seconds, 14401);
       assert.equal(result.status, 'completed'); assert.equal(result.plan_review.status, 'approved');
       assert.deepEqual(result.plan_review.allowed_scope, ['仅按测试要求实施，不扩大任务范围']);
       const events = fs.readFileSync(result.paths.events, 'utf8').trim().split('\n').map(line => JSON.parse(line));
@@ -352,7 +355,8 @@ exit 0
       assert.equal(continued.plan_review.status, 'context'); assert.equal(continued.context_review.prior_status, 'revise_required');
     });
     await t.test('background completion, UTF-8 and restart-safe reads', async () => {
-      first = broker.start({ prompt: '中文参数', user_request: 'USER_ORIGINAL_SENTINEL 原文：不要偷偷换路线。', sandbox: 'read-only' });
+      first = broker.start({ prompt: '中文参数', user_request: 'USER_ORIGINAL_SENTINEL 原文：不要偷偷换路线。', sandbox: 'read-only', timeout_seconds: 0 });
+      assert.equal(broker.get(first.job_id).timeout_seconds, 0);
       await assert.rejects(broker.run({ prompt: 'duplicate', topic_id: first.topic_id }), /still running/);
       const result = await finished(broker, first.job_id);
       assert.equal(result.status, 'completed'); assert.equal(result.exit_code, 0);
@@ -602,7 +606,8 @@ exit 0
       assert.equal(new Broker(host.settings).result(reported.job_id).status, 'execution_blocked');
     });
     await t.test('controlled command waits locally then resumes the same thread without an intermediate terminal', { timeout: 120000 }, async () => {
-      const job = await broker.run({ prompt: 'CONTROLLED_BACKGROUND_FIXTURE', topic: '受控后台闭环', timeout_seconds: 90 });
+      const job = await broker.run({ prompt: 'CONTROLLED_BACKGROUND_FIXTURE', topic: '受控后台闭环' });
+      assert.equal(broker.get(job.job_id).timeout_seconds, 0);
       const result = await broker.wait(job.job_id);
       assert.equal(result.status, 'completed', JSON.stringify({ error: result.error, execution_state: result.execution_state, handoff: result.handoff }));
       assert.equal(result.attempt_total, 2);
@@ -860,6 +865,36 @@ test('worker timeout diagnostics', async t => {
   const settings = config({ CODEX_EXECUTOR_PROJECT: project, CODEX_EXECUTOR_DATA: data, CODEX_EXECUTOR_ENTRY: entry, CODEX_EXECUTOR_PWSH: process.env.CODEX_EXECUTOR_PWSH, CODEX_EXECUTOR_ALLOW_SANDBOX: '1' });
   const broker = new Broker(settings);
   try {
+    await t.test('unlimited worker with over four hours recorded still starts and responds to cancellation', { timeout: 20000 }, async () => {
+      const id = require('node:crypto').randomBytes(12).toString('hex'), file = broker.jobPath(id);
+      fs.mkdirSync(path.dirname(file));
+      save(file, { job_id: id, status: 'queued', created_at: new Date().toISOString(), cwd: project,
+        sandbox: 'read-only', prompt: 'SLOW_FIXTURE', request_context: { original_text: '不限时', followups: [] },
+        topic_id: id, timeout_seconds: 0, execution_used_ms: 15000000, settings });
+      const running = worker(file);
+      for (let i = 0; i < 100 && !broker.get(id).child_pid; i++) await sleep(50);
+      assert.ok(broker.get(id).child_pid, 'worker started the owned child');
+      broker.cancel(id);
+      await running;
+      assert.equal(broker.receipt(id).status, 'cancelled');
+    });
+    await t.test('wait has no unlimited deadline and chunks long finite timers', async () => {
+      const original = global.setTimeout, delays = [];
+      global.setTimeout = (fn, delay, ...args) => { delays.push(delay); return original(fn, delay, ...args); };
+      try {
+        for (const timeout of [0, 3000000]) {
+          const id = require('node:crypto').randomBytes(12).toString('hex'), file = broker.jobPath(id);
+          fs.mkdirSync(path.dirname(file));
+          save(file, { job_id: id, status: 'running', created_at: new Date().toISOString(), cwd: project, timeout_seconds: timeout });
+          const controller = new AbortController(), before = delays.length;
+          const waiting = broker.wait(id, controller.signal);
+          if (timeout === 0) assert.equal(delays.length, before);
+          else assert.equal(delays.at(-1), 2147483647);
+          controller.abort();
+          await assert.rejects(waiting, /Wait cancelled/);
+        }
+      } finally { global.setTimeout = original; }
+    });
     await t.test('exhausted execution budget persists a timeout receipt and specific terminal notice', async () => {
       const id = require('node:crypto').randomBytes(12).toString('hex'), file = broker.jobPath(id);
       fs.mkdirSync(path.dirname(file));

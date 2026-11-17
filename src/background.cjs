@@ -97,7 +97,7 @@ function logTail(file) {
 async function wait(file, id, { timeoutMs, intervalMs = 60000, onCheck = () => {}, activated } = {}) {
   // activate() has already verified the OS process and immutable registration.
   // Reuse that in-memory result, not a model-provided object or persisted hint.
-  const initial = activated || inspect(file, id), started = Date.now(), deadline = started + timeoutMs;
+  const initial = activated || inspect(file, id), started = Date.now(), deadline = timeoutMs == null ? null : started + timeoutMs;
   const pwsh = initial.job.settings.pwsh;
   return new Promise((resolve, reject) => {
     let timer, completionWatcher, cancelWatcher, done = false;
@@ -112,7 +112,7 @@ async function wait(file, id, { timeoutMs, intervalMs = 60000, onCheck = () => {
         const current = inspect(file, id, { verifyProcess: false }), { launch, status } = current;
         if (JSON.stringify(launch) !== JSON.stringify(initial.launch)) throw new Error('Owned registration changed while waiting');
         const cancelled = fs.existsSync(path.join(path.dirname(file), 'cancel'));
-        const timedOut = Date.now() >= deadline;
+        const timedOut = deadline !== null && Date.now() >= deadline;
         if (cancelled || timedOut) {
           const termination = killOwned(launch, pwsh);
           // If the supervisor crashed, only its separately registered child can
@@ -134,7 +134,7 @@ async function wait(file, id, { timeoutMs, intervalMs = 60000, onCheck = () => {
           if (child && child !== launch.child.identity) { finish(new Error('Owned command identity changed')); return; }
           if (!child) { finish(null, { id, exit_code: null, error: 'Owned supervisor exited without a completion record', status_file: current.statusFile, log_file: current.log, output_tail: logTail(current.log) }); return; }
         }
-        timer = setTimeout(check, Math.max(1, Math.min(intervalMs, deadline - Date.now())));
+        timer = setTimeout(check, Math.max(1, Math.min(intervalMs, deadline === null ? intervalMs : deadline - Date.now(), 2147483647)));
       } catch (e) { finish(e); }
     };
     try {
