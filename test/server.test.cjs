@@ -66,6 +66,8 @@ if ($argv -contains 'app-server') {
 $prompt = $input -join "\n"
 $argv = @($args)
 $implementationContract = $prompt.Contains('规划建议不构成用户硬性约束') -and $prompt.Contains('审核阶段仍只读') -and $prompt.Contains('用户边界内的技术错误由 Codex 自行纠正、实现并验证') -and $prompt.Contains('只审核、不改文件等限制及执行策略拒绝不因技术自主权解除') -and (-not $prompt.Contains('技术方案问题按审核交接修订')) -and (-not $prompt.Contains('建议与原文矛盾时按审核协议退回 technical'))
+$longRunContract = $prompt.Contains('检查缺乏依据或不适用的硬编码、逻辑漏洞') -and $prompt.Contains('代表性短跑或分段执行') -and $prompt.Contains('不能等全量运行数小时结束才首次验证') -and $prompt.Contains('早检通过只允许继续，不能代替最终全量验收') -and $prompt.Contains('Terra 可自行完成技术判断') -and $prompt.Contains('交回 Sol 修复') -and $prompt.Contains('未配置时明确限制，不默换模型')
+if (-not $longRunContract) { throw 'Long-run preflight and execution role instructions missing' }
 if (-not (($argv -contains 'approval_policy="on-request"') -and ($argv -contains 'approvals_reviewer="auto_review"') -and (-not ($argv -contains 'approval_policy="never"')))) { throw 'Approval configuration mismatch' }
 if ($prompt.Contains('MODEL_NOT_FOUND_FIXTURE') -or ($prompt.Contains('MODEL_NOT_FOUND_EXEC_FIXTURE') -and -not $prompt.Contains('当前是独立审核阶段（stage=review）'))) {
   $serviceError = @{ error = @{ code = 'model_not_found'; message = 'The selected model is not supported when using Codex with this account.' } } | ConvertTo-Json -Compress

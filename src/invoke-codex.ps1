@@ -69,6 +69,11 @@ $reviewContext = $job.plan_review | ConvertTo-Json -Depth 12 -Compress
 $reviewReply = if ($job.review_followup) { $job.review_followup | ConvertTo-Json -Depth 6 -Compress } else { '无审核修订答复。' }
 $backgroundRoot = Join-Path (Split-Path -Parent $RequestPath) 'background'
 $backgroundContext = if ($job.background_result) { $job.background_result | ConvertTo-Json -Depth 8 -Compress } else { '无已收集的托管命令。' }
+$longRunInstruction = @'
+耗时任务先核查实际执行入口和关键调用链：检查缺乏依据或不适用的硬编码、逻辑漏洞、输入与参数适用性、输出位置及续跑依据，不能只审核方案文字；保留用户明确参数和有依据的常量，不机械参数化。审核阶段只读，指出必要修正和早期验证方法；执行阶段先完成必要修正，再查看真实输出。先用覆盖关键场景、可结束并回读结果的代表性短跑或分段执行，观察一段有代表性的运行并确认输出、进度和必要资源表现正常后，才把剩余长跑交给本地托管；不能等全量运行数小时结束才首次验证。业务输出异常时暂停受影响的后续长跑，定位修复后重验，不能仅凭退出码为零或有日志认定正常。阶段长度按实际风险和输出节奏选择，不写死分钟数或样本数。
+早检本身耗时不确定时也使用受控托管，结束后自动续接核对，再决定后续运行，不靠模型轮询日志。已有同一实际代码、参数和关键输入且覆盖本轮场景的有效早检可复用；代码或关键输入变化后重新核查适用性。入口不支持短跑、分段或可观察输出时，先解决早期可验证性，不能先盲跑；不为此擅自扩大改造范围。保留实际代码身份（含未提交改动）、参数、输入、日志与有效 checkpoint，失败后先核查再续跑。早检通过只允许继续，不能代替最终全量验收。
+用户要求 Sol 改代码、Terra 做计算执行时，Sol 负责源码修改与修复，Terra 只运行已核验入口并分析实际输出；Terra 可自行完成技术判断，发现需要改源码时保留证据和 checkpoint，交回 Sol 修复，核验后再续跑，不因技术自主权越过分工，也不重复请求批准已有分工。使用本机已配置且实际可用的模型或别名；未配置时明确限制，不默换模型。此为执行分工提示，不是桥接新增的强制模型路由或操作系统写隔离。
+'@
 $backgroundInstruction = if ($reviewing) { '审核阶段不允许启动受控后台命令；所有核查命令必须取得退出结果。' } else {
 @"
 长命令等待契约：不要猜测耗时。秒级命令直接取得退出结果；测试、构建、回测、全量扫描、训练、数据处理等耗时不确定的命令使用下述受控托管，Python 等任何可执行程序均适用。禁止用 exec_command/write_stdin 反复轮询或等待期间播报。features.unified_exec=false 在新版本可能被忽略；只有实际 schema 提供 shell_command/timeout_ms 时才可使用，默认同步超时较短，非秒级命令必须显式传充足 timeout_ms，绝不伪造不存在的参数或宣称已切换同步工具。
@@ -105,6 +110,7 @@ $timeInstruction = if ($job.timeout_seconds -gt 0) { "本轮累计执行时限�
 $instruction = @"
 你是由 Antigravity 委派的 Codex 执行者。负责实际读取、定位、改动、命令、测试和证据回读，不把工作再次转交给 Antigravity 或调用本桥接递归委派。
 $reviewInstruction
+$longRunInstruction
 $backgroundInstruction
 $timeInstruction 检索仅按任务需要进行；查询前核对入口是否会自动重建索引，优先使用工具支持的仅查现有索引模式。索引过期或缺失时如实说明，需要重建则单独评估工作量和适用的剩余时限，不把重建藏在普通查询中。已确定阻塞时，可选检索或索引刷新不得拖延最终阻塞反馈。必需证据和既有验收门禁不得跳过或降低。
 $implementationAuthority
