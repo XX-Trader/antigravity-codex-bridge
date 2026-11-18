@@ -640,7 +640,7 @@ exit 0
       const notices = saved.job_id && fs.readdirSync(path.dirname(broker.jobPath(job.job_id))).filter(n => n.startsWith('notification'));
       assert.ok(notices);
     });
-    await t.test('background snapshots preserve start time and alert only once without another model turn', async () => {
+    await t.test('background snapshots preserve start time and alert only on observation failures, never elapsed time', async () => {
       const background = require('../src/background.cjs');
       const original = { activate: background.activate, wait: background.wait };
       const prior = broker.list(1000).map(job => broker.get(job.job_id)).find(job => job.background_result?.exit_code === 0);
@@ -662,8 +662,7 @@ exit 0
         }
         const notices = require('../src/server.cjs').notificationEvents(file);
         assert.equal(notices.filter(event => event.kind === 'monitoring_alert').length, 1);
-        assert.equal(notices.filter(event => event.kind === 'background_status').length, 1);
-        assert.match(notices.find(event => event.kind === 'background_status').detail, /存活状态暂无法确认.*业务进展与完成状态未知/);
+        assert.equal(notices.filter(event => event.kind === 'background_status').length, 0);
         return { id: commandId, reason: 'cancelled', elapsed_ms: 0, termination: { requested: false } };
       };
       try {

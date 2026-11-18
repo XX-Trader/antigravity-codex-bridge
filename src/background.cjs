@@ -1,6 +1,6 @@
 'use strict';
-// A bridge-owned supervisor, not a second model session. All paths are derived
-// from the job and a generated command ID; handoffs never supply a PID to kill.
+// A bridge-owned supervisor, not a second model session. Metadata paths are
+// job-owned; command cwd may be external. Handoffs never supply a PID to kill.
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -196,7 +196,12 @@ async function enqueue(file, requestFile) {
   const request = read(contained(root, requestFile));
   if (!path.isAbsolute(request.executable || '') || !fs.statSync(request.executable).isFile() ||
       !Array.isArray(request.args) || request.args.length > 256 || request.args.some(a => typeof a !== 'string' || a.length > 32768)) throw new Error('Use an existing absolute executable and an argument array');
-  const cwd = contained(job.cwd, request.cwd || job.cwd);
+  // Command cwd is not an ownership boundary: authorized worktrees and shared
+  // tools can live outside job.cwd. Only supervisor metadata stays contained.
+  const requestedCwd = request.cwd === undefined ? job.cwd : request.cwd;
+  if (typeof requestedCwd !== 'string' || !path.isAbsolute(requestedCwd)) throw new Error('Use an existing absolute working directory');
+  const cwd = fs.realpathSync(requestedCwd);
+  if (!fs.statSync(cwd).isDirectory()) throw new Error('Use an existing absolute working directory');
   const slot = path.join(root, 'active.json');
   // One outstanding command per model handoff; a duplicate launch must not
   // silently rerun an unknown command. Worker releases the slot after collection.

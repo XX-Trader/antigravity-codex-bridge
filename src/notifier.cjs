@@ -45,9 +45,9 @@ function recordedReceipt(directory, event) {
   return false;
 }
 const checks = new Set(['notification_check', 'parallel_check', 'subagent_check']);
-const important = new Set(['terminal', 'execution_alert', 'notification_alert', 'monitoring_alert', 'background_status']);
+const important = new Set(['terminal', 'execution_alert', 'notification_alert', 'monitoring_alert']);
 function notificationPolicy(job, event, now = Date.now()) {
-  if (['notification_check', 'silence_alert'].includes(event.kind)) return 'silent';
+  if (['notification_check', 'silence_alert', 'background_status'].includes(event.kind)) return 'silent';
   if (checks.has(event.kind) || important.has(event.kind) || !event.schema) return 'send';
   // A continuation already has a saved chat link. Never replay old startup banners.
   if (event.kind === 'session_ready' && !job.parent_job_id && !job.resumed_session && job.topic_id === job.job_id && now - Date.parse(event.created_at) <= 120000) return 'send';

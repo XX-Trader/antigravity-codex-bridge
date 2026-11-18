@@ -869,12 +869,9 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
         fs.writeSync(events, JSON.stringify({ type: 'bridge.background.check', ...check }) + '\n');
         const snapshot = { ...job.background_wait, last_checked_at: check.at, process_alive: check.process_alive, observation_error: check.observation_error || null };
         const alert = !!check.observation_error && !snapshot.monitoring_alert_at;
-        const longWait = !check.completed && !snapshot.background_status_at && clock.now() - Date.parse(snapshot.started_at) >= (clock.backgroundStatusMs ?? 15 * 60 * 1000);
         if (alert) snapshot.monitoring_alert_at = check.at;
-        if (longWait) snapshot.background_status_at = check.at;
         update({ background_wait: snapshot });
         if (alert) notify(`monitoring-alert-${id}`, 'monitoring_alert', '后台命令监督暂时异常，原命令保留并继续本地观察；未确认业务进展或完成。' + check.observation_error);
-        if (longWait) notify(`background-status-${id}`, 'background_status', check.process_alive === true ? '后台命令已托管等待超过15分钟，已确认监督进程存活；业务进展与完成状态未知，继续本地等待。' : check.process_alive === false ? '后台命令已托管等待超过15分钟，监督进程已退出；业务子进程进展与完成状态尚未确认，继续本地观察。' : '后台命令已托管等待超过15分钟，进程存活状态暂无法确认；业务进展与完成状态未知，继续本地观察。');
       } });
     executionUsed += result.elapsed_ms;
     fs.writeSync(events, JSON.stringify({ type: 'bridge.background.completed', ...result, output_tail: undefined, at: stamp(), thread_id: job.thread_id }) + '\n');

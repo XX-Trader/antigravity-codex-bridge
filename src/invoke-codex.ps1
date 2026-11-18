@@ -78,7 +78,7 @@ $longRunInstruction = @'
 $backgroundInstruction = if ($reviewing) { '审核阶段不允许启动受控后台命令；所有核查命令必须取得退出结果。' } else {
 @"
 长命令等待契约：不要猜测耗时。秒级命令直接取得退出结果；测试、构建、回测、全量扫描、训练、数据处理等耗时不确定的命令使用下述受控托管，Python 等任何可执行程序均适用。禁止用 exec_command/write_stdin 反复轮询或等待期间播报。features.unified_exec=false 在新版本可能被忽略；只有实际 schema 提供 shell_command/timeout_ms 时才可使用，默认同步超时较短，非秒级命令必须显式传充足 timeout_ms，绝不伪造不存在的参数或宣称已切换同步工具。
-受控启动：在 $backgroundRoot 内写一个无 BOM UTF-8 JSON 请求文件，格式为 {"executable":"现有解释器或程序的绝对路径","args":["各个原样参数"],"cwd":"当前任务目录或其子目录"}。使用参数数组，不拼接 shell 命令；Python 脚本仍由指定 python.exe 原样执行，Node 只托管进程。运行 & '$commandShell' -NoProfile -File '$PSCommandPath' -BackgroundRequest '请求文件绝对路径'，该快速交接命令显式使用 yield_time_ms=30000 取得提交结果。包装器仅提交请求，返回 [CODEX_BACKGROUND_WAIT] 及 {"id":"真实生成的命令ID"}，此时不代表业务进程已启动；必须原样作为本轮最终回复立即结束，不再读日志、轮询、播报或运行下一步，也不附执行报告。CLI退出后才由worker启动业务进程，避免后台进程拖延CLI退出。提交报错或结果未知时核对原登记，不重放提交。不得自行拼造PID或交接ID。普通未知后台命令继续用 [CODEX_BACKGROUND_RUNNING]，不能自动接管。
+受控启动：在 $backgroundRoot 内写一个无 BOM UTF-8 JSON 请求文件，格式为 {"executable":"现有解释器或程序的绝对路径","args":["各个原样参数"],"cwd":"已核验且在用户授权范围内的现有绝对目录，可为外部 worktree 或工具目录"}。使用参数数组，不拼接 shell 命令；Python 脚本仍由指定 python.exe 原样执行，Node 只托管进程。运行 & '$commandShell' -NoProfile -File '$PSCommandPath' -BackgroundRequest '请求文件绝对路径'，该快速交接命令显式使用 yield_time_ms=30000 取得提交结果。包装器仅提交请求，返回 [CODEX_BACKGROUND_WAIT] 及 {"id":"真实生成的命令ID"}，此时不代表业务进程已启动；必须原样作为本轮最终回复立即结束，不再读日志、轮询、播报或运行下一步，也不附执行报告。CLI退出后才由worker启动业务进程，避免后台进程拖延CLI退出。提交报错或结果未知时核对原登记，不重放提交。不得自行拼造PID或交接ID。普通未知后台命令继续用 [CODEX_BACKGROUND_RUNNING]，不能自动接管。
 此后 worker 在本地每60秒检查，期间不调用模型；完成文件落盘立即响应。进程观测暂不可用或文件监听失效时继续本地托管与检查，记录未知状态，不把未知当作退出或成功；长时间托管和观测退化由桥接给出有限状态通知，不靠执行模型轮询或重复派发。等待受本任务剩余总时限保护，取消只终止身份匹配的所属进程树。完成后自动 resume 本会话。
 最近已收集的托管结果：$backgroundContext
 续跑时先核对上述真实退出码、状态和日志尾部，再执行后续步骤；严禁重复启动已经收集的命令。exit_code=null 表示退出未确认，应诊断，不能当成功。

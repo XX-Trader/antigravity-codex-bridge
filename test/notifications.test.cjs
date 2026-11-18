@@ -343,8 +343,8 @@ test('default reconciliation is fifteen seconds and an empty outbox does not sen
 
 test('background notices report continued custody and unknown observations without redispatch', t => {
   const f = fixture(t, 'waiting_background');
-  for (const kind of ['background_status', 'monitoring_alert']) {
-    const detail = kind === 'background_status' ? '后台命令仍在托管；进程存活，业务进展尚未确认。' : '进程查询暂不可用；原命令继续托管，未终止或重启。';
+  for (const kind of ['monitoring_alert']) {
+    const detail = '进程查询暂不可用；原命令继续托管，未终止或重启。';
     const event = f.emit(kind, kind, detail);
     assert.equal(notificationPolicy(f.job, event), 'send');
     const message = eventMessage(f.job, event);
@@ -354,6 +354,9 @@ test('background notices report continued custody and unknown observations witho
     assert.ok(message.includes(detail));
     assert.doesNotMatch(message, /执行器已退出/);
   }
+  const retired = f.emit('retired-wait', 'background_status', '旧版等待提醒');
+  assert.equal(notificationPolicy(f.job, retired), 'silent');
+  assert.equal(notificationPolicy(f.job, { ...retired, schema: undefined }), 'silent');
 });
 
 test('slow recipient does not block another conversation and same-chat deliveries remain serial', async t => {

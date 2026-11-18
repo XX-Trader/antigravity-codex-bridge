@@ -183,12 +183,14 @@ test('owned supervisor completion, boundaries, cancellation and crashes', async 
   assert.ok(process.env.CODEX_EXECUTOR_TEST_ROOT);
   const root = fs.mkdtempSync(path.join(process.env.CODEX_EXECUTOR_TEST_ROOT, 'background-'));
   const file = path.join(root, 'job.json'), controlled = path.join(root, 'background');
+  const project = path.join(root, 'original-project');
+  fs.mkdirSync(project);
   const pwsh = process.env.CODEX_EXECUTOR_PWSH;
   fs.mkdirSync(controlled);
-  fs.writeFileSync(file, JSON.stringify({ job_id: '123456789012345678901234', stage: 'execute', cwd: root, settings: { pwsh } }));
+  fs.writeFileSync(file, JSON.stringify({ job_id: '123456789012345678901234', stage: 'execute', cwd: project, settings: { pwsh } }));
   const launch = async code => {
     const request = path.join(controlled, 'input.json');
-    fs.writeFileSync(request, JSON.stringify({ executable: process.execPath, args: ['-e', code], cwd: root }));
+    fs.writeFileSync(request, JSON.stringify({ executable: process.execPath, args: ['-e', code], cwd: project }));
     return bg.start(file, request);
   };
   let outstanding;
@@ -201,6 +203,28 @@ test('owned supervisor completion, boundaries, cancellation and crashes', async 
       await assert.rejects(bg.start(file, external), /escapes/);
       const invalid = path.join(controlled, 'invalid.json'); fs.writeFileSync(invalid, JSON.stringify({ executable: 'relative-program', args: [] }));
       await assert.rejects(bg.start(file, invalid), /absolute executable/);
+    });
+    await t.test('external working directories run without moving job metadata; invalid cwd never claims a slot', async () => {
+      const external = path.join(root, '外部 worktree'); fs.mkdirSync(external);
+      const request = path.join(controlled, 'cwd-input.json');
+      const submit = cwd => {
+        fs.writeFileSync(request, JSON.stringify({ executable: process.execPath, args: ['-e', 'console.log(JSON.stringify(process.cwd()))'], ...(cwd === undefined ? {} : { cwd }) }));
+        return bg.enqueue(file, request);
+      };
+      for (const cwd of ['relative', '', null, 42, path.join(root, 'missing'), file]) {
+        await assert.rejects(submit(cwd));
+        assert.equal(fs.existsSync(path.join(controlled, 'active.json')), false);
+      }
+      for (const cwd of [external, undefined]) {
+        const { id } = await submit(cwd); outstanding = id;
+        await bg.activate(file, id);
+        const result = await bg.wait(file, id, { timeoutMs: 15000 });
+        assert.equal(result.exit_code, 0);
+        assert.equal(JSON.parse(result.output_tail.trim()), fs.realpathSync(cwd || project));
+        assert.equal(path.dirname(result.log_file), path.join(controlled, id));
+        assert.deepEqual(fs.readdirSync(external), []);
+        bg.release(file, id); outstanding = null;
+      }
     });
     await t.test('model-side enqueue never starts a process; only local worker activation does', async () => {
       const request = path.join(controlled, 'input.json');
