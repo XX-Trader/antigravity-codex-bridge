@@ -45,7 +45,7 @@ function recordedReceipt(directory, event) {
   return false;
 }
 const checks = new Set(['notification_check', 'parallel_check', 'subagent_check']);
-const important = new Set(['terminal', 'execution_alert', 'notification_alert']);
+const important = new Set(['terminal', 'execution_alert', 'notification_alert', 'monitoring_alert', 'background_status']);
 function notificationPolicy(job, event, now = Date.now()) {
   if (['notification_check', 'silence_alert'].includes(event.kind)) return 'silent';
   if (checks.has(event.kind) || important.has(event.kind) || !event.schema) return 'send';
@@ -83,6 +83,7 @@ function eventMessage(job, event) {
   if (event.kind === 'notification_check') return internal('本地通知检查，不回复、不展示编号、不调用工具、不派发或续跑业务。');
   if (event.kind === 'session_ready') return `${internal('首次任务会话建立，不调用任何工具；不调用 codex_run、不轮询。')}\n${draft('已启动', '已开始处理这项工作，详细过程可打开原任务查看。')}\n${compact}`;
   if (['notification_alert', 'notification_recovered'].includes(event.kind)) return `${internal(event.detail + '\n不重派、不盲目重发。')}\n${draft('结果通知异常', '任务结果通知未能确认送达，已有结果仍保存在原任务中，请查看详情。')}\n${compact}`;
+  if (['monitoring_alert', 'background_status'].includes(event.kind)) return `${internal(event.detail + '\n这是原任务的托管状态，不是新的派发请求。先简短反馈这一状态；不等待排障或下一轮完成才说明。进程存活不等于业务有进展，观测不可用不等于进程已退出。不调用 codex_run、不取消或重启原命令、不用模型轮询。')}\n${draft(event.kind === 'monitoring_alert' ? '后台状态观测暂不可用' : '后台仍在托管', event.detail)}\n${compact}`;
   if (event.kind === 'execution_alert') return `${internal(event.detail + '\n请领取一次原回执核查所属进程；不重派、不盲目终止PID。')}\n${draft('需要核查', '执行器已退出，后台命令是否结束尚未确认，需要核对原命令和日志。')}\n${compact}`;
   const resume = event.detail?.match(/(?:^|\s)CHECK_ID=([a-f0-9]{24}:\d+)/)?.[1];
   const checkId = resume?.startsWith(job.job_id + ':') ? resume : event.event_id;
@@ -283,6 +284,9 @@ function auditNotifications(broker, ids, options = {}) {
 }
 function watch(broker, send, options = {}) {
   const pending = new Set(), timers = new Map(), offsets = new Map(), known = new Set(), tracked = new Set(); let draining = false, closed = false, interval, watcher;
+  // Delivery slots bound native API calls, not execution jobs. Serialize one
+  // conversation while allowing other recipients past a slow or timed-out host.
+  const inFlight = new Set(), deliveryConcurrency = 4;
   const healthFile = path.join(path.dirname(broker.jobs), 'notification-health.json');
   const health = { pid: process.pid, generation: options.generation || null, interval_ms: options.reconcileMs ?? 15000, last_delivery_at: null, watch_error: null };
   const heartbeat = () => { if (fs.existsSync(path.dirname(healthFile))) save(healthFile, { ...health, checked_at: new Date().toISOString(), tracked_jobs: tracked.size, closed }); };
@@ -313,29 +317,37 @@ function watch(broker, send, options = {}) {
       if (progress?.item_type === 'command_execution' && commandPhase(progress.command)) publishNotification(broker.jobPath(id), job, `legacy-${progress.item_id}-${progress.event_type}`, 'progress', `${commandPhase(progress.command)}状态变化：${progress.event_type}。`);
     }
   };
-  const drain = async () => {
-    if (draining) return;
+  const deliverOne = async id => {
+    try {
+      adaptLegacy(id);
+      if (await deliver(broker, id, send, options)) health.last_delivery_at = new Date().toISOString();
+      const job = broker.get(id), rows = notificationEvents(broker.jobPath(id));
+      // Worker status is saved before its terminal outbox event. Do not retire
+      // that job in the gap, or a lost final callback will bypass reconciliation.
+      const settled = terminal.has(job.status) && ((job.notification_schema !== 2 && rows.length === 0) || rows.some(e => e.kind === 'terminal')) && rows.every(e => {
+        const f = e.file.replace(/\.json$/, '.delivery.json'); return fs.existsSync(f) && ['sent', 'accepted', 'superseded', 'suppressed'].includes(read(f).state);
+      });
+      if (settled) tracked.delete(id); else tracked.add(id);
+    }
+    catch (error) {
+      tracked.add(id);
+      process.stderr.write(`${id}: ${error.message}\n`);
+      if (error.not_sent && error.retry_at) schedule(id, Math.max(0, Date.parse(error.retry_at) - Date.now()), true);
+    }
+  };
+  const drain = () => {
+    if (draining || closed) return;
     draining = true;
     try {
       for (const id of pending) {
-        pending.delete(id);
         if (closed || (options.owns && !options.owns())) { close(); break; }
-        try {
-          adaptLegacy(id);
-          if (await deliver(broker, id, send, options)) health.last_delivery_at = new Date().toISOString();
-          const job = broker.get(id), rows = notificationEvents(broker.jobPath(id));
-          // Worker status is saved before its terminal outbox event. Do not retire
-          // that job in the gap, or a lost final callback will bypass reconciliation.
-          const settled = terminal.has(job.status) && ((job.notification_schema !== 2 && rows.length === 0) || rows.some(e => e.kind === 'terminal')) && rows.every(e => {
-            const f = e.file.replace(/\.json$/, '.delivery.json'); return fs.existsSync(f) && ['sent', 'accepted', 'superseded', 'suppressed'].includes(read(f).state);
-          });
-          if (settled) tracked.delete(id); else tracked.add(id);
-        }
-        catch (error) {
-          tracked.add(id);
-          process.stderr.write(`${id}: ${error.message}\n`);
-          if (error.not_sent && error.retry_at) schedule(id, Math.max(0, Date.parse(error.retry_at) - Date.now()), true);
-        }
+        if (inFlight.size >= deliveryConcurrency) break;
+        let recipient;
+        try { recipient = broker.get(id).conversation_id || id; }
+        catch (error) { pending.delete(id); process.stderr.write(`${id}: ${error.message}\n`); continue; }
+        if (inFlight.has(recipient)) continue;
+        pending.delete(id); inFlight.add(recipient);
+        void deliverOne(id).finally(() => { inFlight.delete(recipient); drain(); });
       }
     } finally { draining = false; }
   };

@@ -341,6 +341,67 @@ test('default reconciliation is fifteen seconds and an empty outbox does not sen
   finally { w.close(); }
 });
 
+test('background notices report continued custody and unknown observations without redispatch', t => {
+  const f = fixture(t, 'waiting_background');
+  for (const kind of ['background_status', 'monitoring_alert']) {
+    const detail = kind === 'background_status' ? '后台命令仍在托管；进程存活，业务进展尚未确认。' : '进程查询暂不可用；原命令继续托管，未终止或重启。';
+    const event = f.emit(kind, kind, detail);
+    assert.equal(notificationPolicy(f.job, event), 'send');
+    const message = eventMessage(f.job, event);
+    assert.match(message, /先简短反馈/);
+    assert.match(message, /不调用 codex_run/);
+    assert.match(message, /观测不可用不等于进程已退出/);
+    assert.ok(message.includes(detail));
+    assert.doesNotMatch(message, /执行器已退出/);
+  }
+});
+
+test('slow recipient does not block another conversation and same-chat deliveries remain serial', async t => {
+  const f = fixture(t), second = 'bbbbbbbbbbbbbbbbbbbbbbbb', other = 'cccccccccccccccccccccccc';
+  for (const [jobId, recipient] of [[second, chat], [other, '33333333-3333-3333-3333-333333333333']]) {
+    const file = f.broker.jobPath(jobId); fs.mkdirSync(path.dirname(file));
+    const job = { ...f.job, job_id: jobId, topic_id: jobId, conversation_id: recipient };
+    save(file, job); publishNotification(file, job, 'alert', 'execution_alert');
+  }
+  f.emit('alert', 'execution_alert');
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const calls = [];
+  let activeInChat = 0, maxInChat = 0;
+  const w = watch(f.broker, async recipient => {
+    calls.push(recipient);
+    if (recipient === chat) {
+      activeInChat++; maxInChat = Math.max(maxInChat, activeInChat);
+      await gate; activeInChat--;
+    }
+    return {};
+  }, { reconcileMs: 60000 });
+  t.after(() => { release(); w.close(); });
+  await changed(f.broker.jobs, () => w.reconcile(), () => notificationSummary(f.broker.jobPath(other)).latest.state === 'accepted');
+  assert.equal(calls.filter(c => c === chat).length, 1);
+  assert.equal(maxInChat, 1);
+  await changed(f.broker.jobs, () => release(), () => notificationSummary(f.broker.jobPath(second)).latest.state === 'accepted');
+  assert.equal(maxInChat, 1); assert.equal(calls.length, 3);
+});
+
+test('native delivery concurrency is bounded without limiting background jobs', async t => {
+  const f = fixture(t); let release, active = 0, maximum = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const ids = [];
+  for (let n = 1; n <= 7; n++) {
+    const jobId = String(n).repeat(24), file = f.broker.jobPath(jobId);
+    const job = { ...f.job, job_id: jobId, topic_id: jobId, conversation_id: `${String(n).repeat(8)}-1111-1111-1111-111111111111` };
+    fs.mkdirSync(path.dirname(file)); save(file, job); publishNotification(file, job, 'alert', 'execution_alert'); ids.push(jobId);
+  }
+  const w = watch(f.broker, async () => {
+    active++; maximum = Math.max(maximum, active); await gate; active--; return {};
+  }, { reconcileMs: 60000 });
+  t.after(() => { release(); w.close(); });
+  assert.equal(active, 4);
+  await changed(f.broker.jobs, () => release(), () => ids.every(id => notificationSummary(f.broker.jobPath(id)).latest.state === 'accepted'));
+  assert.equal(maximum, 4);
+});
+
 test('plan refusal keeps executor reasons distinct, requires a human choice and tolerates legacy/malformed output', t => {
   const f = fixture(t, 'blocked');
   const payload = { original_plan: '直接播放', reason: '缺少画面显示通路', impact: '原目标不能交付', question: '继续补齐还是修改目标？', options: ['补齐：保留原目标', '修改：接受额外等待'], recommendation: '补齐', completed: '已核对代码' };

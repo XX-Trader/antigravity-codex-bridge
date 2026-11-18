@@ -631,6 +631,41 @@ exit 0
       const notices = saved.job_id && fs.readdirSync(path.dirname(broker.jobPath(job.job_id))).filter(n => n.startsWith('notification'));
       assert.ok(notices);
     });
+    await t.test('background snapshots preserve start time and alert only once without another model turn', async () => {
+      const background = require('../src/background.cjs');
+      const original = { activate: background.activate, wait: background.wait };
+      const prior = broker.list(1000).map(job => broker.get(job.job_id)).find(job => job.background_result?.exit_code === 0);
+      assert.ok(prior);
+      const id = require('node:crypto').randomBytes(12).toString('hex'), file = broker.jobPath(id);
+      const started = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+      fs.mkdirSync(path.dirname(file));
+      const commandId = 'abcdefabcdefabcdefabcdef';
+      save(file, { ...prior, job_id: id, status: 'waiting_background', ended_at: undefined, background_result: null,
+        conversation_id: '00000000-0000-0000-0000-000000000004', background_wait: { id: commandId, started_at: started } });
+      let activations = 0;
+      background.activate = async () => { activations++; return {}; };
+      background.wait = async (_file, _id, { onCheck }) => {
+        for (const process_alive of [null, null, true, true]) {
+          onCheck({ id: commandId, at: new Date().toISOString(), process_alive, completed: false, observation_error: process_alive === null ? 'temporary process query failure' : null });
+          const current = JSON.parse(fs.readFileSync(file, 'utf8'));
+          assert.equal(current.status, 'waiting_background'); assert.equal(current.background_wait.started_at, started);
+          assert.equal(current.background_wait.process_alive, process_alive);
+        }
+        const notices = require('../src/server.cjs').notificationEvents(file);
+        assert.equal(notices.filter(event => event.kind === 'monitoring_alert').length, 1);
+        assert.equal(notices.filter(event => event.kind === 'background_status').length, 1);
+        assert.match(notices.find(event => event.kind === 'background_status').detail, /存活状态暂无法确认.*业务进展与完成状态未知/);
+        return { id: commandId, reason: 'cancelled', elapsed_ms: 0, termination: { requested: false } };
+      };
+      try {
+        await worker(file);
+        assert.equal(activations, 1);
+        assert.equal(broker.get(id).status, 'cancelled');
+        const events = fs.readFileSync(path.join(path.dirname(file), 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+        assert.equal(events.filter(event => event.type === 'bridge.attempt').length, 0);
+        assert.equal(events.filter(event => event.type === 'bridge.background.check').length, 4);
+      } finally { Object.assign(background, original); }
+    });
     await t.test('worker controlled cancellation and total deadline stop the owned tree without resume', { timeout: 180000 }, async () => {
       for (const mode of ['CANCEL', 'TIMEOUT']) {
         const initial = await broker.run({ prompt: 'CONTROLLED_BACKGROUND_FIXTURE CONTROLLED_' + mode, topic: '受控边界' + mode, timeout_seconds: 30 });
