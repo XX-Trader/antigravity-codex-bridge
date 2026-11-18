@@ -66,7 +66,7 @@ if ($argv -contains 'app-server') {
 $prompt = $input -join "\n"
 $argv = @($args)
 $implementationContract = $prompt.Contains('规划建议不构成用户硬性约束') -and $prompt.Contains('审核阶段仍只读') -and $prompt.Contains('用户边界内的技术错误由 Codex 自行纠正、实现并验证') -and $prompt.Contains('只审核、不改文件等限制及执行策略拒绝不因技术自主权解除') -and (-not $prompt.Contains('技术方案问题按审核交接修订')) -and (-not $prompt.Contains('建议与原文矛盾时按审核协议退回 technical'))
-$longRunContract = $prompt.Contains('检查缺乏依据或不适用的硬编码、逻辑漏洞') -and $prompt.Contains('代表性短跑或分段执行') -and $prompt.Contains('不能等全量运行数小时结束才首次验证') -and $prompt.Contains('早检通过只允许继续，不能代替最终全量验收') -and $prompt.Contains('Terra 可自行完成技术判断') -and $prompt.Contains('交回 Sol 修复') -and $prompt.Contains('未配置时明确限制，不默换模型')
+$longRunContract = $prompt.Contains('检查缺乏依据或不适用的硬编码、逻辑漏洞') -and $prompt.Contains('代表性短跑或分段执行') -and $prompt.Contains('不能等全量运行数小时结束才首次验证') -and $prompt.Contains('早检通过只允许继续，不能代替最终全量验收') -and $prompt.Contains('Terra 可自行完成技术判断') -and $prompt.Contains('交回 Sol 修复') -and $prompt.Contains('未配置时明确限制，不默换模型') -and $prompt.Contains('方案、根因和接口明确的代码修复及补测试') -and $prompt.Contains('先冻结契约和文件边界再派生下游')
 if (-not $longRunContract) { throw 'Long-run preflight and execution role instructions missing' }
 if (-not (($argv -contains 'approval_policy="on-request"') -and ($argv -contains 'approvals_reviewer="auto_review"') -and (-not ($argv -contains 'approval_policy="never"')))) { throw 'Approval configuration mismatch' }
 if ($prompt.Contains('MODEL_NOT_FOUND_FIXTURE') -or ($prompt.Contains('MODEL_NOT_FOUND_EXEC_FIXTURE') -and -not $prompt.Contains('当前是独立审核阶段（stage=review）'))) {
@@ -103,7 +103,7 @@ if ($prompt.Contains('当前是独立审核阶段（stage=review）')) {
   '{"type":"thread.started","thread_id":"' + $tid + '"}'
   if (-not $prompt.Contains('REVIEW_NO_TOOLS_FIXTURE')) { '{"type":"item.completed","item":{"type":"command_execution","command":"read fixture README","exit_code":0}}' }
   if ($prompt.Contains('REVIEW_WRITE_FIXTURE')) { '{"type":"item.completed","item":{"type":"file_change","changes":[]}}' }
-  '{"type":"turn.completed"}'
+  '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":3}}'
   exit 0
 }
 if ($prompt.Contains('SLOW_FIXTURE')) { Start-Sleep -Seconds 60 }
@@ -176,7 +176,7 @@ if ($prompt.Contains('BACKGROUND_HANDOFF_FIXTURE')) { '{"type":"item.started","i
 '{"type":"item.completed","item":{"id":"verify1","type":"command_execution","command":"fixture verify","aggregated_output":"part-1","exit_code":0}}'
 '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"part-2","exit_code":0}}'
 '{"type":"item.completed","item":{"type":"agent_message","text":"FAKE_OK"}}'
-'{"type":"turn.completed"}'
+'{"type":"turn.completed","usage":{"input_tokens":150,"output_tokens":5}}'
 if ($prompt.Contains('LATE_ERROR_FIXTURE')) { '{"type":"turn.failed","error":{"message":"final failure"}}' }
 if ($prompt.Contains('NONZERO_REFUSAL_FIXTURE')) { exit 1 }
 exit 0
@@ -318,6 +318,15 @@ exit 0
       assert.equal(events.filter(e => e.type === 'bridge.review.approved').length, 1);
       assert.deepEqual([...new Set(events.filter(e => e.type === 'thread.started').map(e => e.thread_id))], [result.session_id]);
       assert.equal(result.attempt_total, 1); assert.equal(result.plan_review.attempts.length, 1);
+      assert.deepEqual(result.usage, { input_tokens: 150, output_tokens: 5 });
+      assert.deepEqual(result.usage_delta, { input_tokens: 150, output_tokens: 5 });
+      assert.equal(result.usage_scope, 'session_cumulative');
+      assert.equal(result.plan_review.attempts[0].usage.input_tokens, 100);
+      assert.equal(result.attempts[0].usage.input_tokens, 150);
+      assert.equal(result.attempts[0].thread_id, result.session_id);
+      const persistedUsage = JSON.parse(fs.readFileSync(result.paths.receipt, 'utf8'));
+      assert.equal(persistedUsage.usage.input_tokens, 150);
+      assert.equal(persistedUsage.usage_delta.input_tokens, 150);
       assert.match(result.final_response, /resume=True/);
       for (const fixture of ['REVIEW_NO_MARKER_FIXTURE', 'REVIEW_WRONG_VERSION_FIXTURE', 'REVIEW_EMPTY_SCOPE_FIXTURE', 'REVIEW_NO_TOOLS_FIXTURE', 'REVIEW_WRITE_FIXTURE']) {
         const held = await broker.run({ wait: true, prompt: fixture, topic: fixture });

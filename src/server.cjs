@@ -10,6 +10,7 @@ const readline = require('node:readline');
 const { spawn, spawnSync } = require('node:child_process');
 const { executionReport, loopState, takeover } = require('./loop-guard.cjs');
 const backgroundTask = require('./background.cjs');
+const { startUsage, recordUsage, usageFields } = require('./usage.cjs');
 const { ModelPolicyError, selectedModel, modelPolicy, executionRoute, assertAvailable, validateJobModels, unsupportedModel } = require('./model-policy.cjs');
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'timed_out', 'needs_input', 'blocked', 'execution_blocked', 'review_revise', 'review_needs_evidence']);
@@ -677,9 +678,10 @@ class Broker {
       }
     }
     const receiptFile = path.join(dir, 'receipt.json');
+    const usageDetails = { usage_scope: job.usage_scope || 'legacy_unverified', usage_delta: job.usage_delta ?? null, ...(job.usage_accounting ? { usage_accounting: job.usage_accounting } : {}) };
     const progress = latestProgress(path.join(dir, 'events.jsonl'));
     const timeoutDetails = (job.status === 'timed_out' || job.prior_status === 'timed_out') ? { stop_reason: 'execution_time_limit', timeout_seconds: job.timeout_seconds, termination: job.termination || { requested: null, note: '历史记录未保存终止请求状态，无法确认。' }, unconfirmed_commands_note: '列出的命令退出状态未确认；不得将最近进度视为最终结果。' } : {};
-    if (terminal.has(job.status) && !fs.existsSync(receiptFile)) createOnce(receiptFile, { ...this.summary(job), ...(job.conversation_id ? { conversation_id: job.conversation_id } : {}), ...(usage ? { usage } : {}), ...timeoutDetails, ...((job.status === 'timed_out' || job.prior_status === 'timed_out') ? { progress, background_commands: job.background_commands || [] } : {}), result_bytes: size, result_file: resultFile });
+    if (terminal.has(job.status) && !fs.existsSync(receiptFile)) createOnce(receiptFile, { ...this.summary(job), ...(job.conversation_id ? { conversation_id: job.conversation_id } : {}), ...(usage ? { usage } : {}), ...usageDetails, ...timeoutDetails, ...((job.status === 'timed_out' || job.prior_status === 'timed_out') ? { progress, background_commands: job.background_commands || [] } : {}), result_bytes: size, result_file: resultFile });
     return {
       job_id: id, status: job.status, sandbox: job.sandbox, execution_environment: job.sandbox === 'danger-full-access' ? 'host' : 'sandbox', cwd: job.cwd, session_id: job.thread_id || null, chat: chatAccess(job.thread_id), chat_title: job.chat_title || null, topic_id: job.topic_id || null, topic: job.topic || null,
       model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, web_search: job.settings?.web_search || null, attempt_total: job.attempts?.length || 0, attempts: (job.attempts || []).slice(-6), ...(job.capacity_retry_at ? { capacity_retry_at: job.capacity_retry_at } : {}),
@@ -691,6 +693,7 @@ class Broker {
       final_response: tail(resultFile, 8000), result_truncated: size > 8000,
       progress, notification: notificationSummary(this.jobPath(id)),
       ...(usage ? { usage } : {}),
+      ...usageDetails,
       acceptance: 'CLI completion is not business acceptance; review the returned evidence.',
       paths: { receipt: path.join(dir, 'receipt.json'), result: resultFile, events: path.join(dir, 'events.jsonl'), stderr: path.join(dir, 'stderr.log') }
     };
@@ -824,6 +827,8 @@ async function restoreExecutionEvidence(file, items) {
 }
 async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay }) {
   let job = read(file);
+  const accounting = startUsage(job);
+  const freshThreads = new Set();
   const dir = path.dirname(file), broker = new Broker(job.settings);
   const events = fs.openSync(path.join(dir, 'events.jsonl'), 'a'), stderr = fs.openSync(path.join(dir, 'stderr.log'), 'a');
   let stopReason, finalChanges = null, terminationRequested = false;
@@ -958,7 +963,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
           fs.writeSync(events, line + '\n');
           try {
             const event = JSON.parse(line);
-            if (event.type === 'thread.started' && event.thread_id) { update({ thread_id: event.thread_id }); updateTitle(); notify('session', 'session_ready', '原生 Codex 会话已建立，可打开已保存的执行过程。'); }
+            if (event.type === 'thread.started' && event.thread_id) { if (!job.thread_id) freshThreads.add(event.thread_id); update({ thread_id: event.thread_id }); updateTitle(); notify('session', 'session_ready', '原生 Codex 会话已建立，可打开已保存的执行过程。'); }
             if (event.type === 'turn.completed') { turnCompleted = true; turnFailed = false; usage = event.usage; if (lastError) { update({ recovered_error: lastError }); lastError = ''; } }
             if (event.type === 'turn.failed' || event.type === 'error') { turnFailed = true; lastError = event.error?.message || event.message || ''; }
             if (['item.started', 'item.completed'].includes(event.type) && ['command_execution', 'file_change'].includes(event.item?.type)) businessStarted = true;
@@ -982,9 +987,8 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       const successful = !stopReason && outcome.code === 0 && turnCompleted && !turnFailed && fs.existsSync(output);
       const attemptStderr = fs.readFileSync(path.join(dir, 'stderr.log')).subarray(stderrOffset).toString('utf8');
       const capacity = !successful && !stopReason && !executionBlock(null, attemptStderr) && isCapacity(lastError);
-      const reportedUsage = { ...(job.usage || {}) };
-      for (const [key, value] of Object.entries(usage || {})) if (typeof value === 'number') reportedUsage[key] = (reportedUsage[key] || 0) + value;
-      update({ ...(usage ? { usage: reportedUsage } : {}), attempts: [...job.attempts, { attempt, started_at: new Date(started).toISOString(), model: attemptModel, exit_code: outcome.code, capacity, ...(usage ? { usage } : {}), ...(lastError ? { error: lastError } : {}) }] });
+       if (usage) recordUsage(accounting, job.thread_id, usage, freshThreads.has(job.thread_id));
+       update({ ...(usage ? usageFields(accounting) : {}), attempts: [...job.attempts, { attempt, stage: job.stage, thread_id: job.thread_id || null, started_at: new Date(started).toISOString(), model: attemptModel, exit_code: outcome.code, capacity, ...(usage ? { usage } : {}), ...(lastError ? { error: lastError } : {}) }] });
       if (fs.existsSync(output)) fs.copyFileSync(output, path.join(dir, 'result.txt'));
       if (!capacity || businessStarted) executionUsed += Math.max(0, clock.now() - started);
       if (!successful && !stopReason && !businessStarted && !observed && unsupportedModel(lastError)) {
