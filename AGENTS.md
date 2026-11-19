@@ -24,6 +24,8 @@ Antigravity 提出方案并验收，Codex 对新事项先独立只读核查，�
 
 模型 ID、安装路径和存储盘符不能硬编码为某个人的环境。默认继承 Codex 模型；可选别名留在本机配置。完整访问与联网默认必须在 README 和安装确认中明示。
 
+实施任务默认允许按需修改当前仓库内与目标相关的源码、测试、配置和文档，包括验证发现的关联缺陷；初始文件清单不作为禁改白名单。具体边界见 `.agents/rules/antigravity-codex.md` 的“仓库内修改范围”；仅审核、用户明确禁令、验收标准和已有无关改动仍受保护。
+
 使用 `pwsh` / `pwsh.exe`，无 BOM UTF-8。测试前设置适合当前环境的外部 `CODEX_EXECUTOR_TEST_ROOT`；本机用户已有存储规范时从其规范。运行 `pwsh -NoProfile -Command 'npm test'` 和 `git diff --check`；涉及安装器时验证幂等、已有字段保留、符号链接与回滚冲突。
 
 区分 mock 测试、真实 CLI、原生协议和 Antigravity 界面验收。没有实际观察就说明未验证，不把 CI 或 push 当成宿主已加载。本仓库目前没有 Graphify 索引，不引入其它业务仓库的索引或数据。
