@@ -817,7 +817,7 @@ async function restoreExecutionEvidence(file, items) {
     else if (stage === 'execute' && event.type === 'item.completed') recordEvidence(items, attempt, event.item);
     else if (stage === 'execute' && event.type === 'bridge.background.completed' && !event.reason && !event.error && event.exit_code === 0) {
       try {
-        const owned = backgroundTask.inspect(file, event.id, { verifyProcess: false });
+        const owned = await backgroundTask.inspect(file, event.id, { verifyProcess: false });
         if (owned.status?.exit_code !== 0 || owned.status.error) continue;
         const fd = fs.openSync(owned.log, 'r');
         try { const size = fs.fstatSync(fd).size, bytes = Buffer.alloc(Math.min(size, 8000)); fs.readSync(fd, bytes, 0, bytes.length, Math.max(0, size - bytes.length)); recordBackgroundEvidence(items, { id: event.id, exit_code: 0, output_tail: bytes.toString('utf8') }); } finally { fs.closeSync(fd); }
@@ -868,12 +868,15 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       onCheck: check => {
         fs.writeSync(events, JSON.stringify({ type: 'bridge.background.check', ...check }) + '\n');
         const snapshot = { ...job.background_wait, last_checked_at: check.at, process_alive: check.process_alive, observation_error: check.observation_error || null };
-        const alert = !!check.observation_error && !snapshot.monitoring_alert_at;
-        if (alert) snapshot.monitoring_alert_at = check.at;
+        snapshot.consecutive_observation_failures = check.observation_error ? (snapshot.consecutive_observation_failures || 0) + 1 : 0;
+        const alert = snapshot.consecutive_observation_failures === 2;
+        if (alert) { snapshot.monitoring_alert_at = check.at; snapshot.monitoring_alert_sequence = (snapshot.monitoring_alert_sequence || 0) + 1; }
         update({ background_wait: snapshot });
-        if (alert) notify(`monitoring-alert-${id}`, 'monitoring_alert', '后台命令监督暂时异常，原命令保留并继续本地观察；未确认业务进展或完成。' + check.observation_error);
+        if (alert) notify(`monitoring-alert-${id}-${snapshot.monitoring_alert_sequence}`, 'monitoring_alert', '后台命令监督暂时异常，原命令保留并继续本地观察；未确认业务进展或完成。' + check.observation_error);
       } });
     executionUsed += result.elapsed_ms;
+    const unconfirmed = result.termination?.observation_error || result.termination?.child?.observation_error || result.termination?.unconfirmed_child;
+    if (unconfirmed) notify(`monitoring-unconfirmed-${id}`, 'monitoring_alert', '后台命令终止时无法确认进程归属或退出状态，未确认业务进展或完成。' + unconfirmed);
     fs.writeSync(events, JSON.stringify({ type: 'bridge.background.completed', ...result, output_tail: undefined, at: stamp(), thread_id: job.thread_id }) + '\n');
     update({ background_result: result, background_wait: null, execution_used_ms: executionUsed });
     recordBackgroundEvidence(evidenceItems, result);

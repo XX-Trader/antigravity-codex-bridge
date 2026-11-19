@@ -20,6 +20,26 @@ const fixtureEnv = { CODEX_EXECUTOR_MODEL: 'terra', CODEX_EXECUTOR_MODEL_ALIASES
 Object.assign(process.env, fixtureEnv);
 const config = env => parseConfig({ ...fixtureEnv, ...env });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+test('background evidence recovery awaits owned metadata and rejects unavailable evidence', async () => {
+  const root = fs.mkdtempSync(path.join(process.env.CODEX_EXECUTOR_TEST_ROOT, 'background-evidence-'));
+  const file = path.join(root, 'job.json'), log = path.join(root, 'output.log');
+  const background = require('../src/background.cjs'), original = background.inspect;
+  try {
+    fs.writeFileSync(log, 'recovered output');
+    fs.writeFileSync(path.join(root, 'events.jsonl'), [
+      JSON.stringify({ type: 'bridge.attempt', stage: 'execute', attempt: 1 }),
+      JSON.stringify({ type: 'bridge.background.completed', id: 'abcdefabcdefabcdefabcdef', exit_code: 0 })
+    ].join('\n') + '\n');
+    background.inspect = async () => ({ status: { exit_code: 0 }, log });
+    const items = new Map();
+    await require('../src/server.cjs').restoreExecutionEvidence(file, items);
+    assert.equal(items.get('bg:abcdefabcdefabcdefabcdef').output, 'recovered output');
+    background.inspect = async () => { throw new Error('unavailable'); };
+    const rejected = new Map();
+    await require('../src/server.cjs').restoreExecutionEvidence(file, rejected);
+    assert.equal(rejected.size, 0);
+  } finally { background.inspect = original; fs.rmSync(root, { recursive: true, force: true }); }
+});
 async function finished(broker, id) {
   for (let i = 0; i < 160; i++) {
     const job = broker.status(id);
@@ -656,16 +676,17 @@ exit 0
       let activations = 0;
       background.activate = async () => { activations++; return {}; };
       background.wait = async (_file, _id, { onCheck }) => {
-        for (const process_alive of [null, null, true, true]) {
+        for (const [index, process_alive] of [null, true, null, null, true, null, null].entries()) {
           onCheck({ id: commandId, at: new Date().toISOString(), process_alive, completed: false, observation_error: process_alive === null ? 'temporary process query failure' : null });
           const current = JSON.parse(fs.readFileSync(file, 'utf8'));
           assert.equal(current.status, 'waiting_background'); assert.equal(current.background_wait.started_at, started);
           assert.equal(current.background_wait.process_alive, process_alive);
+          assert.equal(require('../src/server.cjs').notificationEvents(file).filter(event => event.kind === 'monitoring_alert').length, index < 3 ? 0 : index < 6 ? 1 : 2);
         }
         const notices = require('../src/server.cjs').notificationEvents(file);
-        assert.equal(notices.filter(event => event.kind === 'monitoring_alert').length, 1);
+        assert.equal(notices.filter(event => event.kind === 'monitoring_alert').length, 2);
         assert.equal(notices.filter(event => event.kind === 'background_status').length, 0);
-        return { id: commandId, reason: 'cancelled', elapsed_ms: 0, termination: { requested: false } };
+        return { id: commandId, reason: 'cancelled', elapsed_ms: 0, termination: { requested: false, observation_error: 'termination unconfirmed' } };
       };
       try {
         await worker(file);
@@ -673,7 +694,8 @@ exit 0
         assert.equal(broker.get(id).status, 'cancelled');
         const events = fs.readFileSync(path.join(path.dirname(file), 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
         assert.equal(events.filter(event => event.type === 'bridge.attempt').length, 0);
-        assert.equal(events.filter(event => event.type === 'bridge.background.check').length, 4);
+        assert.equal(events.filter(event => event.type === 'bridge.background.check').length, 7);
+        assert.equal(require('../src/server.cjs').notificationEvents(file).filter(event => event.kind === 'monitoring_alert').length, 3);
       } finally { Object.assign(background, original); }
     });
     await t.test('worker controlled cancellation and total deadline stop the owned tree without resume', { timeout: 180000 }, async () => {

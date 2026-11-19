@@ -14,9 +14,9 @@ test('temporary observation failures preserve a single owned command and bounded
   fs.mkdirSync(controlled);
   fs.writeFileSync(file, JSON.stringify({ job_id: '123456789012345678901234', stage: 'execute', cwd: root, settings: { pwsh: 'fixture-pwsh' } }));
   const source = fs.readFileSync(require.resolve('../src/background.cjs'), 'utf8');
-  let unavailable = false, spawns = 0, queries = 0, watchFails = false, mismatch = false, cimUnavailable = false, kills = 0, manualWatch = false;
+  let unavailable = false, spawns = 0, queries = 0, watchFails = false, mismatch = false, cimUnavailable = false, kills = 0, manualWatch = false, killUnknown = false;
   const watchCallbacks = [];
-  let duringQuery = null;
+  let duringQuery = null, queryGate = null, queryStarted = null, instances = 0, closes = 0;
   const fakeFs = Object.create(fs);
   fakeFs.watch = (...args) => {
     if (manualWatch) { watchCallbacks.push(args[1]); const watcher = new EventEmitter(); watcher.close = () => {}; return watcher; }
@@ -27,7 +27,25 @@ test('temporary observation failures preserve a single owned command and bounded
   const filename = require.resolve('../src/background.cjs');
   vm.runInNewContext(source, { module, exports: module.exports, __filename: filename, console, Buffer, setTimeout, clearTimeout,
     process: { platform: 'win32', execPath: process.execPath, pid: process.pid, env: process.env },
-    require: name => name === 'node:fs' ? fakeFs : name === 'node:child_process' ? {
+    require: name => name === 'node:fs' ? fakeFs : name === './process-query.cjs' ? { ProcessQuery: class {
+      constructor() { instances++; this.interrupt = null; }
+      async request(request) {
+        queries++;
+        if (queryGate && request.op === 'inspect') {
+          const gate = queryGate; queryGate = null;
+          const interrupted = new Promise((_, reject) => { this.interrupt = reject; });
+          queryStarted();
+          try { await Promise.race([gate, interrupted]); } finally { this.interrupt = null; }
+        }
+        if (unavailable) throw new Error('process query timed out');
+        if (request.op === 'kill') { kills++; if (killUnknown) throw new Error('connection lost after kill request'); return { requested: true }; }
+        if (duringQuery) { const action = duringQuery; duringQuery = null; action(); return { items: request.pids.map(pid => ({ pid, identity: null })) }; }
+        if (cimUnavailable) throw new Error('CIM query timed out');
+        return { items: request.pids.map(pid => ({ pid, identity: '123', executable: process.execPath, command: `${mismatch ? 'foreign' : filename} --supervise ${currentRequest}`, parent: 1234 })) };
+      }
+      fail(error) { this.interrupt?.(error); }
+      close() { closes++; }
+    } } : name === 'node:child_process' ? {
       spawn: (_exe, args) => {
         spawns++;
         const request = JSON.parse(fs.readFileSync(args[2], 'utf8'));
@@ -35,15 +53,6 @@ test('temporary observation failures preserve a single owned command and bounded
         fs.writeFileSync(path.join(dir, 'output.log'), 'ONE_COMMAND');
         fs.writeFileSync(path.join(dir, 'launch.json'), JSON.stringify({ id: request.id, job_id: request.job_id, nonce: request.nonce, pid: 1234, identity: '123' }));
         const child = new EventEmitter(); child.unref = () => {}; return child;
-      },
-      spawnSync: (_exe, args) => {
-        queries++;
-        if (unavailable) return { error: new Error('process query timed out'), status: null };
-        const script = args.at(-1);
-        if (duringQuery && script.includes('Get-Process')) { const action = duringQuery; duringQuery = null; action(); return { status: 0, stdout: '', stderr: '' }; }
-        if (script.includes('Get-CimInstance') && cimUnavailable) return { error: new Error('CIM query timed out'), status: null };
-        if (script.includes('.Kill(')) { kills++; return { status: 0, stdout: 'OWNED_TERMINATION_REQUESTED', stderr: '' }; }
-        return { status: 0, stdout: script.includes('Get-CimInstance') ? JSON.stringify({ ExecutablePath: process.execPath, CommandLine: `${mismatch ? 'foreign' : filename} --supervise ${currentRequest}` }) : '123', stderr: '' };
       }
     } : require(name) });
   const owned = module.exports;
@@ -60,6 +69,105 @@ test('temporary observation failures preserve a single owned command and bounded
     fs.writeFileSync(path.join(controlled, id, 'status.json'), JSON.stringify({ id, job_id: launch.job_id, nonce: launch.nonce, exit_code: 0, ended_at: new Date().toISOString() }));
   };
   try {
+    await t.test('completion is collected while observation is pending and query is closed', async () => {
+      const id = await prepare(), activated = await owned.activate(file, id);
+      let releaseQuery, started;
+      const startedPromise = new Promise(resolve => { started = resolve; });
+      queryStarted = started;
+      queryGate = new Promise(resolve => { releaseQuery = resolve; });
+      const closeBefore = closes, pending = owned.wait(file, id, { activated, intervalMs: 20000 });
+      await startedPromise;
+      complete(id);
+      try {
+        const result = await Promise.race([pending, new Promise((_, reject) => setTimeout(() => reject(new Error('completion blocked by query')), 2000))]);
+        assert.equal(result.exit_code, 0);
+        assert.ok(closes > closeBefore);
+      } finally { releaseQuery(); owned.release(file, id); }
+    });
+    await t.test('cancel observed during a pending query is not lost', async () => {
+      const id = await prepare(), activated = await owned.activate(file, id);
+      let releaseQuery, started;
+      const startedPromise = new Promise(resolve => { started = resolve; });
+      queryStarted = started;
+      queryGate = new Promise(resolve => { releaseQuery = resolve; });
+      const pending = owned.wait(file, id, { activated, intervalMs: 20000 });
+      await startedPromise;
+      fs.writeFileSync(path.join(root, 'cancel'), '');
+      releaseQuery();
+      try {
+        const result = await Promise.race([pending, new Promise((_, reject) => setTimeout(() => reject(new Error('cancel event lost')), 2000))]);
+        assert.equal(result.reason, 'cancelled'); assert.equal(result.termination.requested, true);
+      } finally { fs.unlinkSync(path.join(root, 'cancel')); owned.release(file, id); }
+    });
+    await t.test('completion wins when a file event interrupts initial cancellation verification', async () => {
+      const id = await prepare(), activated = await owned.activate(file, id);
+      let releaseQuery, started;
+      const startedPromise = new Promise(resolve => { started = resolve; });
+      queryStarted = started;
+      queryGate = new Promise(resolve => { releaseQuery = resolve; });
+      manualWatch = true; watchCallbacks.length = 0;
+      fs.writeFileSync(path.join(root, 'cancel'), '');
+      const before = kills, pending = owned.wait(file, id, { activated, intervalMs: 20000 });
+      await startedPromise;
+      complete(id); watchCallbacks[0]('change', 'status.json');
+      try {
+        const result = await Promise.race([pending, new Promise((_, reject) => setTimeout(() => reject(new Error('completion event lost')), 2000))]);
+        assert.equal(result.exit_code, 0); assert.equal(kills, before);
+      } finally {
+        releaseQuery(); manualWatch = false; fs.unlinkSync(path.join(root, 'cancel')); owned.release(file, id);
+      }
+    });
+    await t.test('lost termination receipt leaves result unknown without another child kill', async () => {
+      const id = await prepare(); await owned.activate(file, id);
+      const launchFile = path.join(controlled, id, 'launch.json');
+      const launch = JSON.parse(fs.readFileSync(launchFile, 'utf8'));
+      launch.child = { pid: 5678, identity: '123' };
+      fs.writeFileSync(launchFile, JSON.stringify(launch));
+      const updated = await owned.inspect(file, id, { verifyProcess: false });
+      const before = kills;
+      killUnknown = true; fs.writeFileSync(path.join(root, 'cancel'), '');
+      try {
+        const result = await owned.wait(file, id, { activated: updated });
+        assert.equal(result.termination.requested, null);
+        assert.match(result.termination.observation_error, /connection lost after kill request/);
+        assert.equal(kills - before, 1);
+      } finally { killUnknown = false; fs.unlinkSync(path.join(root, 'cancel')); owned.release(file, id); }
+    });
+    for (const policy of [false, true]) await t.test(policy ? 'supervisor does not retry policy denial' : 'supervisor retries a transient self identity failure', async () => {
+      const id = await prepare(), supervisorModule = { exports: {} };
+      let attempts = 0, starts = 0, closed = 0;
+      vm.runInNewContext(source + '\nmodule.exports.fixtureSupervise = supervise;', { module: supervisorModule, exports: supervisorModule.exports, __filename: filename, console, Buffer, setTimeout, clearTimeout,
+        process: { platform: 'win32', execPath: process.execPath, pid: 1234, env: process.env },
+        require: name => name === './process-query.cjs' ? { ProcessQuery: class {
+          async request(request) {
+            if (request.pids.includes(1234)) {
+              attempts++;
+              if (policy) throw new Error('rejected: blocked by policy');
+              if (attempts === 1) throw new Error('temporary timeout');
+            }
+            return { items: request.pids.map(pid => ({ pid, identity: '123' })) };
+          }
+          close() { if (!this.closed) { this.closed = true; closed++; } }
+        } } : name === 'node:child_process' ? {
+          spawn: () => {
+            starts++;
+            const child = new EventEmitter(); child.pid = 5678; child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+            setTimeout(() => child.emit('close', 0), 20);
+            return child;
+          }
+        } : require(name) });
+      try {
+        if (policy) {
+          await assert.rejects(supervisorModule.exports.fixtureSupervise(currentRequest), /rejected: blocked by policy/);
+          assert.equal(attempts, 1); assert.equal(starts, 0);
+        } else {
+          await supervisorModule.exports.fixtureSupervise(currentRequest);
+          assert.equal(attempts, 2); assert.equal(starts, 1);
+          assert.equal(JSON.parse(fs.readFileSync(path.join(path.dirname(currentRequest), 'status.json'), 'utf8')).exit_code, 0);
+        }
+        assert.equal(closed, 1);
+      } finally { owned.release(file, id); }
+    });
     for (const tampered of [false, true]) await t.test(tampered ? 'completion written during exit observation still rejects a foreign nonce' : 'completion written during exit observation wins over the stale empty snapshot', async () => {
       const id = await prepare(), activated = await owned.activate(file, id), before = spawns;
       duringQuery = () => {
@@ -80,14 +188,19 @@ test('temporary observation failures preserve a single owned command and bounded
       let starts = 0;
       vm.runInNewContext(source + '\nmodule.exports.fixtureSupervise = supervise;', { module: supervisorModule, exports: supervisorModule.exports, __filename: filename, console, Buffer, setTimeout, clearTimeout,
         process: { platform: 'win32', execPath: process.execPath, pid: 1234, env: process.env },
-        require: name => name === 'node:child_process' ? {
+        require: name => name === './process-query.cjs' ? { ProcessQuery: class {
+          async request(request) {
+            if (request.pids.includes(5678)) throw new Error('child birth query timeout');
+            return { items: request.pids.map(pid => ({ pid, identity: '123', executable: process.execPath, command: `${filename} --supervise ${currentRequest}`, parent: 1234 })) };
+          }
+          close() {}
+        } } : name === 'node:child_process' ? {
           spawn: () => {
             starts++;
             const child = new EventEmitter(); child.pid = 5678; child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
             setTimeout(() => { child.stdout.emit('data', Buffer.from('CHILD_COMPLETED_ONCE')); child.emit('close', 0); }, 20);
             return child;
-          },
-          spawnSync: (_exe, args) => args.at(-1).includes('-Id 5678 ') ? { error: new Error('child birth query timeout'), status: null } : { status: 0, stdout: '123' }
+          }
         } : require(name) });
       await supervisorModule.exports.fixtureSupervise(currentRequest);
       const dir = path.dirname(currentRequest), registration = JSON.parse(fs.readFileSync(path.join(dir, 'launch.json'), 'utf8'));
@@ -99,7 +212,7 @@ test('temporary observation failures preserve a single owned command and bounded
     });
     await t.test('activation degradation recovers initial verification without another spawn', async () => {
       const before = spawns, id = await prepare(); unavailable = true;
-      const activated = await owned.activate(file, id), checks = [];
+      const activated = await owned.activate(file, id), checks = [], instancesBefore = instances;
       assert.equal(activated.processVerified, false);
       const pending = owned.wait(file, id, { activated, intervalMs: 20, onCheck: check => checks.push(check) });
       await new Promise(resolve => setTimeout(resolve, 65));
@@ -110,6 +223,7 @@ test('temporary observation failures preserve a single owned command and bounded
       assert.ok(checks.some(check => check.process_alive === true));
       complete(id);
       assert.equal((await pending).exit_code, 0); assert.equal(spawns, before + 1);
+      assert.equal(instances - instancesBefore, 1, 'wait reuses one query instance across failures and recovery');
       owned.release(file, id);
     });
     await t.test('failed initial validation must still reject foreign supervisor after recovery', async () => {
@@ -198,7 +312,7 @@ test('owned supervisor completion, boundaries, cancellation and crashes', async 
     await t.test('handoff is distinct from unknown background; invalid IDs and external requests fail', async () => {
       assert.equal(finalHandoff('[CODEX_BACKGROUND_RUNNING] unknown').kind, 'background_running');
       assert.equal(finalHandoff('[CODEX_BACKGROUND_WAIT]\n{"id":"abc"}').controlled_id, 'abc');
-      assert.throws(() => bg.inspect(file, '../outside'), /Invalid/);
+      await assert.rejects(bg.inspect(file, '../outside'), /Invalid/);
       const external = path.join(root, 'external.json'); fs.writeFileSync(external, '{}');
       await assert.rejects(bg.start(file, external), /escapes/);
       const invalid = path.join(controlled, 'invalid.json'); fs.writeFileSync(invalid, JSON.stringify({ executable: 'relative-program', args: [] }));
@@ -259,20 +373,20 @@ test('owned supervisor completion, boundaries, cancellation and crashes', async 
     });
     await t.test('registration nonce, status, symlink and arbitrary live PID cannot be adopted', async () => {
       const { id } = await launch('setTimeout(()=>{},120000)'); outstanding = id;
-      const info = bg.inspect(file, id), launchFile = path.join(info.dir, 'launch.json');
+      const info = await bg.inspect(file, id), launchFile = path.join(info.dir, 'launch.json');
       const original = JSON.stringify(info.launch);
       fs.writeFileSync(launchFile, JSON.stringify({ ...info.launch, nonce: 'a'.repeat(48) }));
-      assert.throws(() => bg.inspect(file, id), /does not match/);
-      fs.writeFileSync(launchFile, JSON.stringify({ ...info.launch, pid: process.pid, identity: bg.identity(process.pid, pwsh) }));
-      assert.throws(() => bg.inspect(file, id), /not this job owned supervisor/);
+      await assert.rejects(bg.inspect(file, id), /does not match/);
+      fs.writeFileSync(launchFile, JSON.stringify({ ...info.launch, pid: process.pid, identity: await bg.identity(process.pid, pwsh) }));
+      await assert.rejects(bg.inspect(file, id), /not this job owned supervisor/);
       fs.writeFileSync(launchFile, original);
       fs.writeFileSync(info.statusFile, JSON.stringify({ id, job_id: info.job.job_id, nonce: 'b'.repeat(48), exit_code: 0, ended_at: new Date().toISOString() }));
-      assert.throws(() => bg.inspect(file, id), /completion/); fs.unlinkSync(info.statusFile);
+      await assert.rejects(bg.inspect(file, id), /completion/); fs.unlinkSync(info.statusFile);
       const junction = path.join(controlled, 'abcdefabcdefabcdefabcdef');
       fs.symlinkSync(root, junction, 'junction');
       // The unit directory may not alias a parent or any location outside root.
-      assert.throws(() => bg.inspect(file, 'abcdefabcdefabcdefabcdef'), /escapes/); fs.unlinkSync(junction);
-      assert.equal(bg.killOwned({ pid: process.pid, identity: '1' }, pwsh).requested, false);
+      await assert.rejects(bg.inspect(file, 'abcdefabcdefabcdefabcdef'), /escapes/); fs.unlinkSync(junction);
+      assert.equal((await bg.killOwned({ pid: process.pid, identity: '1' }, pwsh)).requested, false);
       fs.writeFileSync(path.join(root, 'cancel'), '');
       const result = await bg.wait(file, id, { timeoutMs: 15000 });
       assert.equal(result.reason, 'cancelled'); assert.equal(result.termination.requested, true);
@@ -286,13 +400,13 @@ test('owned supervisor completion, boundaries, cancellation and crashes', async 
     });
     await t.test('supervisor crash without status resumes with unknown exit rather than hanging', async () => {
       const { id } = await launch('setTimeout(()=>{},120000)'); outstanding = id;
-      const info = bg.inspect(file, id); assert.equal(bg.killOwned(info.launch, pwsh).requested, true);
+      const info = await bg.inspect(file, id); assert.equal((await bg.killOwned(info.launch, pwsh)).requested, true);
       const result = await bg.wait(file, id, { timeoutMs: 15000, intervalMs: 50 });
       assert.equal(result.exit_code, null); assert.match(result.error, /without a completion record/);
       bg.release(file, id); outstanding = null;
     });
   } finally {
-    if (outstanding) { const info = bg.inspect(file, outstanding); bg.killOwned(info.launch, pwsh); }
+    if (outstanding) { const info = await bg.inspect(file, outstanding); await bg.killOwned(info.launch, pwsh); }
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

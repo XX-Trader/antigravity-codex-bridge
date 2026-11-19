@@ -2,7 +2,7 @@
 
 让 Antigravity 理解需求、提出方案并验收，由本机 Codex CLI 独立审核，通过后执行任务。
 
-执行和子 agent 都属于 Codex：Antigravity 不用自己的原生子 agent、命令或写文件工具代做。需要细分时，由 Codex 会话调用自己的原生 `spawn_agent` 并汇总结果。桥接启动时显式启用 `features.multi_agent=true`，不覆盖用户的原生子线程数量配置；这与多个独立顶层 Codex 任务是两件事。
+接入桥接的业务项目中，执行和子 agent 都属于 Codex：Antigravity 不用自己的原生子 agent、命令或写文件工具代做。需要细分时，由 Codex 会话调用自己的原生 `spawn_agent` 并汇总结果。桥接启动时显式启用 `features.multi_agent=true`，不覆盖用户的原生子线程数量配置；这与多个独立顶层 Codex 任务是两件事。维护本桥接仓库自身时，Antigravity 可以直接修改、测试和上传代码，无需经 MCP 派发；见 [仓库约定](AGENTS.md)。
 
 这是一个 Windows 优先的本地 stdio MCP 服务，不需要 npm 运行依赖，也不复制 Codex 登录凭证。默认启用完整文件系统/命令网络访问和实时联网搜索，适用于你信任的本机项目；不要接到不可信工作区或远程公开端口。
 

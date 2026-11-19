@@ -4,7 +4,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { spawn, spawnSync } = require('node:child_process');
+const { spawn } = require('node:child_process');
+const { ProcessQuery } = require('./process-query.cjs');
 const idPattern = /^[a-f0-9]{24}$/;
 function observationError(message) {
   const error = new Error(message);
@@ -35,30 +36,29 @@ function layout(file) {
   contained(path.dirname(jobFile), root);
   return { jobFile, job, root };
 }
-function identity(pid, pwsh) {
+async function identity(pid, pwsh, query) {
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('Invalid owned process ID');
   if (process.platform !== 'win32') {
     try { return fs.readFileSync('/proc/' + pid + '/stat', 'utf8').split(') ')[1].split(' ')[19]; }
     catch (e) { if (e.code === 'ENOENT') return null; throw e; }
   }
-  const result = spawnSync(pwsh, ['-NoProfile', '-NonInteractive', '-Command',
-    `$ErrorActionPreference='Stop'; $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($p){try{[Console]::Write($p.StartTime.ToUniversalTime().Ticks)}catch{if(Get-Process -Id ${pid} -ErrorAction SilentlyContinue){throw}}}; exit 0`], { encoding: 'utf8', windowsHide: true, timeout: 10000 });
-  if (result.error || result.status !== 0) throw observationError('Cannot verify owned process identity: ' + (result.error?.message || result.stderr));
-  return result.stdout.trim() || null;
+  const own = !query; query ||= new ProcessQuery(pwsh);
+  try { return (await query.request({ op: 'inspect', pids: [pid] })).items[0].identity; }
+  catch (e) { throw observationError('Cannot verify owned process identity: ' + e.message); }
+  finally { if (own) query.close(); }
 }
-function killOwned(record, pwsh) {
-  if (identity(record.pid, pwsh) !== record.identity) return { requested: false, reason: 'Owned process exited or identity changed' };
+async function killOwned(record, pwsh, query) {
   if (process.platform === 'win32') {
-    // Recheck using the same Process object that issues Kill; do not resolve a
-    // fresh bare PID after the check (PID reuse must not target another process).
-    const script = `$ErrorActionPreference='Stop'; $p=Get-Process -Id ${record.pid} -ErrorAction SilentlyContinue; if($p -and $p.StartTime.ToUniversalTime().Ticks.ToString() -eq '${record.identity}'){ $p.Kill($true); $p.WaitForExit(10000) | Out-Null; 'OWNED_TERMINATION_REQUESTED' }`;
-    const r = spawnSync(pwsh, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', windowsHide: true, timeout: 15000 });
-    return { requested: r.status === 0 && r.stdout.includes('OWNED_TERMINATION_REQUESTED'), exit_code: r.status, error: r.error?.message || r.stderr?.trim() || null };
+    const own = !query; query ||= new ProcessQuery(pwsh);
+    try { return await query.request({ op: 'kill', ...record }); }
+    catch (e) { const error = observationError('Cannot confirm owned process termination: ' + e.message); error.termination_unknown = true; throw error; }
+    finally { if (own) query.close(); }
   }
+  if (await identity(record.pid, pwsh) !== record.identity) return { requested: false, reason: 'Owned process exited or identity changed' };
   try { process.kill(-record.pid, 'SIGTERM'); return { requested: true }; }
   catch (e) { return { requested: false, error: e.message }; }
 }
-function inspect(file, id, { verifyProcess = true } = {}) {
+async function inspect(file, id, { verifyProcess = true, query } = {}) {
   if (!idPattern.test(id || '')) throw new Error('Invalid controlled background ID');
   const { job, root } = layout(file), dir = contained(root, path.join(root, id));
   const launch = read(contained(dir, path.join(dir, 'launch.json')));
@@ -66,28 +66,19 @@ function inspect(file, id, { verifyProcess = true } = {}) {
       !Number.isSafeInteger(launch.pid) || launch.pid <= 0 || !/^\d+$/.test(launch.identity || '')) throw new Error('Invalid owned background registration');
   const requestFile = contained(dir, path.join(dir, 'request.json')), request = read(requestFile);
   if (request.id !== id || request.job_id !== job.job_id || request.nonce !== launch.nonce) throw new Error('Background registration does not match launch request');
-  if (verifyProcess && process.platform === 'win32' && identity(launch.pid, job.settings.pwsh) === launch.identity) {
-    const r = spawnSync(job.settings.pwsh, ['-NoProfile', '-NonInteractive', '-Command',
-      `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Get-CimInstance Win32_Process -Filter 'ProcessId = ${launch.pid}' | Select-Object ExecutablePath,CommandLine | ConvertTo-Json -Compress`], { encoding: 'utf8', windowsHide: true, timeout: 10000 });
-    if (r.error || r.status !== 0) throw observationError('Cannot verify owned supervisor command line: ' + (r.error?.message || r.stderr));
-    let actual;
-    try { actual = r.stdout.trim() ? JSON.parse(r.stdout) : null; } catch (e) { throw observationError('Cannot read owned supervisor command line: ' + e.message); }
-    if (!actual) throw observationError('Owned supervisor command line temporarily unavailable');
-    if (actual && (actual.ExecutablePath?.toLowerCase() !== process.execPath.toLowerCase() ||
-        !actual.CommandLine?.toLowerCase().includes(__filename.toLowerCase()) ||
-        !actual.CommandLine?.includes('--supervise') || !actual.CommandLine?.toLowerCase().includes(requestFile.toLowerCase()))) throw new Error('PID is not this job owned supervisor');
-  }
-  if (launch.child) {
-    if (!Number.isSafeInteger(launch.child.pid) || launch.child.pid <= 0 || !/^\d+$/.test(launch.child.identity || '')) throw new Error('Invalid owned child registration');
-    if (verifyProcess && process.platform === 'win32' && identity(launch.child.pid, job.settings.pwsh) === launch.child.identity) {
-      const r = spawnSync(job.settings.pwsh, ['-NoProfile', '-NonInteractive', '-Command',
-        `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Get-CimInstance Win32_Process -Filter 'ProcessId = ${launch.child.pid}' | Select-Object ExecutablePath,ParentProcessId | ConvertTo-Json -Compress`], { encoding: 'utf8', windowsHide: true, timeout: 10000 });
-      if (r.error || r.status !== 0) throw observationError('Cannot verify owned command parent: ' + (r.error?.message || r.stderr));
-      let actual;
-      try { actual = r.stdout.trim() ? JSON.parse(r.stdout) : null; } catch (e) { throw observationError('Cannot read owned command parent: ' + e.message); }
-      if (!actual) throw observationError('Owned command parent temporarily unavailable');
-      if (actual && (actual.ParentProcessId !== launch.pid || actual.ExecutablePath?.toLowerCase() !== request.executable.toLowerCase())) throw new Error('PID is not this supervisor owned command');
-    }
+  if (launch.child && (!Number.isSafeInteger(launch.child.pid) || launch.child.pid <= 0 || !/^\d+$/.test(launch.child.identity || ''))) throw new Error('Invalid owned child registration');
+  let observed = null;
+  if (verifyProcess && process.platform === 'win32') {
+    const own = !query; query ||= new ProcessQuery(job.settings.pwsh);
+    try { observed = (await query.request({ op: 'inspect', pids: [launch.pid, ...(launch.child ? [launch.child.pid] : [])] })).items; }
+    catch (e) { throw observationError('Cannot verify owned processes: ' + e.message); }
+    finally { if (own) query.close(); }
+    const supervisor = observed[0], child = observed[1];
+    if (!supervisor || (launch.child && !child)) throw observationError('Owned process details temporarily unavailable');
+    if (supervisor.identity === launch.identity && (supervisor.executable?.toLowerCase() !== process.execPath.toLowerCase() ||
+        !supervisor.command?.toLowerCase().includes(__filename.toLowerCase()) || !supervisor.command?.includes('--supervise') ||
+        !supervisor.command?.toLowerCase().includes(requestFile.toLowerCase()))) throw new Error('PID is not this job owned supervisor');
+    if (child && child.identity === launch.child.identity && (child.parent !== launch.pid || child.executable?.toLowerCase() !== request.executable.toLowerCase())) throw new Error('PID is not this supervisor owned command');
   }
   const log = contained(dir, path.join(dir, 'output.log'));
   const statusFile = path.join(dir, 'status.json');
@@ -97,7 +88,7 @@ function inspect(file, id, { verifyProcess = true } = {}) {
     if (status.id !== id || status.nonce !== launch.nonce || status.job_id !== job.job_id ||
         !(status.exit_code === null || Number.isInteger(status.exit_code)) || !Number.isFinite(Date.parse(status.ended_at))) throw new Error('Invalid owned completion record');
   }
-  return { job, dir, launch, log, statusFile, status, processVerified: verifyProcess, observation_error: launch.child_observation_error || null };
+  return { job, dir, launch, log, statusFile, status, observed, processVerified: verifyProcess, observation_error: launch.child_observation_error || null };
 }
 function logTail(file) {
   const fd = fs.openSync(file, 'r');
@@ -107,14 +98,15 @@ function logTail(file) {
 async function wait(file, id, { timeoutMs, intervalMs = 60000, onCheck = () => {}, activated } = {}) {
   // activate() may return an immutable registration with OS verification pending.
   // Complete that verification before observation or termination adopts the process.
-  const initial = activated || inspect(file, id, { verifyProcess: false }), started = Date.now(), deadline = timeoutMs == null ? null : started + timeoutMs;
+  const initial = activated || await inspect(file, id, { verifyProcess: false }), started = Date.now(), deadline = timeoutMs == null ? null : started + timeoutMs;
   let processVerified = initial.processVerified === true;
   const pwsh = initial.job.settings.pwsh;
+  const query = process.platform === 'win32' ? new ProcessQuery(pwsh) : null;
   return new Promise((resolve, reject) => {
-    let timer, completionWatcher, cancelWatcher, done = false, checking = false, lastCheck = 0, watchError = null;
+    let timer, deadlineTimer, completionWatcher, cancelWatcher, done = false, checking = false, terminating = false, recheck = false, lastCheck = 0, watchError = null;
     const schedule = () => { clearTimeout(timer); timer = setTimeout(check, Math.max(1, Math.min(intervalMs, deadline === null ? intervalMs : deadline - Date.now(), 2147483647))); };
     const finish = (error, result) => {
-      if (done) return; done = true; clearTimeout(timer); completionWatcher?.close(); cancelWatcher?.close();
+      if (done) return; done = true; clearTimeout(timer); clearTimeout(deadlineTimer); completionWatcher?.close(); cancelWatcher?.close(); query?.close();
       error ? reject(error) : resolve({ id, ...result, elapsed_ms: Date.now() - started });
     };
     const collect = current => {
@@ -124,46 +116,52 @@ async function wait(file, id, { timeoutMs, intervalMs = 60000, onCheck = () => {
       finish(null, { id, exit_code: status.exit_code, ended_at: status.ended_at, error: status.error || null, status_file: current.statusFile, log_file: current.log, output_tail: logTail(current.log) });
       return true;
     };
-    const check = () => {
-      if (done || checking) return;
+    const check = async () => {
+      if (done) return;
+      if (checking) { if (!terminating) { recheck = true; query?.fail(new Error('Observation interrupted by file event')); } return; }
       checking = true; lastCheck = Date.now();
       clearTimeout(timer);
       try {
-        const current = inspect(file, id, { verifyProcess: false }), { launch, status } = current;
+        const current = await inspect(file, id, { verifyProcess: false }), { launch, status } = current;
         if (JSON.stringify(launch) !== JSON.stringify(initial.launch)) throw new Error('Owned registration changed while waiting');
         const cancelled = fs.existsSync(path.join(path.dirname(file), 'cancel'));
         const timedOut = deadline !== null && Date.now() >= deadline;
         if (cancelled || timedOut) {
+          if (collect(current)) return;
           let termination;
           try {
-            if (!processVerified) { inspect(file, id); processVerified = true; }
-            termination = killOwned(launch, pwsh);
+            if (!processVerified) { await inspect(file, id, { query }); processVerified = true; }
+            terminating = true;
+            termination = await killOwned(launch, pwsh, query);
           }
-          catch (e) { if (e.code !== 'BACKGROUND_OBSERVATION_UNAVAILABLE') throw e; termination = { requested: false, reason: 'Process ownership could not be confirmed; no termination requested', observation_error: e.message }; }
+          catch (e) { if (recheck || e.code !== 'BACKGROUND_OBSERVATION_UNAVAILABLE') throw e; termination = e.termination_unknown
+            ? { requested: null, reason: 'Termination result unknown; no retry requested', observation_error: e.message }
+            : { requested: false, reason: 'Process ownership could not be confirmed; no termination requested', observation_error: e.message }; }
           // If the supervisor crashed, only its separately registered child can
           // be stopped, and only after verifying that child's start identity.
           if (!termination.requested && launch.child && !status && !termination.observation_error) {
-            try { termination.child = killOwned(launch.child, pwsh); }
-            catch (e) { if (e.code !== 'BACKGROUND_OBSERVATION_UNAVAILABLE') throw e; termination.child = { requested: false, observation_error: e.message, reason: 'Child ownership unconfirmed; no termination requested' }; }
+            try { termination.child = await killOwned(launch.child, pwsh, query); }
+            catch (e) { if (e.code !== 'BACKGROUND_OBSERVATION_UNAVAILABLE') throw e; termination.child = { requested: e.termination_unknown ? null : false, observation_error: e.message, reason: e.termination_unknown ? 'Child termination result unknown; no retry requested' : 'Child ownership unconfirmed; no termination requested' }; }
           }
           if (!termination.requested && launch.child_observation_error && !status) termination.unconfirmed_child = 'Child birth identity was unavailable; its exit and termination remain unconfirmed';
           finish(null, { reason: cancelled ? 'cancelled' : 'timed_out', termination }); return;
         }
         if (collect(current)) return;
-        if (!processVerified) { inspect(file, id); processVerified = true; }
-        const supervisor = identity(launch.pid, pwsh);
+        const verified = await inspect(file, id, { query }); processVerified = true;
+        if (JSON.stringify(verified.launch) !== JSON.stringify(initial.launch)) throw new Error('Owned registration changed while waiting');
+        const supervisor = process.platform === 'win32' ? verified.observed[0].identity : await identity(launch.pid, pwsh);
         onCheck({ id, at: new Date().toISOString(), process_alive: supervisor === launch.identity, completed: false, observation_error: watchError || launch.child_observation_error || null });
         if (supervisor && supervisor !== launch.identity) {
           finish(new Error('Owned supervisor identity changed; refusing to adopt or kill reused PID')); return;
         }
         if (!supervisor) {
           if (launch.child_observation_error) throw observationError('Supervisor exited; child ownership and exit remain unconfirmed: ' + launch.child_observation_error);
-          const child = launch.child && identity(launch.child.pid, pwsh);
+          const child = launch.child && (process.platform === 'win32' ? verified.observed[1].identity : await identity(launch.child.pid, pwsh));
           if (child && child !== launch.child.identity) { finish(new Error('Owned command identity changed')); return; }
           if (!child) {
             // Process queries can outlive normal completion. Re-read owned
             // metadata before declaring that an exited supervisor left no result.
-            const latest = inspect(file, id, { verifyProcess: false });
+            const latest = await inspect(file, id, { verifyProcess: false });
             if (JSON.stringify(latest.launch) !== JSON.stringify(initial.launch)) throw new Error('Owned registration changed while waiting');
             if (collect(latest)) return;
             finish(null, { id, exit_code: null, error: 'Owned supervisor exited without a completion record', status_file: latest.statusFile, log_file: latest.log, output_tail: logTail(latest.log) }); return;
@@ -171,10 +169,11 @@ async function wait(file, id, { timeoutMs, intervalMs = 60000, onCheck = () => {
         }
         schedule();
       } catch (e) {
+        if (done || recheck) return;
         if (e.code !== 'BACKGROUND_OBSERVATION_UNAVAILABLE') { finish(e); return; }
         onCheck({ id, at: new Date().toISOString(), process_alive: null, completed: false, observation_error: e.message });
         schedule();
-      } finally { checking = false; }
+      } finally { checking = false; if (recheck && !done) { recheck = false; check(); } }
     };
     const watch = (dir, target) => {
       let watcher;
@@ -187,6 +186,7 @@ async function wait(file, id, { timeoutMs, intervalMs = 60000, onCheck = () => {
       return watcher;
     };
     completionWatcher = watch(initial.dir, 'status.json'); cancelWatcher = watch(path.dirname(file), 'cancel');
+    if (deadline !== null) deadlineTimer = setTimeout(check, Math.max(1, Math.min(deadline - Date.now(), 2147483647)));
     if (initial.observation_error) onCheck({ id, at: new Date().toISOString(), process_alive: null, completed: false, observation_error: initial.observation_error });
     check();
   });
@@ -216,20 +216,14 @@ async function activate(file, id) {
   const { job, root } = layout(file), dir = contained(root, path.join(root, id));
   const requestFile = contained(dir, path.join(dir, 'request.json')), request = read(requestFile);
   if (request.id !== id || request.job_id !== job.job_id || read(path.join(root, 'active.json')).id !== id) throw new Error('Queued command does not belong to this job');
-  const inspectActivated = () => {
-    try { return inspect(file, id); }
-    catch (e) {
-      if (e.code !== 'BACKGROUND_OBSERVATION_UNAVAILABLE') throw e;
-      return { ...inspect(file, id, { verifyProcess: false }), observation_error: e.message };
-    }
-  };
+  const inspectActivated = () => inspect(file, id, { verifyProcess: false });
   if (fs.existsSync(path.join(dir, 'launch.json'))) return inspectActivated();
   // A durable claim prevents replay if the worker crashes in the spawn/record
   // gap. Such an unknown startup requires inspection, never another spawn.
   fs.writeFileSync(path.join(dir, 'activation.json'), JSON.stringify({ worker_pid: process.pid, at: new Date().toISOString() }), { flag: 'wx' });
   const child = spawn(process.execPath, [__filename, '--supervise', requestFile], { detached: true, windowsHide: true, stdio: 'ignore', env: { ...process.env, CODEX_EXECUTOR_BACKGROUND_JOB: '' } });
   let spawnError; child.on('error', e => { spawnError = e; }); child.unref();
-  for (let n = 0; n < 400; n++) {
+  for (let n = 0; n < 2000; n++) {
     if (spawnError) throw spawnError;
     if (fs.existsSync(path.join(dir, 'launch.json'))) return inspectActivated();
     if (fs.existsSync(path.join(dir, 'startup-error.txt'))) throw new Error(fs.readFileSync(path.join(dir, 'startup-error.txt'), 'utf8'));
@@ -242,9 +236,19 @@ async function start(file, requestFile) {
 }
 async function supervise(requestFile) {
   const request = read(requestFile), dir = path.dirname(requestFile);
-  const launch = { id: request.id, job_id: request.job_id, nonce: request.nonce, pid: process.pid, identity: identity(process.pid, request.pwsh) };
+  const query = process.platform === 'win32' ? new ProcessQuery(request.pwsh) : null;
+  let self;
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { self = await identity(process.pid, request.pwsh, query); if (!self) throw observationError('Supervisor identity unavailable'); break; }
+      catch (e) { if (e.code !== 'BACKGROUND_OBSERVATION_UNAVAILABLE' || attempt === 1) throw e; }
+    }
+  } catch (e) { query?.close(); throw e; }
+  const launch = { id: request.id, job_id: request.job_id, nonce: request.nonce, pid: process.pid, identity: self };
   const log = path.join(dir, 'output.log');
-  let fd = fs.openSync(log, 'a'), bytes = fs.fstatSync(fd).size;
+  let fd;
+  try {
+  fd = fs.openSync(log, 'a'); let bytes = fs.fstatSync(fd).size;
   const append = chunk => {
     if (bytes + chunk.length > 8 * 1024 * 1024) {
       fs.closeSync(fd);
@@ -260,7 +264,7 @@ async function supervise(requestFile) {
   const completion = new Promise(resolve => { command.once('close', resolve); });
   if (command.pid) {
     try {
-      const birth = identity(command.pid, request.pwsh);
+      const birth = await identity(command.pid, request.pwsh, query);
       if (birth) launch.child = { pid: command.pid, identity: birth };
     } catch (e) {
       if (e.code !== 'BACKGROUND_OBSERVATION_UNAVAILABLE') throw e;
@@ -269,10 +273,12 @@ async function supervise(requestFile) {
       launch.child_observation_error = e.message;
     }
   }
+  query?.close();
   write(path.join(dir, 'launch.json'), launch);
   const code = await completion;
-  fs.closeSync(fd);
+  fs.closeSync(fd); fd = undefined;
   write(path.join(dir, 'status.json'), { id: request.id, job_id: request.job_id, nonce: request.nonce, exit_code: code, ended_at: new Date().toISOString(), ...(error ? { error } : {}) });
+  } finally { query?.close(); if (fd !== undefined) fs.closeSync(fd); }
 }
 function release(file, id) {
   const { root } = layout(file), slot = path.join(root, 'active.json');

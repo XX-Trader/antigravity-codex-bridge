@@ -12,7 +12,7 @@ const root = fs.mkdtempSync(path.join(base, 'run-'));
 // child may run npm test; do not let its admission sentinel poison mock tests.
 // Production project registrations and model caches must not leak into fixtures.
 const testEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('CODEX_EXECUTOR_')));
-const result = spawnSync(process.execPath, ['--test', 'test/usage.test.cjs', 'test/model-policy.test.cjs', 'test/server.test.cjs', 'test/setup.test.cjs', 'test/notifications.test.cjs', 'test/concurrency.test.cjs', 'test/loop-guard.test.cjs', 'test/background.test.cjs'], { cwd: path.resolve(__dirname, '..'), env: { ...testEnv, CODEX_EXECUTOR_CHILD: '0', CODEX_EXECUTOR_TEST_ROOT: root, CODEX_EXECUTOR_PWSH: process.env.CODEX_EXECUTOR_PWSH || 'pwsh.exe' }, encoding: 'utf8', timeout: 1200000 });
+const result = spawnSync(process.execPath, ['--test', 'test/usage.test.cjs', 'test/model-policy.test.cjs', 'test/server.test.cjs', 'test/setup.test.cjs', 'test/notifications.test.cjs', 'test/concurrency.test.cjs', 'test/loop-guard.test.cjs', 'test/background.test.cjs', 'test/process-query.test.cjs'], { cwd: path.resolve(__dirname, '..'), env: { ...testEnv, CODEX_EXECUTOR_CHILD: '0', CODEX_EXECUTOR_TEST_ROOT: root, CODEX_EXECUTOR_PWSH: process.env.CODEX_EXECUTOR_PWSH || 'pwsh.exe' }, encoding: 'utf8', timeout: 1200000 });
 process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || '');
 if (result.error) process.stderr.write(result.error.stack + '\n');
 if (result.status === 0) {
