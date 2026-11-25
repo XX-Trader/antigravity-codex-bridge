@@ -561,10 +561,12 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
   let fiveHourResetsAt = null;
   let fiveHourHoursLeft = null;
 
+  const ext5hResetMs = agyExternal?.five_hour_resets_at ? Date.parse(agyExternal.five_hour_resets_at) : NaN;
+  const ext5hExpired = Number.isFinite(ext5hResetMs) && ext5hResetMs <= nowMs;
   if (agyExternal?.available && agyExternal.five_hour_used_percent !== null && agyExternal.five_hour_used_percent !== undefined) {
-    fiveHourUsed = round2(clamp(agyExternal.five_hour_used_percent, 0, 100));
+    fiveHourUsed = ext5hExpired ? 0 : round2(clamp(agyExternal.five_hour_used_percent, 0, 100));
     fiveHourSource = agyExternal.source || 'external_probe';
-    fiveHourResetsAt = agyExternal.five_hour_resets_at || null;
+    fiveHourResetsAt = ext5hExpired ? null : (agyExternal.five_hour_resets_at || null);
   } else if (valid5hSnapshot) {
     fiveHourUsed = round2(clamp(snapshot.five_hour_used_percent, 0, 100));
     fiveHourSource = 'manual_snapshot';
@@ -612,12 +614,12 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
   let weeklySource = 'uncalibrated';
   let weeklyResetsAtMs = null;
 
-  if (agyExternal?.available && agyExternal.weekly_used_percent !== null && agyExternal.weekly_used_percent !== undefined) {
+  const ext7dResetMs = agyExternal?.weekly_resets_at ? Date.parse(agyExternal.weekly_resets_at) : NaN;
+  const ext7dValid = !Number.isFinite(ext7dResetMs) || ext7dResetMs > nowMs;
+  if (agyExternal?.available && agyExternal.weekly_used_percent !== null && agyExternal.weekly_used_percent !== undefined && ext7dValid) {
     weeklyUsed = round2(clamp(agyExternal.weekly_used_percent, 0, 100));
     weeklySource = agyExternal.source || 'external_probe';
-    if (agyExternal.weekly_resets_at && Number.isFinite(Date.parse(agyExternal.weekly_resets_at))) {
-      weeklyResetsAtMs = Date.parse(agyExternal.weekly_resets_at);
-    }
+    if (Number.isFinite(ext7dResetMs)) weeklyResetsAtMs = ext7dResetMs;
   } else if (valid7dSnapshot) {
     weeklyUsed = round2(clamp(snapshot.weekly_used_percent, 0, 100));
     weeklySource = 'manual_snapshot';
@@ -1067,11 +1069,52 @@ function resolveRealAgyBin(options = {}) {
   return null;
 }
 
+let cachedWinSystemProxy;
+function detectWindowsSystemProxy() {
+  if (process.platform !== 'win32' || process.env.CODEX_EXECUTOR_TEST_ROOT) return null;
+  if (cachedWinSystemProxy !== undefined) return cachedWinSystemProxy;
+  try {
+    const res = spawnSync('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 2000
+    });
+    if (res.status !== 0 || !res.stdout) { cachedWinSystemProxy = null; return null; }
+    const enabled = /^\s*ProxyEnable\s+REG_DWORD\s+0x1\b/im.test(res.stdout);
+    const serverMatch = res.stdout.match(/^\s*ProxyServer\s+REG_SZ\s+(.+)$/im);
+    if (!enabled || !serverMatch) { cachedWinSystemProxy = null; return null; }
+    const raw = serverMatch[1].trim();
+    let hostPort = raw;
+    if (raw.includes('=')) {
+      const pairs = Object.fromEntries(raw.split(';').map(s => s.split('=')).filter(p => p.length === 2));
+      hostPort = pairs.https || pairs.http || '';
+    }
+    if (!hostPort) { cachedWinSystemProxy = null; return null; }
+    cachedWinSystemProxy = hostPort.includes('://') ? hostPort : `http://${hostPort}`;
+    return cachedWinSystemProxy;
+  } catch {
+    cachedWinSystemProxy = null;
+    return null;
+  }
+}
+
 function cleanOfficialAgyEnv(baseEnv = process.env) {
   const env = { ...baseEnv };
+  let hasProxy = false;
   for (const k of Object.keys(env)) {
     const upper = k.toUpperCase();
     if (upper === 'GEMINI_API_KEY' || upper === 'GOOGLE_GEMINI_BASE_URL') delete env[k];
+    if ((upper === 'HTTPS_PROXY' || upper === 'HTTP_PROXY' || upper === 'ALL_PROXY') && String(env[k] || '').trim()) {
+      hasProxy = true;
+    }
+  }
+  // Go's net/http inside `agy.exe` only reads HTTP(S)_PROXY env vars, not Windows Internet Settings.
+  if (!hasProxy) {
+    const sysProxy = detectWindowsSystemProxy();
+    if (sysProxy) {
+      env.HTTP_PROXY = sysProxy;
+      env.HTTPS_PROXY = sysProxy;
+    }
   }
   return env;
 }
@@ -1216,7 +1259,13 @@ async function probeAgyQuotaAsync(projectPolicy, options = {}) {
   }
   const agyBin = resolveRealAgyBin(options);
   if (!agyBin) return null;
-  return runExternalAgyProbeAsync([agyBin, '--print', '/usage', '--output-format', 'json'], options);
+  const probeHome = options.probeHomeDir
+    || (options.cachePath ? path.join(path.dirname(options.cachePath), 'agy-probe-home') : path.join(os.tmpdir(), 'agy-probe-home'));
+  try { fs.mkdirSync(probeHome, { recursive: true }); } catch {}
+  return runExternalAgyProbeAsync(
+    [agyBin, `--gemini_dir=${probeHome}`, '--print', '/usage', '--output-format', 'json'],
+    { timeoutMs: 35000, ...options }
+  );
 }
 
 function activeCodexTasks(projectScope) {

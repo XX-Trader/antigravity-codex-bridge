@@ -839,10 +839,14 @@ class Broker {
 
       let agyProbedAt = prev?.agy_probed_at || null;
       const prevAgyProbeMs = Date.parse(agyProbedAt || '');
-      if (!isRefresh && Number.isFinite(prevAgyProbeMs) && (nowMs - prevAgyProbeMs < 10 * 60 * 1000) && prev?.agy_external !== undefined) {
+      const anyBucketExpired = Boolean(
+        prev?.agy_external?.buckets
+        && Object.values(prev.agy_external.buckets).some(b => b?.resets_at && Date.parse(b.resets_at) <= nowMs)
+      );
+      if (!isRefresh && !anyBucketExpired && Number.isFinite(prevAgyProbeMs) && (nowMs - prevAgyProbeMs < 10 * 60 * 1000) && prev?.agy_external !== undefined) {
         agyExternal = prev.agy_external;
       } else {
-        const probed = await probeAgyQuotaAsync(projectPolicy, { agyBin: input.agy_bin });
+        const probed = await probeAgyQuotaAsync(projectPolicy, { agyBin: input.agy_bin, cachePath });
         if (probed !== null) {
           agyExternal = probed.available ? probed : (prev?.agy_external?.available ? prev.agy_external : probed);
           agyProbedAt = new Date(nowMs).toISOString();
