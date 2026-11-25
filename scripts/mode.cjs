@@ -25,6 +25,8 @@ function usage() {
     '      (aliases: agy/AGY/Agy/antigravity -> agy; auto/hybrid/balanced -> auto)',
     '  reset-project --project ABS_PATH [--config MCP_JSON] [--policy POLICY_JSON]',
     '  agy-hint --level plenty|normal|low [--config MCP_JSON] [--policy POLICY_JSON]',
+    '  agy-quota [--weekly-used PCT] [--weekly-reset ISO] [--5h-used PCT] [--5h-reset ISO] [--clear]',
+    '  agy-budget [--tokens-5h N] [--tokens-7d N] [--weekly-reset ISO] [--5h-caution PCT] [--5h-protect PCT] [--clear]',
     '  quant-thinking (--model NAME | --clear) [--config MCP_JSON] [--policy POLICY_JSON]',
     '  tier [--simple MODEL] [--standard MODEL] [--complex MODEL] [--expert MODEL] [--enforce-low-cost true|false]',
     '  cooldown --engine codex|agy --minutes N [--reason TEXT]',
@@ -122,6 +124,80 @@ async function run(argv) {
     current.agy_quota_hint = level;
     const saved = saveRoutingPolicy(policyFile, current);
     return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_quota_hint: saved.agy_quota_hint }, null, 2);
+  }
+
+  if (opts.command === 'agy-quota') {
+    if (opts.clear) {
+      current.agy_manual_snapshot = null;
+      const saved = saveRoutingPolicy(policyFile, current);
+      return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_manual_snapshot: null }, null, 2);
+    }
+    const parsePct = (name, val) => {
+      if (val === undefined) return undefined;
+      const n = Number(val);
+      if (!Number.isFinite(n) || n < 0 || n > 100) throw new Error(`--${name} must be a number in 0..100`);
+      return n;
+    };
+    const parseIso = (name, val) => {
+      if (val === undefined) return undefined;
+      const ms = Date.parse(val);
+      if (!Number.isFinite(ms)) throw new Error(`--${name} must be a valid ISO timestamp`);
+      return new Date(ms).toISOString();
+    };
+    const weeklyUsed = parsePct('weekly-used', opts['weekly-used']);
+    const fiveHourUsed = parsePct('5h-used', opts['5h-used']);
+    const weeklyReset = parseIso('weekly-reset', opts['weekly-reset']);
+    const fiveHourReset = parseIso('5h-reset', opts['5h-reset']);
+    if (weeklyUsed === undefined && fiveHourUsed === undefined && weeklyReset === undefined && fiveHourReset === undefined) {
+      throw new Error('Provide at least one of --weekly-used, --weekly-reset, --5h-used, --5h-reset, or --clear');
+    }
+    const prev = current.agy_manual_snapshot || {};
+    current.agy_manual_snapshot = {
+      recorded_at: new Date().toISOString(),
+      weekly_used_percent: weeklyUsed ?? prev.weekly_used_percent ?? null,
+      weekly_resets_at: weeklyReset ?? prev.weekly_resets_at ?? null,
+      five_hour_used_percent: fiveHourUsed ?? prev.five_hour_used_percent ?? null,
+      five_hour_resets_at: fiveHourReset ?? prev.five_hour_resets_at ?? null
+    };
+    const saved = saveRoutingPolicy(policyFile, current);
+    return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_manual_snapshot: saved.agy_manual_snapshot }, null, 2);
+  }
+
+  if (opts.command === 'agy-budget') {
+    if (opts.clear) {
+      current.agy_pacing = { ...(current.agy_pacing || {}), window_5h_tokens: null, window_7d_tokens: null, weekly_resets_at: null };
+      const saved = saveRoutingPolicy(policyFile, current);
+      return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_pacing: saved.agy_pacing }, null, 2);
+    }
+    const ap = { ...(current.agy_pacing || {}) };
+    if (opts['tokens-5h'] !== undefined) {
+      const n = Number(opts['tokens-5h']);
+      if (!Number.isFinite(n) || n <= 0) throw new Error('--tokens-5h must be a positive number');
+      ap.window_5h_tokens = Math.floor(n);
+    }
+    if (opts['tokens-7d'] !== undefined) {
+      const n = Number(opts['tokens-7d']);
+      if (!Number.isFinite(n) || n <= 0) throw new Error('--tokens-7d must be a positive number');
+      ap.window_7d_tokens = Math.floor(n);
+    }
+    if (opts['weekly-reset'] !== undefined) {
+      const ms = Date.parse(opts['weekly-reset']);
+      if (!Number.isFinite(ms)) throw new Error('--weekly-reset must be a valid ISO timestamp');
+      ap.weekly_resets_at = new Date(ms).toISOString();
+    }
+    if (opts['5h-caution'] !== undefined) {
+      const n = Number(opts['5h-caution']);
+      if (!Number.isFinite(n) || n < 30 || n > 99) throw new Error('--5h-caution must be in 30..99');
+      ap.window_5h_caution_percent = n;
+    }
+    if (opts['5h-protect'] !== undefined) {
+      const n = Number(opts['5h-protect']);
+      if (!Number.isFinite(n) || n < 40 || n > 100) throw new Error('--5h-protect must be in 40..100');
+      ap.window_5h_protect_percent = n;
+    }
+    current.agy_pacing = ap;
+    const saved = saveRoutingPolicy(policyFile, current);
+    return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_pacing: saved.agy_pacing }, null, 2);
   }
 
   if (opts.command === 'quant-thinking') {

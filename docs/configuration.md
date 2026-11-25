@@ -294,8 +294,10 @@ Antigravity 切换回读：两个 MCP 入口均引用当前 main 所在的同一
   - `agy_priority`（$\Delta > +5\%$ 或 $U \ge 92\%$）：优先 AGY 低成本多子代理，保留 Codex 撑满 7 天；
   - `codex_protected`（$U \ge 97\%$ 或触发限流）：保护 Codex，新事项默认走 AGY；
   - `codex_drain`（距重置 $\le 12\text{h}$ 且剩余 $\ge 10\%$）：末期冲刺优先 Codex，减少 7 天过期浪费。
-- **AGY 本地转录用量与 429 熔断**：由于 Antigravity 官方未提供公开的剩余额度百分比 API，桥接不探测未文档化的宿主私有接口，而是只读汇总本机 `brain/*/.system_generated/logs/transcript.jsonl` 近 5 小时与 7 天按模型分层的真实 token 消耗与近期配额限流错误（仅识别 429/quota/rate_limit，严格排除 401/403 认证和策略拒绝）。当 AGY 出现近期限流、处于手动冷却或被标记 `agy_quota_hint=low` 时，只要 Codex 未硬限流，路由立即回落由 **Codex 兜底**。
-- **可选外部探针**：可在本地 `routing-policy.json` 配置可选 `agy_quota_command`（命令行参数数组，输出含 `remaining_percent` 的 JSON），默认禁用；失败时显式报错，绝不伪造 100%。
+- **AGY 7 天 100% 等比例 + 5 小时窗口限制 + Codex 兜底**：由于 Antigravity 官方未提供公开的剩余额度百分比 API，桥接不探测未文档化的宿主私有接口，而是将 AGY 拆为两层：
+  - **5 小时滚动限制守卫**：实时汇总本机 `brain/*/.system_generated/logs/transcript.jsonl` 近 5 小时真实 token 消耗与近期 429/配额限流错误（严格排除 401/403 认证与策略拒绝），也支持结合 `Mode.ps1 agy-quota` 手动快照、`Mode.ps1 agy-budget` 本地 5h token 预算或可选外部探针。AGY 5 小时窗口进入警戒区（默认 `75%`）时限速为混合均衡；达到保护线（默认 `88%`）、近期出现 429 限流、标记 `agy_quota_hint=low` 或手动冷却时，只要 Codex 未硬限流，**立刻切由 Codex 兜底**。
+  - **7 天 100% 等比例竞比**：当 AGY 7 天进度通过 `Mode.ps1 agy-quota`（未过期快照）、`Mode.ps1 agy-budget`（本地 7d token 预算）或可选外部探针标定后，桥接按与 Codex 相同的 7 天 100% 匀速公式计算 $\Delta_{\text{agy}}$，与 $\Delta_{\text{codex}}$ 直接比对（谁更落后于 7 天进度且差值 $> 5\%$ 就优先谁，差值 $\le 5\%$ 混合分流；距重置 $\le 12\text{h}$ 且剩余 $\ge 10\%$ 自动冲刺消化尾额）。未标定时不伪造百分比，按 Codex 7 天曲线叠加 AGY 5 小时守卫调度。
+- **可选外部探针**：可在本地 `routing-policy.json` 配置可选 `agy_quota_command`（命令行参数数组，输出含 `remaining_percent` 或双窗口 `five_hour_used_percent` / `weekly_used_percent` 的 JSON），默认禁用；失败时显式报错，绝不伪造 100%。
 
 ### 模型档位对齐与量化最强思考
 
@@ -311,5 +313,7 @@ pwsh -NoProfile -File scripts/Mode.ps1 set --mode agy --project 'C:/work/my-proj
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode codex --project 'C:/work/my-project'
 pwsh -NoProfile -File scripts/Mode.ps1 quant-thinking --model 'YOUR_STRONGEST_THINKING_MODEL'
 pwsh -NoProfile -File scripts/Mode.ps1 agy-hint --level low
+pwsh -NoProfile -File scripts/Mode.ps1 agy-quota --weekly-used 35 --weekly-reset '2026-11-28T15:14:55Z' --5h-used 40 --5h-reset '2026-11-25T13:00:00Z'
+pwsh -NoProfile -File scripts/Mode.ps1 agy-budget --tokens-5h 8000000 --tokens-7d 80000000
 pwsh -NoProfile -File scripts/Mode.ps1 cooldown --engine agy --minutes 60 --reason '5h quota low'
 ```

@@ -32,6 +32,21 @@ const DEFAULT_PACING = Object.freeze({
   drain_min_remaining_percent: 10
 });
 
+const DEFAULT_AGY_PACING = Object.freeze({
+  target_utilization: 100,
+  window_minutes: 10080,          // 7-day weekly quota window (mirrors Codex 7d 100% pacing)
+  window_5h_minutes: 300,         // AGY 5-hour rolling/refresh limit window
+  dual_compare_margin: 5,         // |delta_codex - delta_agy| <= 5% => balanced
+  window_5h_caution_percent: 75,  // AGY 5h >= 75% => throttle to balanced to avoid hitting 5h wall
+  window_5h_protect_percent: 88,  // AGY 5h >= 88% => AGY 5h limited, Codex takes over as fallback
+  weekly_protect_used_percent: 97,
+  drain_window_hours: 12,
+  drain_min_remaining_percent: 10,
+  window_5h_tokens: null,         // Optional local 5h token calibration budget
+  window_7d_tokens: null,         // Optional local 7d token calibration budget
+  weekly_resets_at: null          // Optional ISO timestamp for AGY weekly reset anchor
+});
+
 const DEFAULT_AGY_TIERS = Object.freeze({
   simple: 'flash_lite',
   standard: 'flash',
@@ -72,18 +87,35 @@ function normalizeSubagentModel(value, fallback) {
   return value.trim();
 }
 
+function parseManualAgySnapshot(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const recordedAt = Date.parse(raw.recorded_at);
+  if (!Number.isFinite(recordedAt)) return null;
+  const parsePct = v => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100 ? round2(v) : null;
+  const parseIso = v => typeof v === 'string' && Number.isFinite(Date.parse(v)) ? new Date(Date.parse(v)).toISOString() : null;
+  return {
+    recorded_at: new Date(recordedAt).toISOString(),
+    weekly_used_percent: parsePct(raw.weekly_used_percent),
+    weekly_resets_at: parseIso(raw.weekly_resets_at),
+    five_hour_used_percent: parsePct(raw.five_hour_used_percent),
+    five_hour_resets_at: parseIso(raw.five_hour_resets_at)
+  };
+}
+
 function defaultPolicy() {
   return {
     schema: 1,
     default_mode: 'auto',
     projects: {},
     pacing: { ...DEFAULT_PACING },
+    agy_pacing: { ...DEFAULT_AGY_PACING },
     agy_tiers: { ...DEFAULT_AGY_TIERS },
     subagent_default_model: 'flash',
     subagent_research_model: 'flash_lite',
     enforce_subagent_low_cost: true,
     thinking_models: { general: null, quant: null },
     agy_quota_hint: 'normal',
+    agy_manual_snapshot: null,
     agy_quota_command: null,
     cache_ttl_seconds: 60,
     cooldowns: { codex: null, agy: null },
@@ -140,6 +172,34 @@ function parsePolicy(raw) {
     if (p.codex_protect_used_percent < p.agy_priority_used_percent) p.codex_protect_used_percent = p.agy_priority_used_percent;
     policy.pacing = p;
   }
+  if (raw.agy_pacing && typeof raw.agy_pacing === 'object' && !Array.isArray(raw.agy_pacing)) {
+    const ap = { ...base.agy_pacing };
+    for (const [k, min, max] of [
+      ['target_utilization', 10, 100],
+      ['window_minutes', 60, 43200],
+      ['window_5h_minutes', 30, 1440],
+      ['dual_compare_margin', 0, 40],
+      ['window_5h_caution_percent', 30, 99],
+      ['window_5h_protect_percent', 40, 100],
+      ['weekly_protect_used_percent', 60, 100],
+      ['drain_window_hours', 0, 72],
+      ['drain_min_remaining_percent', 1, 80]
+    ]) {
+      if (typeof raw.agy_pacing[k] === 'number' && Number.isFinite(raw.agy_pacing[k]) && raw.agy_pacing[k] >= min && raw.agy_pacing[k] <= max) {
+        ap[k] = raw.agy_pacing[k];
+      }
+    }
+    if (ap.window_5h_protect_percent < ap.window_5h_caution_percent) ap.window_5h_protect_percent = ap.window_5h_caution_percent;
+    for (const k of ['window_5h_tokens', 'window_7d_tokens']) {
+      if (raw.agy_pacing[k] === null) ap[k] = null;
+      else if (typeof raw.agy_pacing[k] === 'number' && Number.isFinite(raw.agy_pacing[k]) && raw.agy_pacing[k] > 0) ap[k] = Math.floor(raw.agy_pacing[k]);
+    }
+    if (raw.agy_pacing.weekly_resets_at === null) ap.weekly_resets_at = null;
+    else if (typeof raw.agy_pacing.weekly_resets_at === 'string' && Number.isFinite(Date.parse(raw.agy_pacing.weekly_resets_at))) {
+      ap.weekly_resets_at = new Date(Date.parse(raw.agy_pacing.weekly_resets_at)).toISOString();
+    }
+    policy.agy_pacing = ap;
+  }
   if (raw.agy_tiers && typeof raw.agy_tiers === 'object' && !Array.isArray(raw.agy_tiers)) {
     const tiers = { ...base.agy_tiers };
     for (const tier of ['simple', 'standard', 'complex', 'expert']) {
@@ -159,6 +219,7 @@ function parsePolicy(raw) {
   if (typeof raw.agy_quota_hint === 'string' && AGY_HINTS.has(raw.agy_quota_hint.trim().toLowerCase())) {
     policy.agy_quota_hint = raw.agy_quota_hint.trim().toLowerCase();
   }
+  policy.agy_manual_snapshot = parseManualAgySnapshot(raw.agy_manual_snapshot);
   if (Array.isArray(raw.agy_quota_command) && raw.agy_quota_command.length > 0 && raw.agy_quota_command.every(v => typeof v === 'string' && v.trim())) {
     policy.agy_quota_command = raw.agy_quota_command.slice(0, 16);
   }
@@ -252,7 +313,9 @@ function resolveProjectPolicy(policy, projectScope) {
     subagent_research_model: base.subagent_research_model,
     enforce_subagent_low_cost: override?.enforce_subagent_low_cost ?? base.enforce_subagent_low_cost,
     pacing: { ...base.pacing },
+    agy_pacing: { ...base.agy_pacing },
     agy_quota_hint: base.agy_quota_hint,
+    agy_manual_snapshot: base.agy_manual_snapshot ? { ...base.agy_manual_snapshot } : null,
     agy_quota_command: base.agy_quota_command,
     cache_ttl_seconds: base.cache_ttl_seconds,
     cooldowns: { ...base.cooldowns }
@@ -314,6 +377,154 @@ function evaluateCodexPacing(rateLimitReply, pacingCfg = DEFAULT_PACING, nowMs =
     } : null,
     reset_credits_available: Number(resetCredits?.availableCount || 0),
     reset_credit_earliest_expiry: nextCreditExpiry ? new Date(nextCreditExpiry * 1000).toISOString() : null
+  };
+}
+
+function advanceResetAnchor(resetMs, windowMs, nowMs) {
+  if (!Number.isFinite(resetMs) || !Number.isFinite(windowMs) || windowMs <= 0) return null;
+  let next = resetMs;
+  while (next <= nowMs) next += windowMs;
+  return next;
+}
+
+function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, nowMs = Date.now() }) {
+  const cfg = { ...DEFAULT_AGY_PACING, ...(projectPolicy?.agy_pacing || {}) };
+  const snapshot = projectPolicy?.agy_manual_snapshot || null;
+  const snapshotAgeMs = snapshot ? nowMs - Date.parse(snapshot.recorded_at) : Infinity;
+  const valid5hSnapshot = snapshot && snapshot.five_hour_used_percent !== null && (
+    snapshot.five_hour_resets_at ? Date.parse(snapshot.five_hour_resets_at) > nowMs : snapshotAgeMs <= cfg.window_5h_minutes * 60000
+  );
+  const valid7dSnapshot = snapshot && snapshot.weekly_used_percent !== null && (
+    snapshot.weekly_resets_at ? Date.parse(snapshot.weekly_resets_at) > nowMs : snapshotAgeMs <= 24 * 3600000
+  );
+
+  // 1. Evaluate AGY 5-hour window guard (hard/caution)
+  let fiveHourUsed = null;
+  let fiveHourSource = 'local_transcripts';
+  let fiveHourResetsAt = null;
+  let fiveHourHoursLeft = null;
+
+  if (agyExternal?.available && agyExternal.five_hour_used_percent !== null && agyExternal.five_hour_used_percent !== undefined) {
+    fiveHourUsed = round2(clamp(agyExternal.five_hour_used_percent, 0, 100));
+    fiveHourSource = agyExternal.source || 'external_probe';
+    fiveHourResetsAt = agyExternal.five_hour_resets_at || null;
+  } else if (valid5hSnapshot) {
+    fiveHourUsed = round2(clamp(snapshot.five_hour_used_percent, 0, 100));
+    fiveHourSource = 'manual_snapshot';
+    fiveHourResetsAt = snapshot.five_hour_resets_at || null;
+  } else if (cfg.window_5h_tokens && agyUsage?.available && typeof agyUsage.window_5h?.total_tokens === 'number') {
+    fiveHourUsed = round2(clamp((agyUsage.window_5h.total_tokens / cfg.window_5h_tokens) * 100, 0, 100));
+    fiveHourSource = 'local_token_budget';
+  }
+  if (fiveHourResetsAt) {
+    const ms = Date.parse(fiveHourResetsAt);
+    if (Number.isFinite(ms)) fiveHourHoursLeft = round2(Math.max(0, (ms - nowMs) / 3600000));
+  }
+
+  const agyCooling = cooldownActive(projectPolicy?.cooldowns?.agy, nowMs);
+  const recentQuotaErr = agyUsage?.auto_degraded === true;
+  const hintLow = projectPolicy?.agy_quota_hint === 'low';
+  let status5h = 'ok';
+  let reason5h = null;
+  if (agyCooling) { status5h = 'limited'; reason5h = 'agy_manual_cooldown'; }
+  else if (recentQuotaErr) { status5h = 'limited'; reason5h = 'agy_recent_429_quota_error'; }
+  else if (fiveHourUsed !== null && fiveHourUsed >= cfg.window_5h_protect_percent) { status5h = 'limited'; reason5h = 'agy_5h_window_protected'; }
+  else if (hintLow) { status5h = 'limited'; reason5h = 'agy_hint_low'; }
+  else if (fiveHourUsed !== null && fiveHourUsed >= cfg.window_5h_caution_percent) { status5h = 'caution'; reason5h = 'agy_5h_window_caution'; }
+
+  const window5h = {
+    source: fiveHourSource,
+    window_minutes: cfg.window_5h_minutes,
+    used_percent: fiveHourUsed,
+    remaining_percent: fiveHourUsed !== null ? round2(Math.max(0, 100 - fiveHourUsed)) : null,
+    caution_percent: cfg.window_5h_caution_percent,
+    protect_percent: cfg.window_5h_protect_percent,
+    resets_at: fiveHourResetsAt,
+    hours_until_reset: fiveHourHoursLeft,
+    tokens_5h: agyUsage?.available ? (agyUsage.window_5h?.total_tokens ?? null) : null,
+    budget_tokens_5h: cfg.window_5h_tokens,
+    quota_errors_5h: agyUsage?.available ? (agyUsage.quota_errors_5h ?? 0) : 0,
+    auto_degraded: recentQuotaErr,
+    status: status5h,
+    reason: reason5h
+  };
+
+  // 2. Evaluate AGY 7-day 100% proportional pacing (symmetric to Codex)
+  let weeklyUsed = null;
+  let weeklySource = 'uncalibrated';
+  let weeklyResetsAtMs = null;
+
+  if (agyExternal?.available && agyExternal.weekly_used_percent !== null && agyExternal.weekly_used_percent !== undefined) {
+    weeklyUsed = round2(clamp(agyExternal.weekly_used_percent, 0, 100));
+    weeklySource = agyExternal.source || 'external_probe';
+    if (agyExternal.weekly_resets_at && Number.isFinite(Date.parse(agyExternal.weekly_resets_at))) {
+      weeklyResetsAtMs = Date.parse(agyExternal.weekly_resets_at);
+    }
+  } else if (valid7dSnapshot) {
+    weeklyUsed = round2(clamp(snapshot.weekly_used_percent, 0, 100));
+    weeklySource = 'manual_snapshot';
+    if (snapshot.weekly_resets_at) weeklyResetsAtMs = Date.parse(snapshot.weekly_resets_at);
+  } else if (cfg.window_7d_tokens && agyUsage?.available && typeof agyUsage.window_7d?.total_tokens === 'number') {
+    weeklyUsed = round2(clamp((agyUsage.window_7d.total_tokens / cfg.window_7d_tokens) * 100, 0, 100));
+    weeklySource = 'local_token_budget';
+  }
+
+  const window7dMs = cfg.window_minutes * 60 * 1000;
+  if (!weeklyResetsAtMs && cfg.weekly_resets_at) {
+    weeklyResetsAtMs = advanceResetAnchor(Date.parse(cfg.weekly_resets_at), window7dMs, nowMs);
+  }
+  if (!weeklyResetsAtMs && codexPacing?.available && codexPacing.resets_at) {
+    weeklyResetsAtMs = Date.parse(codexPacing.resets_at);
+  }
+
+  let window7d;
+  if (weeklyUsed !== null && Number.isFinite(weeklyResetsAtMs)) {
+    const remainingMs = Math.max(0, weeklyResetsAtMs - nowMs);
+    const hoursUntilReset = round2(remainingMs / 3600000);
+    const elapsedRatio = clamp(1 - remainingMs / window7dMs, 0, 1);
+    const elapsedPercent = round2(elapsedRatio * 100);
+    const targetUsedPercent = round2(elapsedRatio * cfg.target_utilization);
+    const remainingPercent = round2(Math.max(0, 100 - weeklyUsed));
+    const pacingDelta = round2(weeklyUsed - targetUsedPercent);
+
+    let band;
+    if (weeklyUsed >= cfg.weekly_protect_used_percent) band = 'agy_protected';
+    else if (hoursUntilReset > 0 && hoursUntilReset <= cfg.drain_window_hours && remainingPercent >= cfg.drain_min_remaining_percent) band = 'agy_drain';
+    else if (pacingDelta <= -3) band = 'agy_priority';
+    else if (pacingDelta <= 5) band = 'balanced';
+    else band = 'codex_priority';
+
+    window7d = {
+      available: true,
+      source: weeklySource,
+      window_minutes: cfg.window_minutes,
+      used_percent: weeklyUsed,
+      remaining_percent: remainingPercent,
+      elapsed_percent: elapsedPercent,
+      target_used_percent: targetUsedPercent,
+      pacing_delta: pacingDelta,
+      resets_at: new Date(weeklyResetsAtMs).toISOString(),
+      hours_until_reset: hoursUntilReset,
+      tokens_7d: agyUsage?.available ? (agyUsage.window_7d?.total_tokens ?? null) : null,
+      budget_tokens_7d: cfg.window_7d_tokens,
+      band
+    };
+  } else {
+    window7d = {
+      available: false,
+      source: 'uncalibrated',
+      window_minutes: cfg.window_minutes,
+      tokens_7d: agyUsage?.available ? (agyUsage.window_7d?.total_tokens ?? null) : null,
+      budget_tokens_7d: cfg.window_7d_tokens,
+      note: 'AGY 官方未公开剩余百分比 API；如需启用精确 AGY 7 天等比例竞比，可用 Mode.ps1 agy-quota 录入面板快照、配 agy-budget 本地预算，或挂外部只读探针。'
+    };
+  }
+
+  return {
+    window_5h: window5h,
+    window_7d: window7d,
+    limited: window5h.status === 'limited' || window7d.band === 'agy_protected',
+    caution: window5h.status === 'caution'
   };
 }
 
@@ -433,18 +644,30 @@ function scanAgyTranscriptUsage(options = {}) {
 function runExternalAgyProbe(command, options = {}) {
   if (!Array.isArray(command) || !command.length) return null;
   const timeout = options.timeoutMs ?? 5000;
+  const num = v => typeof v === 'number' && Number.isFinite(v) ? round2(clamp(v, 0, 100)) : null;
   try {
     const res = spawnSync(command[0], command.slice(1), { encoding: 'utf8', windowsHide: true, timeout });
     if (res.error) return { available: false, error: res.error.message };
     if (res.status !== 0) return { available: false, error: (res.stderr || res.stdout || `exit ${res.status}`).trim().slice(0, 400) };
     const parsed = JSON.parse((res.stdout || '').trim());
-    const remaining = typeof parsed.remaining_percent === 'number' && Number.isFinite(parsed.remaining_percent)
-      ? round2(clamp(parsed.remaining_percent, 0, 100))
-      : null;
-    if (remaining === null) return { available: false, error: 'Probe output missing numeric remaining_percent (0..100)' };
+
+    const legacyRemaining = num(parsed.remaining_percent);
+    const fiveHourUsed = num(parsed.five_hour_used_percent)
+      ?? (num(parsed.five_hour_remaining_percent) !== null ? round2(100 - num(parsed.five_hour_remaining_percent)) : null)
+      ?? (legacyRemaining !== null ? round2(100 - legacyRemaining) : null);
+    const weeklyUsed = num(parsed.weekly_used_percent)
+      ?? (num(parsed.weekly_remaining_percent) !== null ? round2(100 - num(parsed.weekly_remaining_percent)) : null);
+
+    if (fiveHourUsed === null && weeklyUsed === null) {
+      return { available: false, error: 'Probe output missing numeric quota percent fields (remaining_percent / five_hour_used_percent / weekly_used_percent)' };
+    }
     return {
       available: true,
-      remaining_percent: remaining,
+      remaining_percent: legacyRemaining ?? (fiveHourUsed !== null ? round2(100 - fiveHourUsed) : round2(100 - weeklyUsed)),
+      five_hour_used_percent: fiveHourUsed,
+      five_hour_resets_at: typeof parsed.five_hour_resets_at === 'string' ? parsed.five_hour_resets_at : (typeof parsed.reset_at === 'string' ? parsed.reset_at : null),
+      weekly_used_percent: weeklyUsed,
+      weekly_resets_at: typeof parsed.weekly_resets_at === 'string' ? parsed.weekly_resets_at : null,
       reset_at: typeof parsed.reset_at === 'string' ? parsed.reset_at : null,
       model_group: typeof parsed.model_group === 'string' ? parsed.model_group : null,
       source: typeof parsed.source === 'string' ? parsed.source : 'external_probe'
@@ -496,14 +719,17 @@ function decideRoute(input = {}) {
   const codexPacing = input.codexPacing || { available: false };
   const agyUsage = input.agyUsage || { available: false };
   const agyExternal = input.agyExternal || null;
+  const agyPacing = input.agyPacing || evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy: policy, codexPacing, nowMs });
   const activeTasks = input.activeCodexTasks || { count: 0, orphaned: 0, tasks: [] };
   const currentModelName = typeof input.modelName === 'string' ? input.modelName : '';
 
   const codexCooling = cooldownActive(policy.cooldowns?.codex, nowMs);
-  const agyCooling = cooldownActive(policy.cooldowns?.agy, nowMs);
-  const agyLowExternal = agyExternal?.available === true && agyExternal.remaining_percent < 15;
-  const agyConstrained = agyCooling || agyUsage.auto_degraded === true || policy.agy_quota_hint === 'low' || agyLowExternal;
+  const agy5hLimited = agyPacing.window_5h.status === 'limited';
+  const agy5hCaution = agyPacing.window_5h.status === 'caution';
+  const agy7dProtected = agyPacing.window_7d.band === 'agy_protected';
+  const agyConstrained = agy5hLimited || agy7dProtected;
   const codexHardBlocked = codexCooling || codexPacing.hard_limited === true || codexPacing.band === 'codex_protected';
+  const dualMargin = policy.agy_pacing?.dual_compare_margin ?? DEFAULT_AGY_PACING.dual_compare_margin;
 
   let preferredEngine = 'codex';
   let fallbackEngine = 'codex';
@@ -518,16 +744,21 @@ function decideRoute(input = {}) {
   } else if (mode === 'agy') {
     preferredEngine = 'agy';
     fallbackEngine = 'codex';
-    reason = 'locked_agy_mode';
+    reason = agy5hLimited ? 'locked_agy_mode_5h_limited_warning' : 'locked_agy_mode';
   } else {
-    // Auto mode: Codex-first + 7-day 100% proportional pacing + Codex fallback.
+    // Auto mode: Dual 7-day 100% proportional pacing + AGY 5h window limit + Codex fallback.
     if (agyConstrained && !codexHardBlocked) {
       preferredEngine = 'codex';
       fallbackEngine = 'codex';
-      reason = agyCooling ? 'agy_cooldown_codex_fallback'
-        : agyUsage.auto_degraded ? 'agy_recent_quota_error_codex_fallback'
-        : agyLowExternal ? 'agy_probe_low_codex_fallback'
-        : 'agy_hint_low_codex_fallback';
+      reason = agy5hLimited
+        ? (agyPacing.window_5h.reason === 'agy_recent_429_quota_error'
+          ? 'agy_recent_quota_error_codex_fallback'
+          : agyPacing.window_5h.reason === 'agy_manual_cooldown'
+            ? 'agy_cooldown_codex_fallback'
+            : agyPacing.window_5h.reason === 'agy_hint_low'
+              ? 'agy_hint_low_codex_fallback'
+              : 'agy_5h_limited_codex_fallback')
+        : 'agy_7d_protected_codex_fallback';
     } else if (codexHardBlocked && !agyConstrained) {
       preferredEngine = 'agy';
       fallbackEngine = 'codex';
@@ -544,6 +775,36 @@ function decideRoute(input = {}) {
       preferredEngine = 'codex';
       fallbackEngine = 'codex';
       reason = 'codex_end_of_window_drain';
+    } else if (agyPacing.window_7d.available) {
+      // Both sides have calibrated 7-day 100% proportional pacing:
+      // route to whichever side is further behind its 7-day pace, while respecting AGY's 5h caution guard.
+      if (agyPacing.window_7d.band === 'agy_drain' && !agy5hCaution) {
+        preferredEngine = 'agy';
+        fallbackEngine = 'codex';
+        reason = 'agy_end_of_window_drain';
+      } else {
+        const diff = round2(codexPacing.pacing_delta - agyPacing.window_7d.pacing_delta);
+        if (diff > dualMargin) {
+          // Codex is ahead of AGY relative to 7-day 100% pace => prefer AGY unless AGY 5h is in caution
+          if (agy5hCaution) {
+            preferredEngine = 'balanced';
+            fallbackEngine = 'codex';
+            reason = 'dual_7d_agy_ahead_throttled_by_5h_caution';
+          } else {
+            preferredEngine = 'agy';
+            fallbackEngine = 'codex';
+            reason = 'dual_7d_agy_further_behind_pace';
+          }
+        } else if (diff < -dualMargin) {
+          preferredEngine = 'codex';
+          fallbackEngine = 'codex';
+          reason = 'dual_7d_codex_further_behind_pace';
+        } else {
+          preferredEngine = 'balanced';
+          fallbackEngine = 'codex';
+          reason = 'dual_7d_on_parity_balanced';
+        }
+      }
     } else if (codexPacing.band === 'codex_priority') {
       preferredEngine = 'codex';
       fallbackEngine = 'codex';
@@ -553,9 +814,15 @@ function decideRoute(input = {}) {
       fallbackEngine = 'codex';
       reason = 'codex_on_7d_pace_balanced';
     } else {
-      preferredEngine = 'agy';
-      fallbackEngine = 'codex';
-      reason = 'codex_ahead_of_7d_pace_route_agy';
+      if (agy5hCaution) {
+        preferredEngine = 'balanced';
+        fallbackEngine = 'codex';
+        reason = 'codex_ahead_but_agy_5h_caution_balanced';
+      } else {
+        preferredEngine = 'agy';
+        fallbackEngine = 'codex';
+        reason = 'codex_ahead_of_7d_pace_route_agy';
+      }
     }
   }
 
@@ -568,16 +835,21 @@ function decideRoute(input = {}) {
   const codexText = codexPacing.available
     ? `Codex 7天进度 ${codexPacing.elapsed_percent}% / 已用 ${codexPacing.used_percent}%（偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%，距重置 ${codexPacing.hours_until_reset}h）`
     : 'Codex 实时配额暂未读取（默认优先 Codex）';
-  const agyText = agyExternal?.available
-    ? `AGY 外部探针剩余 ${agyExternal.remaining_percent}%`
-    : agyUsage.available
-      ? `AGY 近5h本地消耗 ${agyUsage.window_5h.total_tokens} tokens（限流错 ${agyUsage.quota_errors_5h}）`
-      : 'AGY 本地用量未扫描';
+
+  const agy5hText = agyPacing.window_5h.used_percent !== null
+    ? `AGY 5h已用 ${agyPacing.window_5h.used_percent}%（${agyPacing.window_5h.status}）`
+    : agyUsage.available && agyUsage.window_5h
+      ? `AGY 近5h消耗 ${agyUsage.window_5h.total_tokens} tokens（状态=${agyPacing.window_5h.status}，限流错 ${agyUsage.quota_errors_5h ?? 0}）`
+      : `AGY 5h状态=${agyPacing.window_5h.status}`;
+  const agy7dText = agyPacing.window_7d.available
+    ? `AGY 7天进度 ${agyPacing.window_7d.elapsed_percent}% / 已用 ${agyPacing.window_7d.used_percent}%（偏差 ${agyPacing.window_7d.pacing_delta >= 0 ? '+' : ''}${agyPacing.window_7d.pacing_delta}%）`
+    : 'AGY 7天未标定（按本地5h+Codex7天均衡）';
+
   const engineLabel = preferredEngine === 'codex' ? '优先 Codex（Codex 兜底）'
     : preferredEngine === 'balanced' ? 'Codex 与 AGY 混合均衡（Codex 兜底）'
     : '优先 AGY 低成本多子代理（Codex 兜底）';
 
-  const summaryLine = `模式=${mode}｜路由=${engineLabel}｜${codexText}｜${agyText}${activeTasks.count ? `｜在途Codex任务=${activeTasks.count}` : ''}`;
+  const summaryLine = `模式=${mode}｜路由=${engineLabel}｜${codexText}｜${agy7dText}｜${agy5hText}${activeTasks.count ? `｜在途Codex任务=${activeTasks.count}` : ''}`;
 
   return {
     mode,
@@ -588,9 +860,12 @@ function decideRoute(input = {}) {
     codex_allowed: codexAllowed,
     reason,
     codex_pacing: codexPacing,
+    agy_pacing: agyPacing,
     agy_usage: agyUsage,
     agy_external: agyExternal,
     agy_constrained: agyConstrained,
+    agy_5h_limited: agy5hLimited,
+    agy_5h_caution: agy5hCaution,
     codex_hard_blocked: codexHardBlocked,
     active_codex_tasks: activeTasks,
     agy_tiers: policy.agy_tiers,
@@ -613,12 +888,14 @@ function decideRoute(input = {}) {
     task_allocation: {
       quant_strategy_thinking: quantThinking ? `主会话 ${quantThinking} 最强思考 + Codex quant 独立只读审核` : '主会话最强思考 + Codex quant 独立只读审核',
       long_background_jobs: '优先 Codex（受控 waiting_background 独立托管与断点恢复）',
-      read_only_parallel_exploration: `AGY research 子代理 (${policy.agy_tiers.simple}) 或 Codex simple`,
+      read_only_parallel_exploration: agy5hLimited
+        ? 'Codex simple（当前 AGY 5h 受限，由 Codex 兜底）'
+        : `AGY research 子代理 (${policy.agy_tiers.simple}) 或 Codex simple`,
       routine_implementation_and_tests: preferredEngine === 'agy'
-        ? `优先 AGY 子代理 (${policy.agy_tiers.standard})，AGY 受限时由 Codex standard 兜底`
+        ? `优先 AGY 子代理 (${policy.agy_tiers.standard})，AGY 5h 吃紧或 429 时立即由 Codex standard 兜底`
         : preferredEngine === 'balanced'
-          ? `Codex standard 与 AGY 子代理 (${policy.agy_tiers.standard}) 混合分流，Codex 兜底`
-          : `优先 Codex standard，多文件独立并行可借助 AGY 子代理 (${policy.agy_tiers.standard})`,
+          ? `Codex standard 与 AGY 子代理 (${policy.agy_tiers.standard}) 混合分流，防 AGY 5h 撞墙，Codex 兜底`
+          : `优先 Codex standard（Codex 兜底），AGY 5h 宽裕时可辅助只读并行`,
       complex_architecture_or_debugging: preferredEngine === 'agy'
         ? `AGY 子代理 (${policy.agy_tiers.complex})，必要时 Codex complex 兜底`
         : `优先 Codex complex`
@@ -692,6 +969,7 @@ function writeQuotaCache(cachePath, payload) {
 module.exports = {
   MODE_ALIASES,
   DEFAULT_PACING,
+  DEFAULT_AGY_PACING,
   DEFAULT_AGY_TIERS,
   normalizeMode,
   normalizeSubagentModel,
@@ -703,6 +981,7 @@ module.exports = {
   saveRoutingPolicy,
   resolveProjectPolicy,
   evaluateCodexPacing,
+  evaluateAgyPacing,
   scanAgyTranscriptUsage,
   runExternalAgyProbe,
   activeCodexTasks,

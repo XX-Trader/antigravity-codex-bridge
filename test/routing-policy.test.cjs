@@ -11,6 +11,7 @@ const {
   saveRoutingPolicy,
   resolveProjectPolicy,
   evaluateCodexPacing,
+  evaluateAgyPacing,
   scanAgyTranscriptUsage,
   runExternalAgyProbe,
   decideRoute,
@@ -265,7 +266,8 @@ test('Broker/ProjectRouter codex_quota MCP tool and external AGY probe contract 
   assert.equal(body1.codex_pacing.used_percent, 85);
   assert.equal(body1.agy_external.remaining_percent, 12);
   assert.equal(body1.preferred_engine, 'codex', 'Low external AGY probe triggers Codex fallback');
-  assert.equal(body1.reason, 'agy_probe_low_codex_fallback');
+  assert.equal(body1.reason, 'agy_5h_limited_codex_fallback');
+  assert.equal(body1.agy_5h_limited, true);
 
   // Second call without refresh hits 60s local cache
   const reply2 = await dispatch(broker, { method: 'tools/call', params: { name: 'codex_quota', arguments: {} } });
@@ -301,4 +303,96 @@ test('Mode CLI switches global/project modes with AGY aliases, quant thinking mo
   assert.equal(out6.cooldowns.agy, null);
   const out7 = JSON.parse(await runModeCli(['reset-project', '--project', f.project, '--policy', f.policyPath]));
   assert.deepEqual(out7.projects, {});
+  const out8 = JSON.parse(await runModeCli(['agy-quota', '--weekly-used', '32', '--weekly-reset', '2026-11-28T15:14:55Z', '--5h-used', '45', '--5h-reset', '2026-11-25T13:00:00Z', '--policy', f.policyPath]));
+  assert.equal(out8.agy_manual_snapshot.weekly_used_percent, 32);
+  assert.equal(out8.agy_manual_snapshot.five_hour_used_percent, 45);
+  const out9 = JSON.parse(await runModeCli(['agy-budget', '--tokens-5h', '10000000', '--tokens-7d', '100000000', '--5h-caution', '70', '--5h-protect', '85', '--policy', f.policyPath]));
+  assert.equal(out9.agy_pacing.window_5h_tokens, 10000000);
+  assert.equal(out9.agy_pacing.window_7d_tokens, 100000000);
+  assert.equal(out9.agy_pacing.window_5h_caution_percent, 70);
+  assert.equal(out9.agy_pacing.window_5h_protect_percent, 85);
+});
+
+test('dual 7-day 100% proportional pacing + AGY 5-hour limit guard + Codex fallback', () => {
+  const now = Date.parse('2026-11-25T10:00:00Z');
+  const reset7d = new Date(now + 84 * 3600000).toISOString(); // 50% elapsed of 7d window
+  const reset5h = new Date(now + 3 * 3600000).toISOString();
+  const base = defaultPolicy();
+  const scope = { project: 'P:/dual', review_category: 'general' };
+
+  // 1. Both calibrated: Codex at 80% (+30% ahead), AGY 7d at 30% (-20% behind), AGY 5h at 40% (ok) => prefer AGY
+  const p1 = resolveProjectPolicy({
+    ...base,
+    agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 30, weekly_resets_at: reset7d, five_hour_used_percent: 40, five_hour_resets_at: reset5h }
+  }, scope);
+  const codexAhead = { available: true, band: 'agy_priority', elapsed_percent: 50, used_percent: 80, pacing_delta: 30, resets_at: reset7d, hours_until_reset: 84, hard_limited: false };
+  const r1 = decideRoute({ policy: base, projectPolicy: p1, projectScope: scope, codexPacing: codexAhead, nowMs: now });
+  assert.equal(r1.preferred_engine, 'agy');
+  assert.equal(r1.reason, 'dual_7d_agy_further_behind_pace');
+  assert.equal(r1.agy_pacing.window_7d.pacing_delta, -20);
+  assert.equal(r1.agy_pacing.window_5h.status, 'ok');
+
+  // 2. Same 7d deltas, but AGY 5h hits caution (80% >= 75%) => throttle down to balanced to avoid 5h wall
+  const p2 = resolveProjectPolicy({
+    ...base,
+    agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 30, weekly_resets_at: reset7d, five_hour_used_percent: 80, five_hour_resets_at: reset5h }
+  }, scope);
+  const r2 = decideRoute({ policy: base, projectPolicy: p2, projectScope: scope, codexPacing: codexAhead, nowMs: now });
+  assert.equal(r2.preferred_engine, 'balanced');
+  assert.equal(r2.agy_5h_caution, true);
+  assert.equal(r2.reason, 'dual_7d_agy_ahead_throttled_by_5h_caution');
+
+  // 3. AGY 5h hits protect (90% >= 88%) => Codex immediately takes over as fallback even though Codex is ahead of 7d pace
+  const p3 = resolveProjectPolicy({
+    ...base,
+    agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 30, weekly_resets_at: reset7d, five_hour_used_percent: 90, five_hour_resets_at: reset5h }
+  }, scope);
+  const r3 = decideRoute({ policy: base, projectPolicy: p3, projectScope: scope, codexPacing: codexAhead, nowMs: now });
+  assert.equal(r3.preferred_engine, 'codex');
+  assert.equal(r3.agy_5h_limited, true);
+  assert.equal(r3.reason, 'agy_5h_limited_codex_fallback');
+
+  // 4. Both calibrated: AGY 7d at 70% (+20% ahead), Codex 7d at 40% (-10% behind), AGY 5h ok => prefer Codex
+  const p4 = resolveProjectPolicy({
+    ...base,
+    agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 70, weekly_resets_at: reset7d, five_hour_used_percent: 20, five_hour_resets_at: reset5h }
+  }, scope);
+  const codexBehind = { available: true, band: 'codex_priority', elapsed_percent: 50, used_percent: 40, pacing_delta: -10, resets_at: reset7d, hours_until_reset: 84, hard_limited: false };
+  const r4 = decideRoute({ policy: base, projectPolicy: p4, projectScope: scope, codexPacing: codexBehind, nowMs: now });
+  assert.equal(r4.preferred_engine, 'codex');
+  assert.equal(r4.reason, 'dual_7d_codex_further_behind_pace');
+
+  // 5. Parity within 5% margin => balanced
+  const p5 = resolveProjectPolicy({
+    ...base,
+    agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 52, weekly_resets_at: reset7d, five_hour_used_percent: 30, five_hour_resets_at: reset5h }
+  }, scope);
+  const codexMid = { available: true, band: 'balanced', elapsed_percent: 50, used_percent: 54, pacing_delta: 4, resets_at: reset7d, hours_until_reset: 84, hard_limited: false };
+  const r5 = decideRoute({ policy: base, projectPolicy: p5, projectScope: scope, codexPacing: codexMid, nowMs: now });
+  assert.equal(r5.preferred_engine, 'balanced');
+  assert.equal(r5.reason, 'dual_7d_on_parity_balanced');
+
+  // 6. Expired manual snapshot is automatically ignored (never fakes stale numbers)
+  const pExpired = resolveProjectPolicy({
+    ...base,
+    agy_manual_snapshot: { recorded_at: new Date(now - 10 * 3600000).toISOString(), weekly_used_percent: 99, weekly_resets_at: new Date(now - 1000).toISOString(), five_hour_used_percent: 99, five_hour_resets_at: new Date(now - 1000).toISOString() }
+  }, scope);
+  const apExpired = evaluateAgyPacing({ agyUsage: { available: false }, agyExternal: null, projectPolicy: pExpired, codexPacing: codexMid, nowMs: now });
+  assert.equal(apExpired.window_7d.available, false);
+  assert.equal(apExpired.window_5h.used_percent, null);
+
+  // 7. Local token budget calibrates AGY 5h and 7d automatically from transcript totals
+  const pBudget = resolveProjectPolicy({
+    ...base,
+    agy_pacing: { ...base.agy_pacing, window_5h_tokens: 10000000, window_7d_tokens: 100000000, weekly_resets_at: reset7d }
+  }, scope);
+  const apBudget = evaluateAgyPacing({
+    agyUsage: { available: true, window_5h: { total_tokens: 8900000 }, window_7d: { total_tokens: 40000000 }, quota_errors_5h: 0, auto_degraded: false },
+    agyExternal: null, projectPolicy: pBudget, codexPacing: codexAhead, nowMs: now
+  });
+  assert.equal(apBudget.window_5h.used_percent, 89);
+  assert.equal(apBudget.window_5h.status, 'limited');
+  assert.equal(apBudget.window_7d.available, true);
+  assert.equal(apBudget.window_7d.used_percent, 40);
+  assert.equal(apBudget.window_7d.pacing_delta, -10);
 });

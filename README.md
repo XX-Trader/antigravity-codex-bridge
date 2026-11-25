@@ -1,6 +1,6 @@
 # Antigravity Codex Bridge
 
-让 Antigravity（简称 `agy`/`AGY`）与本机 Codex CLI 协同执行任务：默认处于 `auto` 自动均衡模式（优先 Codex、按 7 天 100% 等比例消耗预算曲线与 AGY 本地用量/熔断动态分流、AGY 受限时由 Codex 兜底），也可随时按项目或全局切换为纯 `codex` 或 `agy` 模式。
+让 Antigravity（简称 `agy`/`AGY`）与本机 Codex CLI 协同执行任务：默认处于 `auto` 自动均衡模式（Codex 与 AGY 均按 7 天 100% 等比例消耗预算曲线均衡，AGY 叠加 5 小时窗口限制守卫，AGY 5 小时吃紧/受限时由 Codex 兜底），也可随时按项目或全局切换为纯 `codex` 或 `agy` 模式。
 
 走 Codex 执行时，Antigravity 理解需求、提出方案并验收，由 Codex 独立只读审核后在同一原生会话执行并支持 Codex 原生 `spawn_agent`；走 AGY 执行时，高配主会话负责思考、架构拆解与逐项验收，把具体检索、编码与测试下沉至低成本多子代理（`invoke_subagent` / `run_workflow`，默认 `simple→flash_lite`、`standard→flash`、`complex→pro`、`expert→inherit`），并支持为量化策略研究单独配置本机最强思考模型。锁定 `codex` 模式时，Hook 仍严格拦截 Antigravity 原生执行和子代理。维护本桥接仓库自身时，Antigravity 可以直接修改、测试和上传代码，无需经 MCP 派发；见 [仓库约定](AGENTS.md)。
 
