@@ -329,6 +329,14 @@ test('Mode CLI switches global/project modes with AGY aliases, quant thinking mo
   const out10 = JSON.parse(await runModeCli(['codex-pacing', '--days', '5', '--target', '100', '--policy', f.policyPath]));
   assert.equal(out10.pacing.plan_days, 5);
   assert.equal(out10.pacing.target_utilization, 100);
+  const out11 = JSON.parse(await runModeCli(['agy-models', '--standard', 'fast-exec-model', '--complex', 'complex-model', '--expert', 'expert-model', '--policy', f.policyPath]));
+  assert.deepEqual(out11.agy_host_models, { standard: 'fast-exec-model', complex: 'complex-model', expert: 'expert-model' });
+  const ctx = contextHook({ hookEventName: 'SessionStart', conversationId: 'conv-agy-models', workspacePaths: [f.project] }, [{ project: f.project, data: f.data, review_category: 'general' }], { policyPath: f.policyPath, markerFile: path.join(f.root, 'm2.json') });
+  const msg = ctx.injectSteps[0].systemMessage.systemMessage;
+  assert.match(msg, /send_message/);
+  assert.match(msg, /standard\(常规\)→fast-exec-model/);
+  const out12 = JSON.parse(await runModeCli(['agy-models', '--clear', '--policy', f.policyPath]));
+  assert.deepEqual(out12.agy_host_models, { standard: null, complex: null, expert: null });
 });
 
 test('dual 7-day 100% proportional pacing + AGY 5-hour limit guard + Codex fallback', () => {

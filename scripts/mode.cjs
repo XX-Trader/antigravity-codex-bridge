@@ -32,6 +32,7 @@ function usage() {
     '  agy-review-gate --level off|advisory|strict [--project ABS_PATH] [--valid-hours N] [--max-same N] [--max-total N]',
     '  reset-agy-guard [--conversation UUID] [--policy POLICY_JSON]',
     '  quant-thinking (--model NAME | --clear) [--config MCP_JSON] [--policy POLICY_JSON]',
+    '  agy-models [--standard NAME] [--complex NAME] [--expert NAME] [--clear] [--policy POLICY_JSON]',
     '  tier [--simple MODEL] [--standard MODEL] [--complex MODEL] [--expert MODEL] [--enforce-low-cost true|false]',
     '  cooldown --engine codex|agy --minutes N [--reason TEXT]',
     '  clear-cooldown --engine codex|agy'
@@ -263,6 +264,26 @@ async function run(argv) {
     current.thinking_models = { ...(current.thinking_models || {}), quant: opts.clear ? null : String(opts.model).trim() };
     const saved = saveRoutingPolicy(policyFile, current);
     return JSON.stringify({ state: 'updated', policy_path: saved.path, thinking_models: saved.thinking_models }, null, 2);
+  }
+
+  if (opts.command === 'agy-models') {
+    if (opts.clear) {
+      current.agy_host_models = { standard: null, complex: null, expert: null };
+      const saved = saveRoutingPolicy(policyFile, current);
+      return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_host_models: saved.agy_host_models }, null, 2);
+    }
+    const nextModels = { ...(current.agy_host_models || { standard: null, complex: null, expert: null }) };
+    let changed = false;
+    for (const key of ['standard', 'complex', 'expert']) {
+      if (opts[key] !== undefined) {
+        nextModels[key] = String(opts[key]).trim() || null;
+        changed = true;
+      }
+    }
+    if (!changed) throw new Error('Specify at least one of --standard, --complex, --expert, or --clear');
+    current.agy_host_models = nextModels;
+    const saved = saveRoutingPolicy(policyFile, current);
+    return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_host_models: saved.agy_host_models }, null, 2);
   }
 
   if (opts.command === 'tier') {

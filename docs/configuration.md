@@ -284,7 +284,7 @@ Antigravity 切换回读：两个 MCP 入口均引用当前 main 所在的同一
 
 ## 双引擎负载均衡与 AGY 低成本多子代理
 
-桥接默认采用 `auto` 双引擎自动均衡模式（优先 Codex、7 天 100% 等比例消耗预算曲线、AGY 受限时由 Codex 兜底），也支持通过本机外部策略文件 `routing-policy.json`（位于默认运行目录的父目录，或由 `CODEX_EXECUTOR_ROUTING_CONFIG` 指定绝对路径，不进入 Git）随时切换为 `agy`（支持 `agy`/`AGY`/`Agy`/`antigravity` 缩写）或 `codex`（严格锁定模式），**无需重启 Antigravity 立即生效**。
+桥接默认采用 `auto` 双引擎自动均衡模式（Codex 默认 5 天 100% 等比例消耗预算曲线、AGY 7 天 100% 等比例并叠加 5 小时窗口限制、AGY 受限时由 Codex 兜底），也支持通过本机外部策略文件 `routing-policy.json`（位于默认运行目录的父目录，或由 `CODEX_EXECUTOR_ROUTING_CONFIG` 指定绝对路径，不进入 Git）随时切换为 `agy`（支持 `agy`/`AGY`/`Agy`/`antigravity` 缩写）或 `codex`（严格锁定模式），**无需重启 Antigravity 立即生效**。
 
 ### 额度与熔断机制
 
@@ -296,12 +296,12 @@ Antigravity 切换回读：两个 MCP 入口均引用当前 main 所在的同一
   - `codex_drain`（距重置 $\le 12\text{h}$ 且剩余 $\ge 10\%$）：末期冲刺优先 Codex，减少 7 天过期浪费。
 - **AGY 7 天 100% 等比例 + 5 小时窗口限制 + Codex 兜底**：由于 Antigravity 官方未提供公开的剩余额度百分比 API，桥接不探测未文档化的宿主私有接口，而是将 AGY 拆为两层：
   - **5 小时滚动限制守卫**：实时汇总本机 `brain/*/.system_generated/logs/transcript.jsonl` 近 5 小时真实 token 消耗与近期 429/配额限流错误（严格排除 401/403 认证与策略拒绝），也支持结合 `Mode.ps1 agy-quota` 手动快照、`Mode.ps1 agy-budget` 本地 5h token 预算或可选外部探针。AGY 5 小时窗口进入警戒区（默认 `75%`）时限速为混合均衡；达到保护线（默认 `88%`）、近期出现 429 限流、标记 `agy_quota_hint=low` 或手动冷却时，只要 Codex 未硬限流，**立刻切由 Codex 兜底**。
-  - **7 天 100% 等比例竞比**：当 AGY 7 天进度通过 `Mode.ps1 agy-quota`（未过期快照）、`Mode.ps1 agy-budget`（本地 7d token 预算）或可选外部探针标定后，桥接按与 Codex 相同的 7 天 100% 匀速公式计算 $\Delta_{\text{agy}}$，与 $\Delta_{\text{codex}}$ 直接比对（谁更落后于 7 天进度且差值 $> 5\%$ 就优先谁，差值 $\le 5\%$ 混合分流；距重置 $\le 12\text{h}$ 且剩余 $\ge 10\%$ 自动冲刺消化尾额）。未标定时不伪造百分比，按 Codex 7 天曲线叠加 AGY 5 小时守卫调度。
+  - **7 天 100% 等比例竞比**：当 AGY 7 天进度通过 `Mode.ps1 agy-quota`（未过期快照）、`Mode.ps1 agy-budget`（本地 7d token 预算）或可选外部探针标定后，桥接按 7 天 100% 匀速公式计算 $\Delta_{\text{agy}}$，与 $\Delta_{\text{codex}}$ 直接比对（谁更落后于各自进度且差值 $> 5\%$ 就优先谁，差值 $\le 5\%$ 混合分流；距重置 $\le 12\text{h}$ 且剩余 $\ge 10\%$ 自动冲刺消化尾额）。未标定时不伪造百分比，按 Codex 5 天曲线叠加 AGY 5 小时守卫调度。
 - **可选外部探针**：可在本地 `routing-policy.json` 配置可选 `agy_quota_command`（命令行参数数组，输出含 `remaining_percent` 或双窗口 `five_hour_used_percent` / `weekly_used_percent` 的 JSON），默认禁用；失败时显式报错，绝不伪造 100%。
 
-### 模型档位对齐与量化最强思考
+### 模型档位对齐、高缓存复用与量化最强思考
 
-- **AGY 对称执行档位**（默认，可通过本机策略自定义）：`simple`/只读 `research` → `flash_lite`，`standard`（执行默认兜底）→ `flash`，`complex` → `pro`，`expert` → `inherit`。在 `auto`/`agy` 模式下，`PreToolUse` Hook 通过官方 `overwrite` 自动把未指定模型（或普通子任务误传 `inherit`）的 `invoke_subagent` 路由到低成本档位，防止误烧高配主模型。
+- **AGY 对称执行档位与高缓存保活**（默认，可通过本机策略自定义）：`simple`/只读 `research` → `flash_lite`，`standard`（执行默认兜底）→ `flash`，`complex` → `pro`，`expert` → `inherit`。在 `auto`/`agy` 模式下，`PreToolUse` Hook 通过官方 `overwrite` 自动把未指定模型（或普通子任务误传 `inherit`）的 `invoke_subagent` 路由到低成本档位，防止误烧高配主模型；同模块内通过 `send_message` 长期复用同一低成本子代理以维持高缓存命中率。还可通过 `scripts/Mode.ps1 agy-models --standard ... --complex ... --expert ...` 在本机外部策略登记各档对应的 AGY 主对话模型名称（公开仓库默认为 `null`，不硬编码个人模型 ID）。
 - **量化策略研究最强思考**：可在本地策略中通过 `scripts/Mode.ps1 quant-thinking --model MODEL_NAME` 配置本机量化最强思考模型（不写入公开仓库代码）。在 `review_category=quant` 项目中，`SessionStart`/`PreInvocation` 钩子会核对主会话模型并在不匹配时提示切换；同时量化策略思考类子任务显式保留 `inherit`/`pro` 不降级，日常清洗/检索/测试仍下沉低成本执行。
 
 ### AGY 黄金混血审核与智能防死循环门禁
@@ -316,7 +316,9 @@ pwsh -NoProfile -File scripts/Mode.ps1 status --refresh
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode auto
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode agy --project 'C:/work/my-project'
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode codex --project 'C:/work/my-project'
+pwsh -NoProfile -File scripts/Mode.ps1 codex-pacing --days 5 --target 100
 pwsh -NoProfile -File scripts/Mode.ps1 quant-thinking --model 'YOUR_STRONGEST_THINKING_MODEL'
+pwsh -NoProfile -File scripts/Mode.ps1 agy-models --standard 'YOUR_FAST_EXEC_MODEL' --complex 'YOUR_COMPLEX_MODEL' --expert 'YOUR_EXPERT_MODEL'
 pwsh -NoProfile -File scripts/Mode.ps1 agy-hint --level low
 pwsh -NoProfile -File scripts/Mode.ps1 agy-quota --weekly-used 35 --weekly-reset '2026-11-28T15:14:55Z' --5h-used 40 --5h-reset '2026-11-25T13:00:00Z'
 pwsh -NoProfile -File scripts/Mode.ps1 agy-budget --tokens-5h 8000000 --tokens-7d 80000000

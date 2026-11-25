@@ -121,6 +121,7 @@ function defaultPolicy() {
     agy_pacing: { ...DEFAULT_AGY_PACING },
     agy_guard: { ...DEFAULT_AGY_GUARD },
     agy_tiers: { ...DEFAULT_AGY_TIERS },
+    agy_host_models: { standard: null, complex: null, expert: null },
     subagent_default_model: 'flash',
     subagent_research_model: 'flash_lite',
     enforce_subagent_low_cost: true,
@@ -244,6 +245,16 @@ function parsePolicy(raw) {
     }
     policy.agy_tiers = tiers;
   }
+  if (raw.agy_host_models && typeof raw.agy_host_models === 'object' && !Array.isArray(raw.agy_host_models)) {
+    const hostModels = { ...base.agy_host_models };
+    for (const tier of ['standard', 'complex', 'expert']) {
+      if (raw.agy_host_models[tier] === null || raw.agy_host_models[tier] === '') hostModels[tier] = null;
+      else if (typeof raw.agy_host_models[tier] === 'string' && raw.agy_host_models[tier].trim()) {
+        hostModels[tier] = raw.agy_host_models[tier].trim().slice(0, 120);
+      }
+    }
+    policy.agy_host_models = hostModels;
+  }
   if (raw.subagent_default_model !== undefined) policy.subagent_default_model = normalizeSubagentModel(raw.subagent_default_model, base.subagent_default_model);
   if (raw.subagent_research_model !== undefined) policy.subagent_research_model = normalizeSubagentModel(raw.subagent_research_model, base.subagent_research_model);
   if (raw.enforce_subagent_low_cost !== undefined) policy.enforce_subagent_low_cost = Boolean(raw.enforce_subagent_low_cost);
@@ -346,6 +357,7 @@ function resolveProjectPolicy(policy, projectScope) {
     review_category: reviewCategory,
     thinking_model: thinkingModel,
     agy_tiers: { ...base.agy_tiers },
+    agy_host_models: { ...base.agy_host_models },
     subagent_default_model: override?.subagent_default_model || base.subagent_default_model,
     subagent_research_model: base.subagent_research_model,
     enforce_subagent_low_cost: override?.enforce_subagent_low_cost ?? base.enforce_subagent_low_cost,
@@ -916,6 +928,7 @@ function decideRoute(input = {}) {
     codex_hard_blocked: codexHardBlocked,
     active_codex_tasks: activeTasks,
     agy_tiers: policy.agy_tiers,
+    agy_host_models: policy.agy_host_models,
     subagent_defaults: {
       default_model: policy.subagent_default_model,
       research_model: policy.subagent_research_model,
@@ -935,16 +948,19 @@ function decideRoute(input = {}) {
     task_allocation: {
       quant_strategy_thinking: quantThinking ? `主会话 ${quantThinking} 最强思考 + Codex quant 独立只读审核` : '主会话最强思考 + Codex quant 独立只读审核',
       long_background_jobs: '优先 Codex（受控 waiting_background 独立托管与断点恢复）',
+      simple_mechanical_tasks: codexHardBlocked
+        ? `AGY 轻量执行 (${policy.agy_tiers.simple}，复用同子代理保缓存；当前 Codex 处于保护线)`
+        : `优先 Codex simple（单位成本最低）；需省 Codex 额度或并行调研时用 AGY ${policy.agy_tiers.simple}`,
       read_only_parallel_exploration: agy5hLimited
         ? 'Codex simple（当前 AGY 5h 受限，由 Codex 兜底）'
         : `AGY research 子代理 (${policy.agy_tiers.simple}) 或 Codex simple`,
       routine_implementation_and_tests: preferredEngine === 'agy'
-        ? `优先 AGY 子代理 (${policy.agy_tiers.standard})，AGY 5h 吃紧或 429 时立即由 Codex standard 兜底`
+        ? `优先 AGY 子代理 (${policy.agy_tiers.standard}，同模块通过 send_message 长期复用保缓存${policy.agy_host_models?.standard ? `；主对话直做可切 ${policy.agy_host_models.standard}` : ''})，AGY 5h 吃紧或 429 时立即由 Codex standard 兜底`
         : preferredEngine === 'balanced'
-          ? `Codex standard 与 AGY 子代理 (${policy.agy_tiers.standard}) 混合分流，防 AGY 5h 撞墙，Codex 兜底`
+          ? `Codex standard 与 AGY 子代理 (${policy.agy_tiers.standard}，send_message 复用保缓存${policy.agy_host_models?.standard ? ` / 主对话 ${policy.agy_host_models.standard}` : ''}) 混合分流，防 AGY 5h 撞墙，Codex 兜底`
           : `优先 Codex standard（Codex 兜底），AGY 5h 宽裕时可辅助只读并行`,
       complex_architecture_or_debugging: preferredEngine === 'agy'
-        ? `AGY 子代理 (${policy.agy_tiers.complex})，必要时 Codex complex 兜底`
+        ? `AGY 子代理 (${policy.agy_tiers.complex}${policy.agy_host_models?.complex ? ` / 主对话 ${policy.agy_host_models.complex}` : ''})，必要时 Codex complex 兜底`
         : `优先 Codex complex`
     },
     summary_line: summaryLine
