@@ -746,7 +746,7 @@ class Broker {
     const sessionsDir = defaultCodexSessionsDir(this.settings, { codexSessionsDir: input.codex_sessions_dir });
     let codexPacing = cached?.codex_pacing?.available ? cached.codex_pacing : null;
     let codexError = null;
-    if (!codexPacing && input.refresh !== true && sessionsDir && this.metadataCall === metadataCall) {
+    if (!codexPacing && input.refresh !== true && sessionsDir && this.metadataCall === nativeMetadata) {
       const recentRollout = readLatestCodexRolloutRateLimits({ codexSessionsDir: sessionsDir, maxAgeMs: 90 * 1000, nowMs });
       if (recentRollout) {
         codexPacing = { ...evaluateCodexPacing(recentRollout, projectPolicy.pacing, nowMs), source: 'codex_rollout_log', observed_at: recentRollout.observed_at };
