@@ -170,7 +170,7 @@ function contextHook(payload, projects, options = {}) {
 
   const lines = [
     `[双引擎路由状态] ${route.summary_line}`,
-    `执行模式：${route.mode}（支持缩写 agy/AGY/Agy 与 codex；用户显式点名优先；同事项粘性锁定单执行端；Codex 与 AGY 均按 7 天 100% 等比例均衡，AGY 叠加 5 小时窗口限制，AGY 5h 吃紧/受限时由 Codex 兜底）。`,
+    `执行模式：${route.mode}（支持缩写 agy/AGY/Agy 与 codex；用户显式点名优先；同事项粘性锁定单执行端；Codex 按 ${projectPolicy.pacing?.plan_days ?? 5} 天 100% 等比例消化、AGY 按 7 天 100% 等比例并叠加 5 小时窗口限制，AGY 5h 吃紧/受限时由 Codex 兜底）。`,
     `AGY 低成本多子代理分层：simple/research→${projectPolicy.agy_tiers.simple}，standard(默认)→${projectPolicy.agy_tiers.standard}，complex→${projectPolicy.agy_tiers.complex}，expert→${projectPolicy.agy_tiers.expert}；高配主会话做拆解与验收，多步执行下沉低成本子代理，批量扇出用 run_workflow，并行写用 Workspace="share"，Git 串行收口。`,
     `AGY 安全门禁：先审后做=${projectPolicy.agy_guard.review_gate}（重要/量化改动建议先 codex_run(review_only=true) 再交 AGY 实施）；防死循环=同一错误连错 ${projectPolicy.agy_guard.max_same_error_failures} 次或无进展连错 ${projectPolicy.agy_guard.max_consecutive_failures} 次自动熔断（不同错误允许自行修复，成功即清零）。`
   ];

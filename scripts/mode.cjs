@@ -28,6 +28,7 @@ function usage() {
     '  agy-hint --level plenty|normal|low [--config MCP_JSON] [--policy POLICY_JSON]',
     '  agy-quota [--weekly-used PCT] [--weekly-reset ISO] [--5h-used PCT] [--5h-reset ISO] [--clear]',
     '  agy-budget [--tokens-5h N] [--tokens-7d N] [--weekly-reset ISO] [--5h-caution PCT] [--5h-protect PCT] [--clear]',
+    '  codex-pacing [--days N] [--target PCT] [--policy POLICY_JSON]',
     '  agy-review-gate --level off|advisory|strict [--project ABS_PATH] [--valid-hours N] [--max-same N] [--max-total N]',
     '  reset-agy-guard [--conversation UUID] [--policy POLICY_JSON]',
     '  quant-thinking (--model NAME | --clear) [--config MCP_JSON] [--policy POLICY_JSON]',
@@ -201,6 +202,24 @@ async function run(argv) {
     current.agy_pacing = ap;
     const saved = saveRoutingPolicy(policyFile, current);
     return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_pacing: saved.agy_pacing }, null, 2);
+  }
+
+  if (opts.command === 'codex-pacing') {
+    const p = { ...(current.pacing || {}) };
+    if (opts.days !== undefined) {
+      const n = Number(opts.days);
+      if (!Number.isFinite(n) || n < 1 || n > 30) throw new Error('--days must be a number in 1..30');
+      p.plan_days = n;
+    }
+    if (opts.target !== undefined) {
+      const n = Number(opts.target);
+      if (!Number.isFinite(n) || n < 10 || n > 100) throw new Error('--target must be a number in 10..100');
+      p.target_utilization = n;
+    }
+    if (opts.days === undefined && opts.target === undefined) throw new Error('Specify --days N and/or --target PCT');
+    current.pacing = p;
+    const saved = saveRoutingPolicy(policyFile, current);
+    return JSON.stringify({ state: 'updated', policy_path: saved.path, pacing: saved.pacing }, null, 2);
   }
 
   if (opts.command === 'agy-review-gate') {

@@ -288,7 +288,7 @@ Antigravity 切换回读：两个 MCP 入口均引用当前 main 所在的同一
 
 ### 额度与熔断机制
 
-- **Codex 实时配额与 7 天等比例 Pacing**：通过本机 `codex --no-daemon app-server` 原生 JSON-RPC 方法 `account/rateLimits/read` 获取当前主窗口时长、已用百分比、精确重置时间、credits 与免费重置券（默认 60 秒本地缓存，`codex_quota(refresh=true)` 可强制刷新）。按公式 $P_{\text{target}} = \text{elapsedRatio} \times \text{target\_utilization}$ 与偏差 $\Delta = U - P_{\text{target}}$ 分段：
+- **Codex 实时配额与 5 天等比例 Pacing**：通过本机 `codex --no-daemon app-server` 原生 JSON-RPC 方法 `account/rateLimits/read` 获取当前主窗口时长（通常 7 天）、已用百分比、精确重置时间、credits 与免费重置券（默认 60 秒本地缓存，`codex_quota(refresh=true)` 可强制刷新）。默认按周期前 **`plan_days = 5` 天**（可通过 `Mode.ps1 codex-pacing --days N` 调整）等比例走满 100%（起点 $T_{\text{start}} = T_{\text{reset}} - W_{\text{api}}$，目标线 $P_{\text{target}} = \min(1,\ E / W_{\text{plan}}) \times 100\%$，偏差 $\Delta = U - P_{\text{target}}$）分段：
   - `codex_priority`（$\Delta \le -3\%$）：未达到等比例消耗线，优先 Codex；
   - `balanced`（$-3\% < \Delta \le +5\%$）：混合分流（Codex 主力/长后台/审核，AGY 低成本多子代理并行只读与中小改）；
   - `agy_priority`（$\Delta > +5\%$ 或 $U \ge 92\%$）：优先 AGY 低成本多子代理，保留 Codex 撑满 7 天；

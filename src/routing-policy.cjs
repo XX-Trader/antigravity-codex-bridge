@@ -23,6 +23,7 @@ const TERMINAL_STATUSES = new Set([
 ]);
 
 const DEFAULT_PACING = Object.freeze({
+  plan_days: 5,                   // Consume 100% of Codex weekly quota proportionally within 5 days
   target_utilization: 100,
   codex_priority_margin: -3,
   balanced_upper_margin: 5,
@@ -168,6 +169,10 @@ function parsePolicy(raw) {
   }
   if (raw.pacing && typeof raw.pacing === 'object' && !Array.isArray(raw.pacing)) {
     const p = { ...base.pacing };
+    if (raw.pacing.plan_days === null) p.plan_days = null;
+    else if (typeof raw.pacing.plan_days === 'number' && Number.isFinite(raw.pacing.plan_days) && raw.pacing.plan_days >= 1 && raw.pacing.plan_days <= 30) {
+      p.plan_days = round2(raw.pacing.plan_days);
+    }
     for (const [k, min, max] of [
       ['target_utilization', 10, 100],
       ['codex_priority_margin', -50, 20],
@@ -365,8 +370,13 @@ function evaluateCodexPacing(rateLimitReply, pacingCfg = DEFAULT_PACING, nowMs =
   const windowMs = primary.windowDurationMins * 60 * 1000;
   const resetsAtMs = primary.resetsAt * 1000;
   const remainingMs = Math.max(0, resetsAtMs - nowMs);
+  const elapsedMs = clamp(windowMs - remainingMs, 0, windowMs);
   const hoursUntilReset = round2(remainingMs / 3600000);
-  const elapsedRatio = clamp(1 - remainingMs / windowMs, 0, 1);
+  const windowElapsedPercent = round2((elapsedMs / windowMs) * 100);
+  const planDays = typeof cfg.plan_days === 'number' && cfg.plan_days > 0 ? cfg.plan_days : null;
+  const planWindowMs = planDays ? Math.min(windowMs, planDays * 24 * 3600 * 1000) : windowMs;
+  const effectivePlanDays = round2(planWindowMs / (24 * 3600 * 1000));
+  const elapsedRatio = clamp(elapsedMs / planWindowMs, 0, 1);
   const elapsedPercent = round2(elapsedRatio * 100);
   const targetUsedPercent = round2(elapsedRatio * cfg.target_utilization);
   const usedPercent = round2(clamp(primary.usedPercent, 0, 100));
@@ -395,6 +405,8 @@ function evaluateCodexPacing(rateLimitReply, pacingCfg = DEFAULT_PACING, nowMs =
     hard_limited: hardLimited,
     rate_limit_reached_type: limits.rateLimitReachedType || null,
     window_minutes: primary.windowDurationMins,
+    plan_days: effectivePlanDays,
+    window_elapsed_percent: windowElapsedPercent,
     used_percent: usedPercent,
     remaining_percent: remainingPercent,
     elapsed_percent: elapsedPercent,
@@ -866,8 +878,9 @@ function decideRoute(input = {}) {
     ? currentModelName.toLowerCase().includes(quantThinking.toLowerCase())
     : null;
 
+  const codexPlanLabel = codexPacing.plan_days ? `${codexPacing.plan_days}天` : '7天';
   const codexText = codexPacing.available
-    ? `Codex 7天进度 ${codexPacing.elapsed_percent}% / 已用 ${codexPacing.used_percent}%（偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%，距重置 ${codexPacing.hours_until_reset}h）`
+    ? `Codex ${codexPlanLabel}进度 ${codexPacing.elapsed_percent}% / 已用 ${codexPacing.used_percent}%（偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%，距重置 ${codexPacing.hours_until_reset}h）`
     : 'Codex 实时配额暂未读取（默认优先 Codex）';
 
   const agy5hText = agyPacing.window_5h.used_percent !== null
@@ -877,7 +890,7 @@ function decideRoute(input = {}) {
       : `AGY 5h状态=${agyPacing.window_5h.status}`;
   const agy7dText = agyPacing.window_7d.available
     ? `AGY 7天进度 ${agyPacing.window_7d.elapsed_percent}% / 已用 ${agyPacing.window_7d.used_percent}%（偏差 ${agyPacing.window_7d.pacing_delta >= 0 ? '+' : ''}${agyPacing.window_7d.pacing_delta}%）`
-    : 'AGY 7天未标定（按本地5h+Codex7天均衡）';
+    : `AGY 7天未标定（按本地5h+Codex${codexPlanLabel}均衡）`;
 
   const engineLabel = preferredEngine === 'codex' ? '优先 Codex（Codex 兜底）'
     : preferredEngine === 'balanced' ? 'Codex 与 AGY 混合均衡（Codex 兜底）'

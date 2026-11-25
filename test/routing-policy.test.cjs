@@ -43,9 +43,9 @@ test('mode normalization accepts auto/hybrid/balanced, agy/AGY/Agy/antigravity a
   assert.throws(() => normalizeMode('unknown'), /Unsupported execution mode/);
 });
 
-test('Codex 7-day proportional pacing classifies all five bands accurately without faking missing data', () => {
+test('Codex 5-day proportional pacing (over 7-day API window) classifies all five bands accurately without faking missing data', () => {
   const now = Date.parse('2026-11-25T07:00:00Z');
-  const windowMins = 10080; // 7 days
+  const windowMins = 10080; // 7 days = 168h API reset window; default plan_days = 5 days (120h)
   const makeReply = (usedPercent, hoursRemaining, extra = {}) => ({
     ordinaryUsageAllowed: extra.ordinaryUsageAllowed ?? true,
     rateLimits: {
@@ -58,24 +58,38 @@ test('Codex 7-day proportional pacing classifies all five bands accurately witho
     rateLimitResetCredits: { availableCount: 1, credits: [{ expiresAt: Math.floor((now + 10 * 86400000) / 1000) }] }
   });
 
-  // Halfway through 7d window (84h remaining => elapsed 50%)
-  const behind = evaluateCodexPacing(makeReply(35, 84), undefined, now);
+  // 108h remaining of 168h => elapsed 60h => 50% of the 5-day (120h) plan window
+  const behind = evaluateCodexPacing(makeReply(35, 108), undefined, now);
   assert.equal(behind.available, true);
+  assert.equal(behind.plan_days, 5);
   assert.equal(behind.elapsed_percent, 50);
+  assert.equal(behind.window_elapsed_percent, 35.71);
   assert.equal(behind.pacing_delta, -15);
   assert.equal(behind.band, 'codex_priority');
 
-  const onPace = evaluateCodexPacing(makeReply(52, 84), undefined, now);
+  const onPace = evaluateCodexPacing(makeReply(52, 108), undefined, now);
   assert.equal(onPace.band, 'balanced');
 
-  const ahead = evaluateCodexPacing(makeReply(87, 84), undefined, now);
+  const ahead = evaluateCodexPacing(makeReply(87, 108), undefined, now);
   assert.equal(ahead.pacing_delta, 37);
   assert.equal(ahead.band, 'agy_priority');
 
-  const nearCap = evaluateCodexPacing(makeReply(97, 84), undefined, now);
+  // After day 5 (e.g. 36h remaining => elapsed 132h >= 120h => 5-day target is 100%): 85% used => behind pace => prioritize Codex to finish remaining quota
+  const postDay5 = evaluateCodexPacing(makeReply(85, 36), undefined, now);
+  assert.equal(postDay5.elapsed_percent, 100);
+  assert.equal(postDay5.pacing_delta, -15);
+  assert.equal(postDay5.band, 'codex_priority');
+
+  // Explicit 7-day override still works when configured
+  const sevenDay = evaluateCodexPacing(makeReply(50, 84), { plan_days: 7 }, now);
+  assert.equal(sevenDay.plan_days, 7);
+  assert.equal(sevenDay.elapsed_percent, 50);
+  assert.equal(sevenDay.pacing_delta, 0);
+
+  const nearCap = evaluateCodexPacing(makeReply(97, 108), undefined, now);
   assert.equal(nearCap.band, 'codex_protected');
 
-  const hardLimited = evaluateCodexPacing(makeReply(60, 84, { ordinaryUsageAllowed: false }), undefined, now);
+  const hardLimited = evaluateCodexPacing(makeReply(60, 108, { ordinaryUsageAllowed: false }), undefined, now);
   assert.equal(hardLimited.band, 'codex_protected');
   assert.equal(hardLimited.hard_limited, true);
 
@@ -312,6 +326,9 @@ test('Mode CLI switches global/project modes with AGY aliases, quant thinking mo
   assert.equal(out9.agy_pacing.window_7d_tokens, 100000000);
   assert.equal(out9.agy_pacing.window_5h_caution_percent, 70);
   assert.equal(out9.agy_pacing.window_5h_protect_percent, 85);
+  const out10 = JSON.parse(await runModeCli(['codex-pacing', '--days', '5', '--target', '100', '--policy', f.policyPath]));
+  assert.equal(out10.pacing.plan_days, 5);
+  assert.equal(out10.pacing.target_utilization, 100);
 });
 
 test('dual 7-day 100% proportional pacing + AGY 5-hour limit guard + Codex fallback', () => {
