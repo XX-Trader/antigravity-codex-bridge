@@ -4,11 +4,14 @@
 
 ## 代码与入口
 
-- `src/server.cjs`：协议、任务 worker、持久化、权限、原生会话与标题。
+- `src/server.cjs`：协议、任务 worker、持久化、权限、原生会话、标题与共享配额查询（`codex_quota`）。
 - `src/model-policy.cjs`：执行档位、角色边界和本机账户模型快照校验。
-- `src/router.cjs`：多项目选择、会话归属和 PreToolUse 身份绑定。
-- `src/notifier.cjs`：文件事件监听、一次性原生回执投递。
-- `src/invoke-codex.ps1`：真实 Codex 启动；不改全局 Codex 配置。
+- `src/routing-policy.cjs`：双引擎线性均衡、官方 `agy /usage` 五桶解析、增量转录索引、跨进程单飞共享缓存与单/双边耗尽交接裁决。
+- `src/agy-guard.cjs`：AGY 先审后做门禁（Codex 100% 耗尽时自动免死锁）与智能防死循环熔断。
+- `src/router.cjs`：多项目选择、会话归属及 `PreToolUse` / `PostToolUse` / `SessionStart` / `PreInvocation` 钩子路由。
+- `src/notifier.cjs`：文件事件监听、一次性原生回执投递及宿主单例后台共享额度定时刷新（`startQuotaSyncLoop`）。
+- `src/invoke-codex.ps1`：真实 Codex 启动与无引号 Windows 钩子入口；不改全局 Codex 配置。
+- `scripts/Mode.ps1` / `scripts/mode.cjs`：免重启查看双引擎配额、切换模式、调整线性曲线/缓冲解锁窗口与模型池配置。
 - `scripts/Setup.ps1` / `scripts/setup.cjs`：预览、合并安装和按字段回滚。
 - `scripts/test.cjs`、`test/`：不调用模型的测试。
 - `scripts/verify.cjs`：注册检查，以及显式启用的真实 Codex smoke。

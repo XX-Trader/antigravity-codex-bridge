@@ -1,8 +1,8 @@
 # Antigravity Codex Bridge
 
-让 Antigravity（简称 `agy`/`AGY`）与本机 Codex CLI 协同执行任务：默认处于 `auto` 自动均衡模式（Codex 默认按 5 天 100% 等比例消耗，AGY 默认只用 90% 额度并预留 10% 应急缓冲且叠加 5 小时窗口限制守卫，AGY 触及缓冲线或 5 小时受限时由 Codex 兜底），也可随时按项目或全局切换为纯 `codex` 或 `agy` 模式。
+让 Antigravity（简称 `agy`/`AGY`）与本机 Codex CLI 协同执行任务：默认处于 `auto` 自动均衡模式（Codex 默认按 5 天 100% 等比例消耗，AGY 主池与可选独立模型池默认按 7 天 90% 上限等比例消耗、平时预留 10% 应急缓冲并在距周重置 $\le 6$ 小时内自动解锁剩余 10% 缓冲，同时叠加 5 小时窗口限制守卫；AGY 触及保护线时由 Codex 兜底，单边 100% 硬归零时自动解除粘性锁定跨端交接，双边受限时按软缓冲应急省流或双归零熔断待命），也可随时按项目或全局切换为纯 `codex` 或 `agy` 模式。
 
-走 Codex 执行时，Antigravity 理解需求、提出方案并验收，由 Codex 独立只读审核后在同一原生会话执行并支持 Codex 原生 `spawn_agent`；走 AGY 执行时，高配主会话负责思考、架构拆解与逐项验收，把具体检索、编码与测试下沉至低成本多子代理（`invoke_subagent` / `run_workflow`，默认 `simple→flash_lite`、`standard→flash`、`complex→pro`、`expert→inherit`），并支持为量化策略研究单独配置本机最强思考模型。锁定 `codex` 模式时，Hook 仍严格拦截 Antigravity 原生执行和子代理。维护本桥接仓库自身时，Antigravity 可以直接修改、测试和上传代码，无需经 MCP 派发；见 [仓库约定](AGENTS.md)。
+走 Codex 执行时，Antigravity 理解需求、提出方案并验收，由 Codex 独立只读审核后在同一原生会话执行并支持 Codex 原生 `spawn_agent`；走 AGY 执行时，高配主会话负责思考、架构拆解与逐项验收，把具体检索、编码与测试下沉至低成本多子代理（`invoke_subagent` / `run_workflow`，默认 `simple→flash_lite`、`standard→flash`、`complex→pro`、`expert→inherit`，同模块内通过 `send_message` 长期复用子代理以保持高缓存命中率），并支持为量化策略研究单独配置本机最强思考模型及备用链。锁定 `codex` 模式时，Hook 仍严格拦截 Antigravity 原生执行和子代理。维护本桥接仓库自身时，Antigravity 可以直接修改、测试和上传代码，无需经 MCP 派发；见 [仓库约定](AGENTS.md)。
 
 这是一个 Windows 优先的本地 stdio MCP 服务，不需要 npm 运行依赖，也不复制 Codex 登录凭证。默认启用完整文件系统/命令网络访问和实时联网搜索，适用于你信任的本机项目；不要接到不可信工作区或远程公开端口。
 
@@ -73,9 +73,9 @@ pwsh -NoProfile -File scripts/Setup.ps1 --project 'C:/work/my-project' --data 'C
 | `codex_result` | 领取原回执，或查看最后已落盘进度；`sync_title=true` 可补齐已结束旧任务的标题 |
 | `codex_wait` | 一次等待既有任务完成，不重新提交 |
 | `codex_cancel` | 只取消该任务拥有的子进程，不回滚源码改动 |
-| `codex_quota` | 只读查询 Codex 实时 7 天等比例消耗进度、AGY 本地 5h/7d 转录用量与限流态、活跃任务数及当前 `auto`/`agy`/`codex` 路由建议 |
+| `codex_quota` | 只读查询 Codex 实时等比例消耗进度、AGY 官方 `agy /usage` 五桶剩余百分比与增量转录用量、独立模型池水位、活跃任务数及当前 `auto`/`agy`/`codex` 路由与跨端交接建议（多窗口共享单例缓存，不按窗口重复探测） |
 
-也可通过 `pwsh -NoProfile -File scripts/Mode.ps1` 免重启查看配额、切换全局或单项目 `auto`/`agy`/`codex` 模式、设置量化思考模型与熔断冷却。
+也可通过 `pwsh -NoProfile -File scripts/Mode.ps1` 免重启查看共享配额快照、切换全局或单项目 `auto`/`agy`/`codex` 模式、调整线性消耗天数/6h缓冲解锁窗口、配置独立模型池与主对话档位映射，以及管理先审后做门禁与熔断冷却。
 
 `topic` 应是“修复播放器切集失败”这样的实际任务，而不是“Codex 执行者”。首次新事项的会话建立事件带有原生聊天链接，不必等到最终回执；常规进度、同事项续接和通知恢复只留本地，不反复唤醒模型或刷聊天。通知正文保留本地时间、项目/短事项、具体结果或所需操作和一个详情链接，默认最多三行；用户选择完整展示。把 `chat.vscode_uri` 展示给用户；`chat=null` 不代表失败，也不是重复提交的理由。
 

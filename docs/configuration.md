@@ -284,29 +284,35 @@ Antigravity 切换回读：两个 MCP 入口均引用当前 main 所在的同一
 
 ## 双引擎负载均衡与 AGY 低成本多子代理
 
-桥接默认采用 `auto` 双引擎自动均衡模式（Codex 默认 5 天 100% 等比例消耗预算曲线、AGY 默认只用 90% 额度并预留 10% 应急缓冲且叠加 5 小时窗口限制、AGY 触及缓冲线或受限时由 Codex 兜底），也支持通过本机外部策略文件 `routing-policy.json`（位于默认运行目录的父目录，或由 `CODEX_EXECUTOR_ROUTING_CONFIG` 指定绝对路径，不进入 Git）随时切换为 `agy`（支持 `agy`/`AGY`/`Agy`/`antigravity` 缩写）或 `codex`（严格锁定模式），**无需重启 Antigravity 立即生效**。
+桥接默认采用 `auto` 双引擎自动均衡模式（Codex 默认 5 天 100% 等比例消耗预算曲线、AGY 主池与独立模型池默认 7 天 90% 上限并预留 10% 应急缓冲且在距周重置 $\le 6$ 小时内自动解锁剩余 10% 缓冲，同时叠加 5 小时窗口限制、单边 100% 耗尽跨端交接与双边分级兜底），也支持通过本机外部策略文件 `routing-policy.json`（位于默认运行目录的父目录，或由 `CODEX_EXECUTOR_ROUTING_CONFIG` 指定绝对路径，不进入 Git）随时切换为 `agy`（支持 `agy`/`AGY`/`Agy`/`antigravity` 缩写）或 `codex`（严格锁定模式），**无需重启 Antigravity 立即生效**。
 
-### 额度与熔断机制
+### 跨窗口资源复用与共享额度机制
 
-- **Codex 实时配额与 5 天等比例 Pacing**：通过本机 `codex --no-daemon app-server` 原生 JSON-RPC 方法 `account/rateLimits/read` 获取当前主窗口时长（通常 7 天）、已用百分比、精确重置时间、credits 与免费重置券（默认 60 秒本地缓存，`codex_quota(refresh=true)` 可强制刷新）。默认按周期前 **`plan_days = 5` 天**（可通过 `Mode.ps1 codex-pacing --days N` 调整）等比例走满 100%（起点 $T_{\text{start}} = T_{\text{reset}} - W_{\text{api}}$，目标线 $P_{\text{target}} = \min(1,\ E / W_{\text{plan}}) \times 100\%$，偏差 $\Delta = U - P_{\text{target}}$）分段：
+- **宿主单例后台同步 + 跨窗口共享快照**：宿主唯一的 `notifier.cjs` Sidecar 守护进程通过 `startQuotaSyncLoop` 每 2 分钟在后台执行一次毫秒级本地增量对账并原子更新全局 `quota-cache.json`（默认共享缓存 TTL 为 `300` 秒，并带 `takeQuotaRefreshClaim` 跨进程单飞锁消除并发惊群）。新开任意数量的 Antigravity 窗口或触发 `SessionStart` / `PreInvocation` / `PreToolUse` 钩子时，**全部直接复用同一份 `quota-cache.json`，不按窗口重复拉起 CLI 子进程或全量扫描会话日志**。
+- **增量会话游标索引（`agy-transcript-index.json`）**：按 `(mtime_ms, size, offset)` 持久化每个 `transcript.jsonl` 的解析游标；未变动的历史会话零字节读取，活跃会话（含 $>2\text{MB}$ 大文件）仅增量读取新增尾部完整行。
+- **Codex 实时配额与 5 天等比例 Pacing**：优先复用本机 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` 最新 `rate_limits` 记录与共享缓存，仅在无新日志且到期（后台默认 15 分钟）或显式 `refresh=true` 时调用 `codex --no-daemon app-server` 的 `account/rateLimits/read`（超时自动回退会话日志与同周期缓存，绝不用不可用状态覆盖有效配额）。默认按周期前 **`plan_days = 5` 天**（可通过 `Mode.ps1 codex-pacing --days N` 调整）等比例走满 100%（起点 $T_{\text{start}} = T_{\text{reset}} - W_{\text{api}}$，目标线 $P_{\text{target}} = \min(1,\ E / W_{\text{plan}}) \times 100\%$，偏差 $\Delta = U - P_{\text{target}}$），并在高水位时自动收敛 `auto` 模式下的全局 Codex 在途并发上限（`ahead_max_concurrent=3`、$\ge 92\%$ 时 `high_max_concurrent=2`、$\ge 97\%$ 时 `protect_max_concurrent=1`）：
   - `codex_priority`（$\Delta \le -3\%$）：未达到等比例消耗线，优先 Codex；
   - `balanced`（$-3\% < \Delta \le +5\%$）：混合分流（Codex 主力/长后台/审核，AGY 低成本多子代理并行只读与中小改）；
-  - `agy_priority`（$\Delta > +5\%$ 或 $U \ge 92\%$）：优先 AGY 低成本多子代理，保留 Codex 撑满 7 天；
-  - `codex_protected`（$U \ge 97\%$ 或触发限流）：保护 Codex，新事项默认走 AGY；
-  - `codex_drain`（距重置 $\le 12\text{h}$ 且剩余 $\ge 10\%$）：末期冲刺优先 Codex，减少 7 天过期浪费。
-- **AGY 7 天 90% 上限（预留 10% 缓冲）+ 5 小时窗口限制 + Codex 兜底**：由于 Antigravity 官方未提供公开的剩余额度百分比 API，桥接不探测未文档化的宿主私有接口，而是将 AGY 拆为两层：
-  - **5 小时滚动限制守卫**：实时汇总本机 `brain/*/.system_generated/logs/transcript.jsonl` 近 5 小时真实 token 消耗与近期 429/配额限流错误（严格排除 401/403 认证与策略拒绝），也支持结合 `Mode.ps1 agy-quota` 手动快照、`Mode.ps1 agy-budget` 本地 5h token 预算或可选外部探针。AGY 5 小时窗口进入警戒区（默认 `75%`）时限速为混合均衡；达到保护线（默认 `88%`）、近期出现 429 限流、标记 `agy_quota_hint=low` 或手动冷却时，只要 Codex 未硬限流，**立刻切由 Codex 兜底**。
-  - **7 天 90% 上限与 10% 应急缓冲**：默认 `target_utilization = 90`、`weekly_protect_used_percent = 90`（可通过 `Mode.ps1 agy-budget --target N --weekly-protect N` 调整），自动留出 10% 突发缓冲。当 AGY 7 天进度通过快照、本地预算或外部探针标定后，按 90% 目标线计算 $\Delta_{\text{agy}}$ 并与 $\Delta_{\text{codex}}$ 比对（差值 $> 5\%$ 优先落后方，差值 $\le 5\%$ 混合分流）；已用达 `90%` 立即进入 `agy_protected` 切由 Codex 兜底，且末期清仓仅针对 90% 上限以内的可用余量，绝不吃进 10% 缓冲。未标定时不伪造百分比，按 Codex 5 天曲线叠加 AGY 5 小时守卫调度。
-- **可选外部探针**：可在本地 `routing-policy.json` 配置可选 `agy_quota_command`（命令行参数数组，输出含 `remaining_percent` 或双窗口 `five_hour_used_percent` / `weekly_used_percent` 的 JSON），默认禁用；失败时显式报错，绝不伪造 100%。
+  - `agy_priority`（$\Delta > +5\%$ 或 $U \ge 92\%$）：优先 AGY 低成本多子代理，保留 Codex 撑满周期；
+  - `codex_protected`（$97\% \le U < 100\%$）：保护 Codex，拦截普通新事项改走 AGY，仅允许单路在途收尾；
+  - `codex_drain`（距重置 $\le 12\text{h}$ 且剩余 $\ge 10\%$）：末期冲刺优先 Codex，减少过期浪费。
+- **AGY 官方 `agy /usage` 五桶探测 + 7 天 90% 上限（最后 6 小时自动解锁 10% 缓冲）+ 5 小时守卫**：
+  - **官方 CLI 五桶自动接入（与 CC Switch 共用系统钥匙串登录）**：当本机安装官方 Antigravity CLI（`%LOCALAPPDATA%\agy\bin\agy.exe` 或 `PATH` 中的 `agy`）后，后台每 10 分钟（或任一桶到达 `reset_time` 时）在纯 ASCII 隔离目录自动执行一次 `agy --print /usage --output-format json`（自动剥离 `GEMINI_API_KEY`/`GOOGLE_GEMINI_BASE_URL` 并在 Windows 下按需继承系统代理注册表，直接复用系统凭据管理器 `gemini:antigravity` 登录，不读私密令牌文件、不调未公开内部 RPC），原生解析 `gemini-5h`、`gemini-weekly`、`gemini-argon-wtu-weekly`、`3p-5h`、`3p-weekly` 五个官方额度桶与精确重置时间；未安装 CLI 时零报错回退至增量本地预算或手动快照（也可在 `routing-policy.json` 配置自定义 `agy_quota_command`）。
+  - **5 小时滚动限制守卫**：结合官方 `gemini-5h` 桶与本地近 5 小时 429 限流检测（严格排除 401/403 认证错误及 `HTTP 503 No capacity available` 服务端瞬时容量抖动）。进入警戒区（默认 `75%`）时限速为混合均衡；达到保护线（默认 `88%`）、近期出现 429、标记 `agy_quota_hint=low` 或手动冷却且 Codex 仍有余量时，**`PreToolUse` 硬拦截 AGY 执行子代理/写操作（`[AGY_QUOTA_PROTECTED]`）并立刻交由 Codex 兜底**。
+  - **7 天 90% 上限与最后 6 小时自动解锁 10% 缓冲**：默认 `target_utilization = 90`、`weekly_protect_used_percent = 90`、`buffer_unlock_window_hours = 6`（可通过 `Mode.ps1 agy-budget --target 90 --weekly-protect 90 --unlock-hours 6` 调整）。距周重置 $> 6\text{h}$ 时严格保留 10% 主窗口救命缓冲，触及 90% 即硬停 AGY 执行交由 Codex 接管；**当距周重置剩余 $\le 6\text{h}$ 时，自动解锁剩余 10% 缓冲升至 100% 上限并切入 `agy_drain` 清仓消耗**，避免重置前浪费剩余额度。
+- **单边 100% 硬归零跨端交接与双端受限分级兜底**：
+  - **Codex 100% 硬归零（`exhausted=true`）**：自动解除原事项粘性锁定与原生子代理锁定，`PreToolUse` 对所有 `codex_run`（含旧事项续接、`review_only=true`）返回 `[CODEX_EXHAUSTED_HANDOVER]` 引导 AGY 读取原任务 `codex_result` / `job.json` 与 Git 差异无缝接力完成（未经用户在 `prompt` 明确附带 `CODEX_ALLOW_EXTRA_CREDITS` 绝不静默消耗额外 Credits 或重置券）；同时 `strict` 先审后做门禁自动免除 `codex_run(review_only=true)` 防死锁。
+  - **单边 0% 硬归零 + 另一边软缓冲**：绝不向 0% 一侧派单，自动进入有余量一侧的**应急省流模式**（`[AGY_EMERGENCY_RATIONING]` 拦截 `run_workflow` 批量扇出，并将执行子代理强制压至 `flash_lite` 最低成本档位）。
+  - **双端均 0% 硬归零**：进入 `paused` 并以 `[DUAL_QUOTA_EXHAUSTED]` 熔断防空转刷错，同时向用户展示最快窗口重置倒计时、CC Switch 切换备用账号与额外 Credits 授权三项选择。
 
 ### 模型档位对齐、高缓存复用与量化最强思考
 
 - **AGY 对称执行档位与高缓存保活**（默认，可通过本机策略自定义）：`simple`/只读 `research` → `flash_lite`，`standard`（执行默认兜底）→ `flash`，`complex` → `pro`，`expert` → `inherit`。在 `auto`/`agy` 模式下，`PreToolUse` Hook 通过官方 `overwrite` 自动把未指定模型（或普通子任务误传 `inherit`）的 `invoke_subagent` 路由到低成本档位，防止误烧高配主模型；同模块内通过 `send_message` 长期复用同一低成本子代理以维持高缓存命中率。还可通过 `scripts/Mode.ps1 agy-models --standard ... --complex ... --expert ...` 在本机外部策略登记各档对应的 AGY 主对话模型名称（公开仓库默认为 `null`，不硬编码个人模型 ID）。
-- **量化策略研究最强思考与独立模型池硬停**：可在本地策略中通过 `scripts/Mode.ps1 quant-thinking --model PRIMARY --general DEEP --backups BACKUP1,BACKUP2` 配置主思考模型与按优先级排列的备用思考链（不写入公开仓库代码）；并通过 `scripts/Mode.ps1 pool --name POOL --match KEYWORD --weekly-protect 90 --5h-protect 88` 为单独计额的顶级模型池配置独立 7 天 90% 硬停（剩余 10% 不可再用）与 5 小时保护线。一旦主思考模型所在池触及硬停线，`codex_quota` 与钩子会自动告警并按备用顺序切换至第一个可用备用模型。
+- **量化策略研究最强思考与独立模型池硬停（含最后 6 小时自动解锁）**：可在本地策略中通过 `scripts/Mode.ps1 quant-thinking --model PRIMARY --general DEEP --backups BACKUP1,BACKUP2` 配置主思考模型与按优先级排列的备用思考链（不写入公开仓库代码）；并通过 `scripts/Mode.ps1 pool --name POOL --match KEYWORD --bucket-5h 3p-5h --bucket-7d 3p-weekly --weekly-protect 90 --unlock-hours 6 --5h-protect 88` 为单独计额的第三方/顶级模型池绑定官方额度桶、7 天 90% 线性硬停（平时留 10% 缓冲，距该池周重置 $\le 6\text{h}$ 自动解锁至 100%）与 5 小时保护线。一旦主思考模型所在池触及硬停线，`codex_quota` 与钩子会自动告警并按备用顺序切换至第一个可用备用模型。
 
 ### AGY 黄金混血审核与智能防死循环门禁
 
-- **先审后做门禁（`agy_guard.review_gate`）**：支持全局或按项目配置 `off` / `advisory`（默认）/ `strict`。在 `strict` 模式下，AGY 执行写文件或启动非只读执行子代理前，`PreToolUse` 会核查当前项目最近 `review_valid_hours`（默认 12 小时）内是否存在已通过的 Codex 独立审核回执（`plan_review.status=approved`）；缺失时返回 `[AGY_REVIEW_REQUIRED]`，只读 `read_file` 与 `research` 子代理不受阻。
+- **先审后做门禁（`agy_guard.review_gate`）**：支持全局或按项目配置 `off` / `advisory`（默认）/ `strict`。在 `strict` 模式下，AGY 执行写文件或启动非只读执行子代理前，`PreToolUse` 会核查当前项目最近 `review_valid_hours`（默认 12 小时）内是否存在已通过的 Codex 独立审核回执（`plan_review.status=approved`）；缺失时返回 `[AGY_REVIEW_REQUIRED]`（若此时 Codex 已 100% 耗尽则自动免除死锁，改提示用 AGY 只读 `research` 子代理核查），只读 `read_file` 与 `research` 子代理始终不受阻。
 - **智能防死循环（`PostToolUse` + `PreToolUse`）**：区分“正常多点排错”与“同错死循环”——不同文件或不同错误连续失败时允许代理自主修复；仅当**同一规范化错误连续重复 3 次**（`max_same_error_failures=3`）或**连续 8 次工具全失败且中间零成功进展**（`max_consecutive_failures=8`）才触发 `[AGY_LOOP_GUARD]` 熔断。任何成功执行或新用户输入自动清零；捕获 429/配额错仅触发 AGY 15 分钟冷却交由 Codex 兜底，不计实现失败。
 
 ### 常用控制命令（免重启）
@@ -316,14 +322,13 @@ pwsh -NoProfile -File scripts/Mode.ps1 status --refresh
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode auto
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode agy --project 'C:/work/my-project'
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode codex --project 'C:/work/my-project'
-pwsh -NoProfile -File scripts/Mode.ps1 codex-pacing --days 5 --target 100
+pwsh -NoProfile -File scripts/Mode.ps1 codex-pacing --days 5 --target 100 --ahead-max 3 --high-max 2 --protect-max 1
 pwsh -NoProfile -File scripts/Mode.ps1 quant-thinking --model 'YOUR_PRIMARY_TOP_MODEL' --general 'YOUR_DEEP_MODEL' --backups 'BACKUP_A,BACKUP_B'
 pwsh -NoProfile -File scripts/Mode.ps1 agy-models --standard 'YOUR_FAST_EXEC_MODEL' --complex 'YOUR_COMPLEX_MODEL' --expert 'YOUR_PRIMARY_TOP_MODEL'
-pwsh -NoProfile -File scripts/Mode.ps1 pool --name 'top-pool' --match 'family-prefix' --weekly-protect 90 --5h-caution 75 --5h-protect 88
-pwsh -NoProfile -File scripts/Mode.ps1 pool --name 'top-pool' --weekly-used 90 --5h-used 40
-pwsh -NoProfile -File scripts/Mode.ps1 agy-hint --level low
-pwsh -NoProfile -File scripts/Mode.ps1 agy-quota --weekly-used 35 --weekly-reset '2026-11-28T15:14:55Z' --5h-used 40 --5h-reset '2026-11-25T13:00:00Z'
-pwsh -NoProfile -File scripts/Mode.ps1 agy-budget --target 90 --weekly-protect 90 --tokens-5h 8000000 --tokens-7d 80000000
+pwsh -NoProfile -File scripts/Mode.ps1 pool --name 'top-pool' --match 'family-prefix' --bucket-5h '3p-5h' --bucket-7d '3p-weekly' --weekly-protect 90 --unlock-hours 6 --5h-caution 75 --5h-protect 88
+pwsh -NoProfile -File scripts/Mode.ps1 agy-hint --level normal
+pwsh -NoProfile -File scripts/Mode.ps1 agy-quota --weekly-used 35 --weekly-reset '2026-11-28T15:14:55Z' --5h-used 40 --5h-reset '2026-11-25T23:00:00Z'
+pwsh -NoProfile -File scripts/Mode.ps1 agy-budget --target 90 --weekly-protect 90 --unlock-hours 6 --tokens-5h 8000000 --tokens-7d 80000000
 pwsh -NoProfile -File scripts/Mode.ps1 agy-review-gate --level strict --project 'C:/work/my-project'
 pwsh -NoProfile -File scripts/Mode.ps1 reset-agy-guard
 pwsh -NoProfile -File scripts/Mode.ps1 cooldown --engine agy --minutes 60 --reason '5h quota low'
