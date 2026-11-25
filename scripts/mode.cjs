@@ -31,8 +31,9 @@ function usage() {
     '  codex-pacing [--days N] [--target PCT] [--policy POLICY_JSON]',
     '  agy-review-gate --level off|advisory|strict [--project ABS_PATH] [--valid-hours N] [--max-same N] [--max-total N]',
     '  reset-agy-guard [--conversation UUID] [--policy POLICY_JSON]',
-    '  quant-thinking (--model NAME | --clear) [--config MCP_JSON] [--policy POLICY_JSON]',
+    '  quant-thinking [--model NAME] [--general NAME] [--backups A,B] [--clear] [--config MCP_JSON] [--policy POLICY_JSON]',
     '  agy-models [--standard NAME] [--complex NAME] [--expert NAME] [--clear] [--policy POLICY_JSON]',
+    '  pool --name POOL [--match TEXT] [--weekly-protect PCT] [--5h-caution PCT] [--5h-protect PCT] [--weekly-used PCT] [--weekly-reset ISO] [--5h-used PCT] [--5h-reset ISO] [--clear-snapshot] [--remove]',
     '  tier [--simple MODEL] [--standard MODEL] [--complex MODEL] [--expert MODEL] [--enforce-low-cost true|false]',
     '  cooldown --engine codex|agy --minutes N [--reason TEXT]',
     '  clear-cooldown --engine codex|agy'
@@ -43,7 +44,7 @@ function parseArgs(argv) {
   const command = argv[0] && !argv[0].startsWith('--') ? argv[0] : 'status';
   const rest = argv[0] && !argv[0].startsWith('--') ? argv.slice(1) : argv;
   const opts = { command };
-  const flags = new Set(['--refresh', '--clear', '--help', '-h']);
+  const flags = new Set(['--refresh', '--clear', '--clear-snapshot', '--remove', '--help', '-h']);
   for (let i = 0; i < rest.length; i++) {
     const token = rest[i];
     if (flags.has(token)) { opts[token.replace(/^-+/, '')] = true; continue; }
@@ -270,10 +271,67 @@ async function run(argv) {
   }
 
   if (opts.command === 'quant-thinking') {
-    if (!opts.clear && !opts.model) throw new Error('Specify --model NAME or --clear');
-    current.thinking_models = { ...(current.thinking_models || {}), quant: opts.clear ? null : String(opts.model).trim() };
+    if (!opts.clear && !opts.model && opts.general === undefined && opts.backups === undefined) {
+      throw new Error('Specify --model NAME, --general NAME, --backups A,B, or --clear');
+    }
+    const next = { ...(current.thinking_models || { general: null, quant: null, backups: [] }) };
+    if (opts.clear) {
+      next.quant = null;
+      next.general = null;
+      next.backups = [];
+    } else {
+      if (opts.model !== undefined) next.quant = String(opts.model).trim() || null;
+      if (opts.general !== undefined) next.general = String(opts.general).trim() || null;
+      if (opts.backups !== undefined) {
+        next.backups = String(opts.backups).split(',').map(s => s.trim()).filter(Boolean);
+      }
+    }
+    current.thinking_models = next;
     const saved = saveRoutingPolicy(policyFile, current);
     return JSON.stringify({ state: 'updated', policy_path: saved.path, thinking_models: saved.thinking_models }, null, 2);
+  }
+
+  if (opts.command === 'pool') {
+    const name = String(opts.name || '').trim().toLowerCase();
+    if (!name) throw new Error('--name is required');
+    current.agy_model_pools = { ...(current.agy_model_pools || {}) };
+    if (opts.remove) {
+      delete current.agy_model_pools[name];
+      const saved = saveRoutingPolicy(policyFile, current);
+      return JSON.stringify({ state: 'updated', policy_path: saved.path, removed: name, agy_model_pools: saved.agy_model_pools }, null, 2);
+    }
+    const prev = current.agy_model_pools[name] || { match: name, weekly_protect_used_percent: 90, window_5h_caution_percent: 75, window_5h_protect_percent: 88, manual_snapshot: null, cooldown: null };
+    const next = { ...prev };
+    if (opts.match !== undefined) next.match = String(opts.match).trim().toLowerCase() || name;
+    const parseRange = (k, min, max) => {
+      const n = Number(opts[k]);
+      if (!Number.isFinite(n) || n < min || n > max) throw new Error(`--${k} must be in ${min}..${max}`);
+      return n;
+    };
+    if (opts['weekly-protect'] !== undefined) next.weekly_protect_used_percent = parseRange('weekly-protect', 50, 100);
+    if (opts['5h-caution'] !== undefined) next.window_5h_caution_percent = parseRange('5h-caution', 30, 99);
+    if (opts['5h-protect'] !== undefined) next.window_5h_protect_percent = parseRange('5h-protect', 40, 100);
+    if (opts['clear-snapshot']) {
+      next.manual_snapshot = null;
+    } else if (opts['weekly-used'] !== undefined || opts['5h-used'] !== undefined || opts['weekly-reset'] !== undefined || opts['5h-reset'] !== undefined) {
+      const snap = next.manual_snapshot || {};
+      const parseIso = k => {
+        if (opts[k] === undefined) return undefined;
+        const ms = Date.parse(opts[k]);
+        if (!Number.isFinite(ms)) throw new Error(`--${k} must be a valid ISO timestamp`);
+        return new Date(ms).toISOString();
+      };
+      next.manual_snapshot = {
+        recorded_at: new Date().toISOString(),
+        weekly_used_percent: opts['weekly-used'] !== undefined ? parseRange('weekly-used', 0, 100) : (snap.weekly_used_percent ?? null),
+        weekly_resets_at: parseIso('weekly-reset') ?? snap.weekly_resets_at ?? null,
+        five_hour_used_percent: opts['5h-used'] !== undefined ? parseRange('5h-used', 0, 100) : (snap.five_hour_used_percent ?? null),
+        five_hour_resets_at: parseIso('5h-reset') ?? snap.five_hour_resets_at ?? null
+      };
+    }
+    current.agy_model_pools[name] = next;
+    const saved = saveRoutingPolicy(policyFile, current);
+    return JSON.stringify({ state: 'updated', policy_path: saved.path, pool: saved.agy_model_pools[name] }, null, 2);
   }
 
   if (opts.command === 'agy-models') {

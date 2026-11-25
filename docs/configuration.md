@@ -302,7 +302,7 @@ Antigravity 切换回读：两个 MCP 入口均引用当前 main 所在的同一
 ### 模型档位对齐、高缓存复用与量化最强思考
 
 - **AGY 对称执行档位与高缓存保活**（默认，可通过本机策略自定义）：`simple`/只读 `research` → `flash_lite`，`standard`（执行默认兜底）→ `flash`，`complex` → `pro`，`expert` → `inherit`。在 `auto`/`agy` 模式下，`PreToolUse` Hook 通过官方 `overwrite` 自动把未指定模型（或普通子任务误传 `inherit`）的 `invoke_subagent` 路由到低成本档位，防止误烧高配主模型；同模块内通过 `send_message` 长期复用同一低成本子代理以维持高缓存命中率。还可通过 `scripts/Mode.ps1 agy-models --standard ... --complex ... --expert ...` 在本机外部策略登记各档对应的 AGY 主对话模型名称（公开仓库默认为 `null`，不硬编码个人模型 ID）。
-- **量化策略研究最强思考**：可在本地策略中通过 `scripts/Mode.ps1 quant-thinking --model MODEL_NAME` 配置本机量化最强思考模型（不写入公开仓库代码）。在 `review_category=quant` 项目中，`SessionStart`/`PreInvocation` 钩子会核对主会话模型并在不匹配时提示切换；同时量化策略思考类子任务显式保留 `inherit`/`pro` 不降级，日常清洗/检索/测试仍下沉低成本执行。
+- **量化策略研究最强思考与独立模型池硬停**：可在本地策略中通过 `scripts/Mode.ps1 quant-thinking --model PRIMARY --general DEEP --backups BACKUP1,BACKUP2` 配置主思考模型与按优先级排列的备用思考链（不写入公开仓库代码）；并通过 `scripts/Mode.ps1 pool --name POOL --match KEYWORD --weekly-protect 90 --5h-protect 88` 为单独计额的顶级模型池配置独立 7 天 90% 硬停（剩余 10% 不可再用）与 5 小时保护线。一旦主思考模型所在池触及硬停线，`codex_quota` 与钩子会自动告警并按备用顺序切换至第一个可用备用模型。
 
 ### AGY 黄金混血审核与智能防死循环门禁
 
@@ -317,11 +317,13 @@ pwsh -NoProfile -File scripts/Mode.ps1 set --mode auto
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode agy --project 'C:/work/my-project'
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode codex --project 'C:/work/my-project'
 pwsh -NoProfile -File scripts/Mode.ps1 codex-pacing --days 5 --target 100
-pwsh -NoProfile -File scripts/Mode.ps1 quant-thinking --model 'YOUR_STRONGEST_THINKING_MODEL'
-pwsh -NoProfile -File scripts/Mode.ps1 agy-models --standard 'YOUR_FAST_EXEC_MODEL' --complex 'YOUR_COMPLEX_MODEL' --expert 'YOUR_EXPERT_MODEL'
+pwsh -NoProfile -File scripts/Mode.ps1 quant-thinking --model 'YOUR_PRIMARY_TOP_MODEL' --general 'YOUR_DEEP_MODEL' --backups 'BACKUP_A,BACKUP_B'
+pwsh -NoProfile -File scripts/Mode.ps1 agy-models --standard 'YOUR_FAST_EXEC_MODEL' --complex 'YOUR_COMPLEX_MODEL' --expert 'YOUR_PRIMARY_TOP_MODEL'
+pwsh -NoProfile -File scripts/Mode.ps1 pool --name 'top-pool' --match 'family-prefix' --weekly-protect 90 --5h-caution 75 --5h-protect 88
+pwsh -NoProfile -File scripts/Mode.ps1 pool --name 'top-pool' --weekly-used 90 --5h-used 40
 pwsh -NoProfile -File scripts/Mode.ps1 agy-hint --level low
 pwsh -NoProfile -File scripts/Mode.ps1 agy-quota --weekly-used 35 --weekly-reset '2026-11-28T15:14:55Z' --5h-used 40 --5h-reset '2026-11-25T13:00:00Z'
-pwsh -NoProfile -File scripts/Mode.ps1 agy-budget --tokens-5h 8000000 --tokens-7d 80000000
+pwsh -NoProfile -File scripts/Mode.ps1 agy-budget --target 90 --weekly-protect 90 --tokens-5h 8000000 --tokens-7d 80000000
 pwsh -NoProfile -File scripts/Mode.ps1 agy-review-gate --level strict --project 'C:/work/my-project'
 pwsh -NoProfile -File scripts/Mode.ps1 reset-agy-guard
 pwsh -NoProfile -File scripts/Mode.ps1 cooldown --engine agy --minutes 60 --reason '5h quota low'

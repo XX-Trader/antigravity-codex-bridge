@@ -122,10 +122,11 @@ function defaultPolicy() {
     agy_guard: { ...DEFAULT_AGY_GUARD },
     agy_tiers: { ...DEFAULT_AGY_TIERS },
     agy_host_models: { standard: null, complex: null, expert: null },
+    agy_model_pools: {},
     subagent_default_model: 'flash',
     subagent_research_model: 'flash_lite',
     enforce_subagent_low_cost: true,
-    thinking_models: { general: null, quant: null },
+    thinking_models: { general: null, quant: null, backups: [] },
     agy_quota_hint: 'normal',
     agy_manual_snapshot: null,
     agy_quota_command: null,
@@ -255,13 +256,41 @@ function parsePolicy(raw) {
     }
     policy.agy_host_models = hostModels;
   }
+  if (raw.agy_model_pools && typeof raw.agy_model_pools === 'object' && !Array.isArray(raw.agy_model_pools)) {
+    const pools = {};
+    for (const [rawName, cfg] of Object.entries(raw.agy_model_pools)) {
+      const name = String(rawName || '').trim().toLowerCase().slice(0, 40);
+      if (!name || !cfg || typeof cfg !== 'object' || Array.isArray(cfg)) continue;
+      const match = typeof cfg.match === 'string' && cfg.match.trim() ? cfg.match.trim().toLowerCase().slice(0, 80) : name;
+      const weeklyProtect = typeof cfg.weekly_protect_used_percent === 'number' && Number.isFinite(cfg.weekly_protect_used_percent) && cfg.weekly_protect_used_percent >= 50 && cfg.weekly_protect_used_percent <= 100
+        ? cfg.weekly_protect_used_percent : DEFAULT_AGY_PACING.weekly_protect_used_percent;
+      const caution5h = typeof cfg.window_5h_caution_percent === 'number' && Number.isFinite(cfg.window_5h_caution_percent) && cfg.window_5h_caution_percent >= 30 && cfg.window_5h_caution_percent <= 99
+        ? cfg.window_5h_caution_percent : DEFAULT_AGY_PACING.window_5h_caution_percent;
+      const protect5hRaw = typeof cfg.window_5h_protect_percent === 'number' && Number.isFinite(cfg.window_5h_protect_percent) && cfg.window_5h_protect_percent >= 40 && cfg.window_5h_protect_percent <= 100
+        ? cfg.window_5h_protect_percent : DEFAULT_AGY_PACING.window_5h_protect_percent;
+      pools[name] = {
+        match,
+        weekly_protect_used_percent: weeklyProtect,
+        window_5h_caution_percent: caution5h,
+        window_5h_protect_percent: Math.max(caution5h, protect5hRaw),
+        window_5h_tokens: typeof cfg.window_5h_tokens === 'number' && Number.isFinite(cfg.window_5h_tokens) && cfg.window_5h_tokens > 0 ? Math.floor(cfg.window_5h_tokens) : null,
+        window_7d_tokens: typeof cfg.window_7d_tokens === 'number' && Number.isFinite(cfg.window_7d_tokens) && cfg.window_7d_tokens > 0 ? Math.floor(cfg.window_7d_tokens) : null,
+        manual_snapshot: parseManualAgySnapshot(cfg.manual_snapshot),
+        cooldown: parseCooldown(cfg.cooldown)
+      };
+    }
+    policy.agy_model_pools = pools;
+  }
   if (raw.subagent_default_model !== undefined) policy.subagent_default_model = normalizeSubagentModel(raw.subagent_default_model, base.subagent_default_model);
   if (raw.subagent_research_model !== undefined) policy.subagent_research_model = normalizeSubagentModel(raw.subagent_research_model, base.subagent_research_model);
   if (raw.enforce_subagent_low_cost !== undefined) policy.enforce_subagent_low_cost = Boolean(raw.enforce_subagent_low_cost);
   if (raw.thinking_models && typeof raw.thinking_models === 'object' && !Array.isArray(raw.thinking_models)) {
+    const rawBackups = Array.isArray(raw.thinking_models.backups) ? raw.thinking_models.backups : [];
+    const backups = [...new Set(rawBackups.filter(v => typeof v === 'string' && v.trim()).map(v => v.trim().slice(0, 120)))].slice(0, 8);
     policy.thinking_models = {
       general: typeof raw.thinking_models.general === 'string' && raw.thinking_models.general.trim() ? raw.thinking_models.general.trim().slice(0, 120) : null,
-      quant: typeof raw.thinking_models.quant === 'string' && raw.thinking_models.quant.trim() ? raw.thinking_models.quant.trim().slice(0, 120) : null
+      quant: typeof raw.thinking_models.quant === 'string' && raw.thinking_models.quant.trim() ? raw.thinking_models.quant.trim().slice(0, 120) : null,
+      backups
     };
   }
   if (typeof raw.agy_quota_hint === 'string' && AGY_HINTS.has(raw.agy_quota_hint.trim().toLowerCase())) {
@@ -356,8 +385,10 @@ function resolveProjectPolicy(policy, projectScope) {
     mode_source: override?.mode ? 'project_override' : 'default_mode',
     review_category: reviewCategory,
     thinking_model: thinkingModel,
+    thinking_backups: [...(base.thinking_models.backups || [])],
     agy_tiers: { ...base.agy_tiers },
     agy_host_models: { ...base.agy_host_models },
+    agy_model_pools: Object.fromEntries(Object.entries(base.agy_model_pools || {}).map(([k, v]) => [k, { ...v }])),
     subagent_default_model: override?.subagent_default_model || base.subagent_default_model,
     subagent_research_model: base.subagent_research_model,
     enforce_subagent_low_cost: override?.enforce_subagent_low_cost ?? base.enforce_subagent_low_cost,
@@ -593,6 +624,60 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
     limited: window5h.status === 'limited' || window7d.band === 'agy_protected',
     caution: window5h.status === 'caution'
   };
+}
+
+function evaluateAgyModelPools({ agyUsage, projectPolicy, nowMs = Date.now() }) {
+  const poolsCfg = projectPolicy?.agy_model_pools || {};
+  const result = {};
+  for (const [name, cfg] of Object.entries(poolsCfg)) {
+    const token = String(cfg.match || name).toLowerCase();
+    const sumMatching = byModel => Object.entries(byModel || {})
+      .filter(([m]) => String(m).toLowerCase().includes(token))
+      .reduce((acc, [, v]) => acc + (v?.total_tokens || 0), 0);
+    const tokens5h = agyUsage?.available ? sumMatching(agyUsage.window_5h?.by_model) : null;
+    const tokens7d = agyUsage?.available ? sumMatching(agyUsage.window_7d?.by_model) : null;
+
+    const snap = cfg.manual_snapshot || null;
+    const snapAgeMs = snap ? nowMs - Date.parse(snap.recorded_at) : Infinity;
+    const valid5h = snap && snap.five_hour_used_percent !== null && (
+      snap.five_hour_resets_at ? Date.parse(snap.five_hour_resets_at) > nowMs : snapAgeMs <= 5 * 3600000
+    );
+    const valid7d = snap && snap.weekly_used_percent !== null && (
+      snap.weekly_resets_at ? Date.parse(snap.weekly_resets_at) > nowMs : snapAgeMs <= 24 * 3600000
+    );
+
+    const used5h = valid5h ? round2(clamp(snap.five_hour_used_percent, 0, 100))
+      : (cfg.window_5h_tokens && typeof tokens5h === 'number' ? round2(clamp((tokens5h / cfg.window_5h_tokens) * 100, 0, 100)) : null);
+    const used7d = valid7d ? round2(clamp(snap.weekly_used_percent, 0, 100))
+      : (cfg.window_7d_tokens && typeof tokens7d === 'number' ? round2(clamp((tokens7d / cfg.window_7d_tokens) * 100, 0, 100)) : null);
+
+    const cooling = cooldownActive(cfg.cooldown, nowMs);
+    const weeklyStopped = used7d !== null && used7d >= cfg.weekly_protect_used_percent;
+    const fiveHourLimited = cooling || (used5h !== null && used5h >= cfg.window_5h_protect_percent);
+    const fiveHourCaution = !fiveHourLimited && used5h !== null && used5h >= cfg.window_5h_caution_percent;
+    const stopped = weeklyStopped || fiveHourLimited;
+    const reason = weeklyStopped ? 'pool_weekly_buffer_hard_stop'
+      : cooling ? 'pool_cooldown'
+        : fiveHourLimited ? 'pool_5h_protected'
+          : fiveHourCaution ? 'pool_5h_caution'
+            : null;
+    result[name] = {
+      match: token,
+      weekly_protect_used_percent: cfg.weekly_protect_used_percent,
+      buffer_percent: round2(Math.max(0, 100 - cfg.weekly_protect_used_percent)),
+      weekly_used_percent: used7d,
+      weekly_remaining_percent: used7d !== null ? round2(Math.max(0, 100 - used7d)) : null,
+      five_hour_used_percent: used5h,
+      five_hour_caution_percent: cfg.window_5h_caution_percent,
+      five_hour_protect_percent: cfg.window_5h_protect_percent,
+      tokens_5h: tokens5h,
+      tokens_7d: tokens7d,
+      stopped,
+      caution: fiveHourCaution,
+      reason
+    };
+  }
+  return result;
 }
 
 function inferBrainDir(transcriptPath) {
@@ -893,11 +978,32 @@ function decideRoute(input = {}) {
     }
   }
 
-  const quantThinking = policy.review_category === 'quant' && policy.thinking_model ? policy.thinking_model : null;
+  const agyPools = evaluateAgyModelPools({ agyUsage, projectPolicy: policy, nowMs });
+  const poolForModel = modelStr => {
+    if (!modelStr || typeof modelStr !== 'string') return null;
+    const lower = modelStr.toLowerCase();
+    for (const [name, st] of Object.entries(agyPools)) {
+      if (lower.includes(st.match)) return { name, ...st };
+    }
+    return null;
+  };
+  const thinkingBackups = Array.isArray(policy.thinking_backups) ? policy.thinking_backups : [];
+  const primaryThinking = policy.thinking_model || null;
+  const primaryPool = poolForModel(primaryThinking);
+  const currentHostPool = poolForModel(currentModelName);
+  let effectiveThinking = primaryThinking;
+  let thinkingFailoverReason = null;
+  if (primaryThinking && primaryPool?.stopped) {
+    const availableBackup = thinkingBackups.find(m => !poolForModel(m)?.stopped) || null;
+    effectiveThinking = availableBackup || primaryThinking;
+    thinkingFailoverReason = `${primaryPool.name} 池已触及 ${primaryPool.weekly_protect_used_percent}% 硬停线（剩余≤${primaryPool.buffer_percent}%缓冲）或 5h 保护线`;
+  }
+  const quantThinking = policy.review_category === 'quant' && effectiveThinking ? effectiveThinking : null;
   const knownHostModel = currentModelName && currentModelName.toLowerCase() !== 'auto';
   const quantModelMatched = quantThinking && knownHostModel
     ? currentModelName.toLowerCase().includes(quantThinking.toLowerCase())
     : null;
+  const currentModelBlockedByPool = Boolean(knownHostModel && currentHostPool?.stopped);
 
   const effectivePlanDays = codexPacing.plan_days ?? policy.pacing?.plan_days ?? null;
   const codexPlanLabel = effectivePlanDays ? `${effectivePlanDays}天` : '7天';
@@ -941,6 +1047,7 @@ function decideRoute(input = {}) {
     active_codex_tasks: activeTasks,
     agy_tiers: policy.agy_tiers,
     agy_host_models: policy.agy_host_models,
+    agy_model_pools: agyPools,
     subagent_defaults: {
       default_model: policy.subagent_default_model,
       research_model: policy.subagent_research_model,
@@ -948,14 +1055,22 @@ function decideRoute(input = {}) {
     },
     thinking_guidance: {
       review_category: policy.review_category,
-      required_thinking_model: quantThinking || policy.thinking_model || null,
+      required_thinking_model: quantThinking || effectiveThinking || null,
+      primary_thinking_model: primaryThinking,
+      backups: thinkingBackups,
+      failover_reason: thinkingFailoverReason,
       current_model_name: currentModelName || null,
+      current_model_pool_stopped: currentModelBlockedByPool,
       matches_required: quantModelMatched,
-      reminder: quantThinking && quantModelMatched === false
-        ? `当前为量化研究项目，建议将主会话模型切换为本机配置的 ${quantThinking} 最强思考模式；日常检索、改脚本与跑测试下沉给低成本子代理或 Codex。`
-        : quantThinking
-          ? `量化策略研究默认使用本机配置的 ${quantThinking} 最强模式思考，核心思考子任务保留 inherit 不降级；执行与检索下沉低成本档位。`
-          : null
+      reminder: currentModelBlockedByPool
+        ? `当前主会话模型所属 ${currentHostPool.name} 池已触及硬停保护（7天≥${currentHostPool.weekly_protect_used_percent}% 留${currentHostPool.buffer_percent}%缓冲，或 5h 受限），不可继续使用；请立即切换至备用模型${effectiveThinking && !poolForModel(effectiveThinking)?.stopped ? ` ${effectiveThinking}` : ''}${thinkingBackups.length ? `（备用顺序：${thinkingBackups.join(' → ')}）` : ''}。`
+        : thinkingFailoverReason && effectiveThinking
+          ? `${thinkingFailoverReason}，顶配思考自动切至备用模型 ${effectiveThinking}${thinkingBackups.length > 1 ? `（顺序：${thinkingBackups.join(' → ')}）` : ''}。`
+          : quantThinking && quantModelMatched === false
+            ? `当前为量化研究项目，建议将主会话模型切换为本机配置的 ${quantThinking} 最强思考模式${thinkingBackups.length ? `（备用顺序：${thinkingBackups.join(' → ')}）` : ''}；日常检索、改脚本与跑测试下沉给低成本子代理或 Codex。`
+            : quantThinking
+              ? `量化策略研究默认使用本机配置的 ${quantThinking} 最强模式思考${thinkingBackups.length ? `（备用：${thinkingBackups.join(' → ')}）` : ''}，核心思考子任务保留 inherit 不降级；执行与检索下沉低成本档位。`
+              : null
     },
     task_allocation: {
       quant_strategy_thinking: quantThinking ? `主会话 ${quantThinking} 最强思考 + Codex quant 独立只读审核` : '主会话最强思考 + Codex quant 独立只读审核',
@@ -1000,8 +1115,10 @@ function evaluateSubagentCall(args = {}, projectPolicy) {
     return { overwrite: null, note: null };
   }
 
+  const backupMatched = Array.isArray(projectPolicy.thinking_backups)
+    && projectPolicy.thinking_backups.some(m => matchesConfiguredThinkingModel(roleAndPrompt, m));
   const isQuantThinking = projectPolicy.review_category === 'quant'
-    && (QUANT_THINKING_RE.test(roleAndPrompt) || matchesConfiguredThinkingModel(roleAndPrompt, projectPolicy.thinking_model))
+    && (QUANT_THINKING_RE.test(roleAndPrompt) || matchesConfiguredThinkingModel(roleAndPrompt, projectPolicy.thinking_model) || backupMatched)
     && !MECHANICAL_SUBTASK_RE.test(args.Role || args.role || '');
 
   if (isQuantThinking && (currentModel === 'inherit' || currentModel === 'pro')) {
@@ -1058,6 +1175,7 @@ module.exports = {
   resolveProjectPolicy,
   evaluateCodexPacing,
   evaluateAgyPacing,
+  evaluateAgyModelPools,
   scanAgyTranscriptUsage,
   runExternalAgyProbe,
   activeCodexTasks,

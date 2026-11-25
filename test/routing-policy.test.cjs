@@ -339,6 +339,23 @@ test('Mode CLI switches global/project modes with AGY aliases, quant thinking mo
   assert.match(msg, /standard\(常规\)→fast-exec-model/);
   const out12 = JSON.parse(await runModeCli(['agy-models', '--clear', '--policy', f.policyPath]));
   assert.deepEqual(out12.agy_host_models, { standard: null, complex: null, expert: null });
+
+  // Independent model pool 90% weekly hard stop (reserve 10%) + failover to backup thinking chain
+  const outPool = JSON.parse(await runModeCli(['pool', '--name', 'family-x', '--match', 'famx', '--weekly-protect', '90', '--5h-protect', '88', '--weekly-used', '90', '--policy', f.policyPath]));
+  assert.equal(outPool.pool.weekly_protect_used_percent, 90);
+  assert.equal(outPool.pool.manual_snapshot.weekly_used_percent, 90);
+  await runModeCli(['quant-thinking', '--model', 'famx-top', '--general', 'famx-mid', '--backups', 'backup-1,backup-last', '--policy', f.policyPath]);
+  const ctxPool = contextHook(
+    { hookEventName: 'SessionStart', conversationId: 'conv-pool-stop', modelName: 'famx-top-high', workspacePaths: [f.quantProject] },
+    [{ project: f.quantProject, data: f.quantData, review_category: 'quant' }],
+    { policyPath: f.policyPath, markerFile: path.join(f.root, 'm3.json') }
+  );
+  const poolMsg = ctxPool.injectSteps[0].systemMessage.systemMessage;
+  assert.match(poolMsg, /\[模型池硬停告警\]/);
+  assert.match(poolMsg, /backup-1/);
+  assert.match(poolMsg, /backup-1 → backup-last/);
+  const outPoolCleared = JSON.parse(await runModeCli(['pool', '--name', 'family-x', '--remove', '--policy', f.policyPath]));
+  assert.equal(outPoolCleared.removed, 'family-x');
 });
 
 test('dual 7-day 100% proportional pacing + AGY 5-hour limit guard + Codex fallback', () => {
