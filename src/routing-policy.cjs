@@ -890,7 +890,8 @@ function decideRoute(input = {}) {
     ? currentModelName.toLowerCase().includes(quantThinking.toLowerCase())
     : null;
 
-  const codexPlanLabel = codexPacing.plan_days ? `${codexPacing.plan_days}天` : '7天';
+  const effectivePlanDays = codexPacing.plan_days ?? policy.pacing?.plan_days ?? null;
+  const codexPlanLabel = effectivePlanDays ? `${effectivePlanDays}天` : '7天';
   const codexText = codexPacing.available
     ? `Codex ${codexPlanLabel}进度 ${codexPacing.elapsed_percent}% / 已用 ${codexPacing.used_percent}%（偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%，距重置 ${codexPacing.hours_until_reset}h）`
     : 'Codex 实时配额暂未读取（默认优先 Codex）';
