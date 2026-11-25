@@ -652,3 +652,212 @@ test('Hybrid review-before-AGY gate blocks writes in strict mode until Codex rev
   const resetOut = JSON.parse(await runModeCli(['reset-agy-guard', '--policy', f.policyPath]));
   assert.equal(resetOut.state, 'reset');
 });
+
+test('official agy /usage 5-bucket JSON parser, incremental transcript index, cross-window shared cache reuse, and Sidecar background sync', async t => {
+  const f = fixture(t);
+  const {
+    parseAgyProbePayload,
+    defaultQuotaCachePath,
+    defaultTranscriptIndexPath,
+    takeQuotaRefreshClaim
+  } = require('../src/routing-policy.cjs');
+  const { startQuotaSyncLoop } = require('../src/notifier.cjs');
+
+  const now = Date.parse('2026-11-25T16:00:00Z');
+  const reset5h = new Date(now + 3 * 3600000).toISOString();
+  const reset7d = new Date(now + 84 * 3600000).toISOString(); // 50% of 7d elapsed
+
+  // 1. Parse official `agy --print /usage --output-format json` 5-bucket structure (same schema as CC Switch subscription_agy.rs)
+  const agyCliSample = {
+    conversation_id: '',
+    status: 'SUCCESS',
+    usage: { input_tokens: 0, output_tokens: 0 },
+    command: {
+      name: 'usage',
+      data: {
+        groups: [
+          {
+            name: 'Gemini Models',
+            buckets: [
+              { id: 'gemini-weekly', window: 'weekly', remaining_fraction: 0.7, reset_time: reset7d },
+              { id: 'gemini-5h', window: '5h', remaining_fraction: 0.85, reset_time: reset5h },
+              { id: 'gemini-argon-wtu-weekly', window: 'weekly', remaining_fraction: 0.8, reset_time: reset7d }
+            ]
+          },
+          {
+            name: 'Claude and GPT models',
+            buckets: [
+              { id: '3p-weekly', window: 'weekly', remaining_fraction: 0.08, reset_time: reset7d },
+              { id: '3p-5h', window: '5h', remaining_fraction: 0.5, reset_time: reset5h }
+            ]
+          }
+        ]
+      }
+    }
+  };
+  const parsedProbe = parseAgyProbePayload(agyCliSample);
+  assert.equal(parsedProbe.available, true);
+  assert.equal(parsedProbe.source, 'agy_cli_usage');
+  assert.equal(parsedProbe.five_hour_used_percent, 15);
+  assert.equal(parsedProbe.weekly_used_percent, 30);
+  assert.equal(parsedProbe.buckets['3p-weekly'].used_percent, 92);
+  assert.equal(parsedProbe.buckets['3p-5h'].used_percent, 50);
+
+  // 3p-weekly = 92% >= 90% protect cap automatically trips independent 3p model pool hard stop and fails over to backup thinking model!
+  saveRoutingPolicy(f.policyPath, {
+    ...defaultPolicy(),
+    thinking_models: { general: null, quant: 'thirdparty-top', backups: ['backup-safe-model'] },
+    agy_model_pools: {
+      thirdparty: { match: 'thirdparty', weekly_protect_used_percent: 90, window_5h_caution_percent: 75, window_5h_protect_percent: 88, bucket_5h: '3p-5h', bucket_7d: '3p-weekly' }
+    }
+  });
+  const polLoaded = loadRoutingPolicy(f.policyPath);
+  const projPol = resolveProjectPolicy(polLoaded, { project: f.quantProject, review_category: 'quant' });
+  const routeFromBuckets = decideRoute({
+    policy: polLoaded,
+    projectPolicy: projPol,
+    projectScope: { project: f.quantProject, review_category: 'quant' },
+    codexPacing: { available: true, band: 'agy_priority', elapsed_percent: 50, used_percent: 85, pacing_delta: 35, resets_at: reset7d, hours_until_reset: 84 },
+    agyUsage: { available: true, window_5h: { total_tokens: 100 }, window_7d: { total_tokens: 100 }, quota_errors_5h: 0, auto_degraded: false },
+    agyExternal: parsedProbe,
+    modelName: 'thirdparty-top-high',
+    nowMs: now
+  });
+  assert.equal(routeFromBuckets.agy_pacing.window_7d.used_percent, 30);
+  assert.equal(routeFromBuckets.agy_pacing.window_7d.source, 'agy_cli_usage');
+  assert.equal(routeFromBuckets.agy_model_pools.thirdparty.weekly_used_percent, 92);
+  assert.equal(routeFromBuckets.agy_model_pools.thirdparty.source, 'agy_cli_usage');
+  assert.equal(routeFromBuckets.agy_model_pools.thirdparty.stopped, true);
+  assert.equal(routeFromBuckets.thinking_guidance.required_thinking_model, 'backup-safe-model');
+  assert.equal(routeFromBuckets.thinking_guidance.current_model_pool_stopped, true);
+
+  // 2. Incremental transcript index: 2nd scan reads 0 bytes (stat cache hit), append reads ONLY appended line bytes!
+  const brainDir = path.join(f.root, 'inc-brain');
+  const logDir1 = path.join(brainDir, 'c1', '.system_generated', 'logs');
+  const logDir2 = path.join(brainDir, 'c2', '.system_generated', 'logs');
+  fs.mkdirSync(logDir1, { recursive: true });
+  fs.mkdirSync(logDir2, { recursive: true });
+  const tFile1 = path.join(logDir1, 'transcript.jsonl');
+  const tFile2 = path.join(logDir2, 'transcript.jsonl');
+  fs.writeFileSync(tFile1, JSON.stringify({ created_at: new Date(now - 3600000).toISOString(), model: 'm-std', input_tokens: 2000, output_tokens: 500 }) + '\n', 'utf8');
+  fs.writeFileSync(tFile2, JSON.stringify({ created_at: new Date(now - 7200000).toISOString(), model: 'm-std', input_tokens: 3000, output_tokens: 1000 }) + '\n', 'utf8');
+  const indexPath = defaultTranscriptIndexPath(f.policyPath);
+
+  const s1 = scanAgyTranscriptUsage({ brainDir, indexPath, nowMs: now });
+  assert.equal(s1.window_5h.total_tokens, 6500);
+  assert.equal(s1.sync_stats.full_reads, 2);
+  assert.equal(s1.sync_stats.cache_hits, 0);
+
+  // Unchanged files => 0 bytes read from disk, 2 cache hits!
+  const s2 = scanAgyTranscriptUsage({ brainDir, indexPath, nowMs: now });
+  assert.equal(s2.window_5h.total_tokens, 6500);
+  assert.equal(s2.sync_stats.cache_hits, 2);
+  assert.equal(s2.sync_stats.bytes_read, 0);
+
+  // Append 1 new line to tFile1 => 1 cache hit (tFile2), 1 incremental read (tFile1) reading ONLY appended line!
+  const appendedLine = JSON.stringify({ created_at: new Date(now - 60000).toISOString(), model: 'm-std', input_tokens: 400, output_tokens: 100 }) + '\n';
+  fs.appendFileSync(tFile1, appendedLine, 'utf8');
+  const s3 = scanAgyTranscriptUsage({ brainDir, indexPath, nowMs: now });
+  assert.equal(s3.window_5h.total_tokens, 7000);
+  assert.equal(s3.sync_stats.cache_hits, 1);
+  assert.equal(s3.sync_stats.incremental_reads, 1);
+  assert.equal(s3.sync_stats.bytes_read, Buffer.byteLength(appendedLine, 'utf8'));
+
+  // Matches stateless full scan 100%
+  const sFull = scanAgyTranscriptUsage({ brainDir, nowMs: now });
+  assert.equal(sFull.window_5h.total_tokens, s3.window_5h.total_tokens);
+  assert.equal(sFull.window_7d.total_tokens, s3.window_7d.total_tokens);
+
+  // 3. Cross-window resource reuse + Sidecar centralized background sync:
+  // Once Sidecar warms quota-cache.json, opening 5 new windows (SessionStart + PreToolUse) does ZERO probes and ZERO transcript scans!
+  let probeRuns = 0;
+  const mockAgyBin = path.join(f.root, 'mock-agy-cli.cjs');
+  const probeCounterFile = path.join(f.root, 'probe-count.txt');
+  fs.writeFileSync(mockAgyBin, [
+    'const fs = require("node:fs");',
+    `const c = fs.existsSync(${JSON.stringify(probeCounterFile)}) ? Number(fs.readFileSync(${JSON.stringify(probeCounterFile)}, "utf8")) : 0;`,
+    `fs.writeFileSync(${JSON.stringify(probeCounterFile)}, String(c + 1), "utf8");`,
+    // Verify GEMINI_API_KEY was stripped from child env (same rule as CC Switch subscription_agy.rs)
+    'if (process.env.GEMINI_API_KEY) { process.exit(2); }',
+    `console.log(JSON.stringify(${JSON.stringify(agyCliSample)}));`
+  ].join('\n'), 'utf8');
+  saveRoutingPolicy(f.policyPath, {
+    ...loadRoutingPolicy(f.policyPath),
+    agy_quota_command: [process.execPath, mockAgyBin]
+  });
+
+  let rpcCalls = 0;
+  const sidecarBroker = new Broker(
+    { project: f.quantProject, data: f.quantData, routing_config_file: f.policyPath },
+    async () => {
+      rpcCalls += 1;
+      return {
+        ordinaryUsageAllowed: true,
+        rateLimits: { planType: 'pro', primary: { usedPercent: 88, windowDurationMins: 10080, resetsAt: Math.floor((Date.now() + 84 * 3600000) / 1000) } }
+      };
+    }
+  );
+  const prevKey = process.env.GEMINI_API_KEY;
+  process.env.GEMINI_API_KEY = 'should-not-leak-to-official-agy-usage';
+  const syncLoop = startQuotaSyncLoop(sidecarBroker, { initialDelayMs: 60000, intervalMs: 120000 });
+  try {
+    const bg1 = await syncLoop.tick();
+    assert.equal(bg1.codex_pacing.used_percent, 88);
+    assert.equal(bg1.agy_external.weekly_used_percent, 30);
+    probeRuns = Number(fs.readFileSync(probeCounterFile, 'utf8'));
+    assert.equal(rpcCalls, 1);
+    assert.equal(probeRuns, 1);
+
+    // Second Sidecar background tick 10s later reuses recent Codex (<15m) & AGY (<10m) probes without spawning anything!
+    await syncLoop.tick();
+    assert.equal(rpcCalls, 1);
+    assert.equal(Number(fs.readFileSync(probeCounterFile, 'utf8')), 1);
+
+    // Delete brainDir after Sidecar warmed quota-cache.json to prove opening 5 new windows NEVER touches brainDir or spawns probes!
+    const markerFile = path.join(f.root, 'multi-window-markers.json');
+    const projects = [
+      { project: f.project, data: f.data, review_category: 'general' },
+      { project: f.quantProject, data: f.quantData, review_category: 'quant' }
+    ];
+    for (let w = 1; w <= 5; w++) {
+      const convId = `0000000${w}-1111-2222-3333-444444444444`;
+      const hookOut = contextHook(
+        { hookEventName: 'SessionStart', conversationId: convId, workspacePaths: [w % 2 === 0 ? f.project : f.quantProject], modelName: 'backup-safe-model' },
+        projects,
+        { policyPath: f.policyPath, brainDir: path.join(f.root, 'non-existent-if-scanned'), markerFile }
+      );
+      assert.equal(hookOut.injectSteps.length, 1);
+      assert.match(hookOut.injectSteps[0].systemMessage.systemMessage, /已用 88%/);
+      assert.match(hookOut.injectSteps[0].systemMessage.systemMessage, /AGY 7天目标.*已用 30%/);
+
+      const preOut = bindOrigin(
+        { conversationId: convId, workspacePaths: [f.project], toolCall: { name: 'invoke_subagent', args: { TypeName: 'self', Role: 'Impl', Prompt: 'work' } } },
+        projects,
+        { policyPath: f.policyPath }
+      );
+      assert.equal(preOut.decision, 'allow');
+    }
+
+    // Normal codex_quota() call from any window also hits shared quota-cache.json in 0ms without re-probing
+    const winQuota = await sidecarBroker.quota({});
+    assert.equal(winQuota.cached, true);
+    assert.equal(rpcCalls, 1);
+    assert.equal(Number(fs.readFileSync(probeCounterFile, 'utf8')), 1);
+
+    // Single-flight claim prevents concurrent refresh stampede
+    const cachePath = defaultQuotaCachePath(f.policyPath, { data: f.quantData });
+    const held = takeQuotaRefreshClaim(cachePath, 30000, Date.now());
+    assert.equal(typeof held, 'function');
+    try {
+      const bgSkipped = await sidecarBroker.quota({ background: true });
+      assert.equal(bgSkipped.skipped, true);
+      assert.equal(rpcCalls, 1);
+    } finally {
+      held();
+    }
+  } finally {
+    syncLoop.close();
+    if (prevKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = prevKey;
+  }
+});

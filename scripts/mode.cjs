@@ -331,6 +331,8 @@ async function run(argv) {
       if (!Number.isFinite(n) || n <= 0) throw new Error('--tokens-7d must be positive');
       next.window_7d_tokens = Math.floor(n);
     }
+    if (opts['bucket-5h'] !== undefined) next.bucket_5h = String(opts['bucket-5h']).trim() || null;
+    if (opts['bucket-7d'] !== undefined) next.bucket_7d = String(opts['bucket-7d']).trim() || null;
     if (opts['clear-snapshot']) {
       next.manual_snapshot = null;
     } else if (opts['weekly-used'] !== undefined || opts['5h-used'] !== undefined || opts['weekly-reset'] !== undefined || opts['5h-reset'] !== undefined) {

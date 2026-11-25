@@ -4,20 +4,14 @@ const path = require('node:path');
 const { Broker, inside, terminal, executionSandbox } = require('./server.cjs');
 const {
   defaultPolicyPath,
-  defaultQuotaCachePath,
-  defaultCodexSessionsDir,
   loadRoutingPolicy,
   resolveProjectPolicy,
-  evaluateCodexPacing,
   evaluateAgyPacing,
   evaluateCodexConcurrencyGate,
   evaluateSubagentCall,
   activeCodexTasks,
   decideRoute,
-  readQuotaCache,
-  readStaleQuotaCache,
-  readLatestCodexRolloutRateLimits,
-  scanAgyTranscriptUsage,
+  resolveSharedQuotaSnapshot,
   saveAtomic
 } = require('./routing-policy.cjs');
 const {
@@ -58,25 +52,6 @@ function isReadOnlyTaskStatusCall(name, args = {}) {
   if (/(?:^|[_/.:-])manage_task$/i.test(name) && ['list', 'status'].includes(action)) return true;
   if (/(?:^|[_/.:-])manage_subagents$/i.test(name) && action === 'list') return true;
   return false;
-}
-
-function resolveFastCodexPacing(scope, projectPolicy, options = {}) {
-  const nowMs = options.nowMs ?? Date.now();
-  const policyPath = options.policyPath || defaultPolicyPath(scope);
-  const cachePath = options.cachePath || defaultQuotaCachePath(policyPath, scope);
-  const fresh = readQuotaCache(cachePath, Math.max(projectPolicy.cache_ttl_seconds || 60, 300), nowMs);
-  if (fresh?.codex_pacing?.available) return { codexPacing: fresh.codex_pacing, cached: fresh };
-  const sessionsDir = defaultCodexSessionsDir(scope, options);
-  const rollout = sessionsDir ? readLatestCodexRolloutRateLimits({ codexSessionsDir: sessionsDir, nowMs }) : null;
-  const fromRollout = rollout ? evaluateCodexPacing(rollout, projectPolicy.pacing, nowMs) : null;
-  const stale = readStaleQuotaCache(cachePath, nowMs);
-  if (fromRollout?.available && (!stale?.codex_pacing?.available || fromRollout.used_percent >= stale.codex_pacing.used_percent)) {
-    return { codexPacing: { ...fromRollout, source: 'codex_rollout_log', observed_at: rollout.observed_at }, cached: stale };
-  }
-  if (stale?.codex_pacing?.available) {
-    return { codexPacing: { ...stale.codex_pacing, stale: true, source: 'stale_cache' }, cached: stale };
-  }
-  return { codexPacing: { available: false }, cached: fresh || stale || null };
 }
 
 function bindOrigin(payload, projects, options = {}) {
@@ -152,10 +127,9 @@ function bindOrigin(payload, projects, options = {}) {
     const guardCooldown = readGuardQuotaCooldown(guardFile, options.nowMs);
     const effPolicy = { ...selected.policy, ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
     if (effPolicy.mode === 'auto' && args.review_only !== true) {
-      const { codexPacing, cached } = resolveFastCodexPacing(selected.scope, effPolicy, { ...options, policyPath });
+      const { codexPacing, agyUsage, agyExternal } = resolveSharedQuotaSnapshot(selected.scope, effPolicy, { ...options, policyPath });
       if (codexPacing.available) {
-        const agyUsage = cached?.agy_usage || { available: false };
-        const agyPacing = evaluateAgyPacing({ agyUsage, agyExternal: cached?.agy_external || null, projectPolicy: effPolicy, codexPacing, nowMs: options.nowMs });
+        const agyPacing = evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy: effPolicy, codexPacing, nowMs: options.nowMs });
         const totalActive = projects.reduce((sum, p) => sum + activeCodexTasks(p).count, 0);
         const concGate = evaluateCodexConcurrencyGate({ args, projectPolicy: effPolicy, codexPacing, agyPacing, totalActiveCodexTasks: totalActive });
         if (concGate.blocked) return { decision: 'deny', reason: concGate.reason };
@@ -178,8 +152,11 @@ function contextHook(payload, projects, options = {}) {
   const guardFile = options.guardStateFile || defaultGuardStatePath(policyPath, selected.scope);
   const guardCooldown = readGuardQuotaCooldown(guardFile, options.nowMs);
   const projectPolicy = { ...selected.policy, ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
-  const { codexPacing, cached } = resolveFastCodexPacing(selected.scope, projectPolicy, { ...options, policyPath });
-  const agyUsage = cached?.agy_usage || scanAgyTranscriptUsage({ transcriptPath: payload?.transcriptPath, brainDir: options.brainDir, nowMs: options.nowMs });
+  const { codexPacing, agyUsage, agyExternal } = resolveSharedQuotaSnapshot(selected.scope, projectPolicy, {
+    ...options,
+    policyPath,
+    transcriptPath: payload?.transcriptPath
+  });
   const active = activeCodexTasks(selected.scope);
   const route = decideRoute({
     policy: rawPolicy,
@@ -187,7 +164,7 @@ function contextHook(payload, projects, options = {}) {
     projectScope: selected.scope,
     codexPacing,
     agyUsage,
-    agyExternal: cached?.agy_external || null,
+    agyExternal,
     activeCodexTasks: active,
     modelName: payload?.modelName || '',
     nowMs: options.nowMs

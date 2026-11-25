@@ -407,7 +407,38 @@ function watch(broker, send, options = {}) {
   interval = setInterval(reconcile, health.interval_ms);
   heartbeat(); void drain(); return { close, reconcile };
 }
-module.exports = { originHook, contextHook, postToolHook, deliver, watch, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
+function startQuotaSyncLoop(broker, options = {}) {
+  const intervalMs = options.intervalMs ?? 120000;
+  const initialDelayMs = options.initialDelayMs ?? 1500;
+  let closed = false, running = false, initTimer = null, timer = null;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    if (initTimer) clearTimeout(initTimer);
+    if (timer) clearInterval(timer);
+    initTimer = null;
+    timer = null;
+  };
+  const tick = async () => {
+    if (closed || running) return null;
+    if (options.owns && !options.owns()) { close(); return null; }
+    running = true;
+    try {
+      return await broker.quota({ background: true });
+    } catch (error) {
+      process.stderr.write(`Shared quota sync: ${error.message}\n`);
+      return null;
+    } finally {
+      running = false;
+    }
+  };
+  initTimer = setTimeout(() => { initTimer = null; void tick(); }, initialDelayMs);
+  initTimer.unref?.();
+  timer = setInterval(() => { void tick(); }, intervalMs);
+  timer.unref?.();
+  return { close, tick };
+}
+module.exports = { originHook, contextHook, postToolHook, deliver, watch, startQuotaSyncLoop, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
 if (require.main === module) {
   if (['--origin-hook', '--context-hook', '--post-tool-hook'].includes(process.argv[2])) {
     const mode = process.argv[2];
@@ -440,10 +471,11 @@ if (require.main === module) {
       const owner = claimHost(settings.data, generation);
       const eventDirectory = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR ? path.resolve(process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR, '../events') : null;
       const watchers = projects.map(p => watch(new Broker(p), (recipient, message) => nativeSend(executable, recipient, message), { generation, owns: owner.owns, reconcile: event => recordedReceipt(eventDirectory, event) }));
-      save(path.join(settings.data, 'notification-host.json'), { ...owner.host, projects: projects.map(p => p.project), watcher_count: watchers.length });
-      const ownership = fs.watch(settings.data, (_event, name) => { if (String(name) === 'notification-host.json' && !owner.owns()) { for (const w of watchers) w.close(); ownership.close(); } });
+      const quotaSync = projects[0] ? startQuotaSyncLoop(new Broker(projects[0]), { owns: owner.owns }) : null;
+      save(path.join(settings.data, 'notification-host.json'), { ...owner.host, projects: projects.map(p => p.project), watcher_count: watchers.length, shared_quota_sync: Boolean(quotaSync) });
+      const ownership = fs.watch(settings.data, (_event, name) => { if (String(name) === 'notification-host.json' && !owner.owns()) { quotaSync?.close(); for (const w of watchers) w.close(); ownership.close(); } });
       ownership.on('error', error => { process.stderr.write(`Ownership watcher degraded; periodic fencing remains active: ${error.message}\n`); ownership.close(); });
-      for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { for (const w of watchers) w.close(); ownership.close(); });
+      for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { quotaSync?.close(); for (const w of watchers) w.close(); ownership.close(); });
     } catch (error) { process.stderr.write(error.message + '\n'); process.exitCode = error.duplicate ? 0 : 1; }
   }
 }

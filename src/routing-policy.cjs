@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 
 const MODE_ALIASES = Object.freeze({
   auto: 'auto',
@@ -133,7 +133,7 @@ function defaultPolicy() {
     agy_quota_hint: 'normal',
     agy_manual_snapshot: null,
     agy_quota_command: null,
-    cache_ttl_seconds: 60,
+    cache_ttl_seconds: 300,
     cooldowns: { codex: null, agy: null },
     updated_at: null
   };
@@ -284,6 +284,8 @@ function parsePolicy(raw) {
         window_5h_protect_percent: Math.max(caution5h, protect5hRaw),
         window_5h_tokens: typeof cfg.window_5h_tokens === 'number' && Number.isFinite(cfg.window_5h_tokens) && cfg.window_5h_tokens > 0 ? Math.floor(cfg.window_5h_tokens) : null,
         window_7d_tokens: typeof cfg.window_7d_tokens === 'number' && Number.isFinite(cfg.window_7d_tokens) && cfg.window_7d_tokens > 0 ? Math.floor(cfg.window_7d_tokens) : null,
+        bucket_5h: typeof cfg.bucket_5h === 'string' && cfg.bucket_5h.trim() ? cfg.bucket_5h.trim().slice(0, 80) : null,
+        bucket_7d: typeof cfg.bucket_7d === 'string' && cfg.bucket_7d.trim() ? cfg.bucket_7d.trim().slice(0, 80) : null,
         manual_snapshot: parseManualAgySnapshot(cfg.manual_snapshot),
         cooldown: parseCooldown(cfg.cooldown)
       };
@@ -339,6 +341,50 @@ function defaultQuotaCachePath(policyPath, settings) {
   if (policyPath) return path.join(path.dirname(policyPath), 'quota-cache.json');
   const dataRoot = settings?.data || settings?.projects?.[0]?.data;
   return dataRoot ? path.join(path.resolve(dataRoot), 'quota-cache.json') : null;
+}
+
+function defaultTranscriptIndexPath(policyPath, settings) {
+  const cachePath = defaultQuotaCachePath(policyPath, settings);
+  return cachePath ? path.join(path.dirname(cachePath), 'agy-transcript-index.json') : null;
+}
+
+function takeQuotaRefreshClaim(cachePath, staleMs = 30000, nowMs = Date.now()) {
+  if (!cachePath) return () => {};
+  const claimFile = `${cachePath}.refresh.claim`;
+  try { fs.mkdirSync(path.dirname(claimFile), { recursive: true }); } catch {}
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(claimFile, 'wx');
+      try {
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, created_at: new Date(nowMs).toISOString() }), 'utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        try { fs.unlinkSync(claimFile); } catch {}
+      };
+    } catch (error) {
+      if (error.code !== 'EEXIST') return null;
+      try {
+        const existing = JSON.parse(fs.readFileSync(claimFile, 'utf8'));
+        const createdMs = Date.parse(existing?.created_at);
+        if (!alivePid(existing?.pid) || !Number.isFinite(createdMs) || nowMs - createdMs > staleMs) {
+          fs.unlinkSync(claimFile);
+          continue;
+        }
+      } catch {
+        try {
+          const st = fs.statSync(claimFile);
+          if (nowMs - st.mtimeMs > staleMs) { fs.unlinkSync(claimFile); continue; }
+        } catch { continue; }
+      }
+      return null;
+    }
+  }
+  return null;
 }
 
 function saveAtomic(file, value) {
@@ -649,9 +695,10 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
   };
 }
 
-function evaluateAgyModelPools({ agyUsage, projectPolicy, codexPacing, nowMs = Date.now() }) {
+function evaluateAgyModelPools({ agyUsage, agyExternal, projectPolicy, codexPacing, nowMs = Date.now() }) {
   const poolsCfg = projectPolicy?.agy_model_pools || {};
   const window7dMs = (projectPolicy?.agy_pacing?.window_minutes || DEFAULT_AGY_PACING.window_minutes) * 60 * 1000;
+  const extBuckets = agyExternal?.available && agyExternal.buckets && typeof agyExternal.buckets === 'object' ? agyExternal.buckets : null;
   const result = {};
   for (const [name, cfg] of Object.entries(poolsCfg)) {
     const token = String(cfg.match || name).toLowerCase();
@@ -660,6 +707,15 @@ function evaluateAgyModelPools({ agyUsage, projectPolicy, codexPacing, nowMs = D
       .reduce((acc, [, v]) => acc + (v?.total_tokens || 0), 0);
     const tokens5h = agyUsage?.available ? sumMatching(agyUsage.window_5h?.by_model) : null;
     const tokens7d = agyUsage?.available ? sumMatching(agyUsage.window_7d?.by_model) : null;
+
+    const bucket5hKey = cfg.bucket_5h || (!token.includes('gemini') ? '3p-5h' : null);
+    const bucket7dKey = cfg.bucket_7d || (!token.includes('gemini') ? '3p-weekly' : null);
+    const ext5h = bucket5hKey && extBuckets?.[bucket5hKey] && typeof extBuckets[bucket5hKey].used_percent === 'number'
+      && (!extBuckets[bucket5hKey].resets_at || Date.parse(extBuckets[bucket5hKey].resets_at) > nowMs)
+      ? extBuckets[bucket5hKey] : null;
+    const ext7d = bucket7dKey && extBuckets?.[bucket7dKey] && typeof extBuckets[bucket7dKey].used_percent === 'number'
+      && (!extBuckets[bucket7dKey].resets_at || Date.parse(extBuckets[bucket7dKey].resets_at) > nowMs)
+      ? extBuckets[bucket7dKey] : null;
 
     const snap = cfg.manual_snapshot || null;
     const snapAgeMs = snap ? nowMs - Date.parse(snap.recorded_at) : Infinity;
@@ -670,13 +726,19 @@ function evaluateAgyModelPools({ agyUsage, projectPolicy, codexPacing, nowMs = D
       snap.weekly_resets_at ? Date.parse(snap.weekly_resets_at) > nowMs : snapAgeMs <= 24 * 3600000
     );
 
-    const used5h = valid5h ? round2(clamp(snap.five_hour_used_percent, 0, 100))
-      : (cfg.window_5h_tokens && typeof tokens5h === 'number' ? round2(clamp((tokens5h / cfg.window_5h_tokens) * 100, 0, 100)) : null);
-    const used7d = valid7d ? round2(clamp(snap.weekly_used_percent, 0, 100))
-      : (cfg.window_7d_tokens && typeof tokens7d === 'number' ? round2(clamp((tokens7d / cfg.window_7d_tokens) * 100, 0, 100)) : null);
+    const used5h = ext5h ? round2(clamp(ext5h.used_percent, 0, 100))
+      : valid5h ? round2(clamp(snap.five_hour_used_percent, 0, 100))
+        : (cfg.window_5h_tokens && typeof tokens5h === 'number' ? round2(clamp((tokens5h / cfg.window_5h_tokens) * 100, 0, 100)) : null);
+    const used7d = ext7d ? round2(clamp(ext7d.used_percent, 0, 100))
+      : valid7d ? round2(clamp(snap.weekly_used_percent, 0, 100))
+        : (cfg.window_7d_tokens && typeof tokens7d === 'number' ? round2(clamp((tokens7d / cfg.window_7d_tokens) * 100, 0, 100)) : null);
+    const source = ext7d || ext5h ? (agyExternal.source || 'agy_cli_usage')
+      : (valid7d || valid5h ? 'manual_snapshot' : (used7d !== null || used5h !== null ? 'local_token_budget' : 'uncalibrated'));
 
-    let weeklyResetsAtMs = valid7d && snap.weekly_resets_at && Number.isFinite(Date.parse(snap.weekly_resets_at))
-      ? Date.parse(snap.weekly_resets_at) : null;
+    let weeklyResetsAtMs = ext7d?.resets_at && Number.isFinite(Date.parse(ext7d.resets_at))
+      ? Date.parse(ext7d.resets_at)
+      : (valid7d && snap.weekly_resets_at && Number.isFinite(Date.parse(snap.weekly_resets_at))
+        ? Date.parse(snap.weekly_resets_at) : null);
     if (!weeklyResetsAtMs && projectPolicy?.agy_pacing?.weekly_resets_at) {
       weeklyResetsAtMs = advanceResetAnchor(Date.parse(projectPolicy.agy_pacing.weekly_resets_at), window7dMs, nowMs);
     }
@@ -711,6 +773,7 @@ function evaluateAgyModelPools({ agyUsage, projectPolicy, codexPacing, nowMs = D
             : null;
     result[name] = {
       match: token,
+      source,
       weekly_protect_used_percent: cfg.weekly_protect_used_percent,
       buffer_percent: round2(Math.max(0, 100 - cfg.weekly_protect_used_percent)),
       weekly_used_percent: used7d,
@@ -763,10 +826,78 @@ function readTailUtf8(file, maxBytes) {
   } finally { fs.closeSync(fd); }
 }
 
+function readSliceCompleteLines(file, startOffset, endSize, maxBytes) {
+  if (endSize <= startOffset) return { text: '', consumedOffset: endSize, bytesRead: 0, truncated: false };
+  let actualStart = startOffset;
+  let dropFirstPartial = false;
+  if (endSize - startOffset > maxBytes) {
+    actualStart = endSize - maxBytes;
+    dropFirstPartial = true;
+  }
+  const len = endSize - actualStart;
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(len);
+    const bytesRead = fs.readSync(fd, buf, 0, len, actualStart);
+    const lastNl = buf.lastIndexOf(0x0a, bytesRead - 1);
+    if (lastNl < 0) {
+      if (actualStart === 0 && bytesRead === endSize) {
+        return { text: buf.subarray(0, bytesRead).toString('utf8'), consumedOffset: endSize, bytesRead, truncated: false };
+      }
+      return { text: '', consumedOffset: startOffset, bytesRead, truncated: dropFirstPartial };
+    }
+    let slice = buf.subarray(0, lastNl + 1);
+    if (dropFirstPartial) {
+      const firstNl = slice.indexOf(0x0a);
+      slice = firstNl >= 0 ? slice.subarray(firstNl + 1) : Buffer.alloc(0);
+    }
+    return {
+      text: slice.toString('utf8'),
+      consumedOffset: actualStart + lastNl + 1,
+      bytesRead,
+      truncated: dropFirstPartial
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function parseTranscriptCompactRecords(text, cutoff7d, nowMs) {
+  const records = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    const ts = Date.parse(row.created_at);
+    if (!Number.isFinite(ts) || ts < cutoff7d || ts > nowMs + 60000) continue;
+    const inp = Number.isSafeInteger(row.input_tokens) && row.input_tokens > 0 ? row.input_tokens : 0;
+    const cache = Number.isSafeInteger(row.cache_read_tokens) && row.cache_read_tokens > 0 ? row.cache_read_tokens : 0;
+    const out = Number.isSafeInteger(row.output_tokens) && row.output_tokens > 0 ? row.output_tokens : 0;
+    const errText = typeof row.error === 'string' ? row.error : (row.error?.message || '');
+    const is429 = isAgyQuotaError(errText) ? 1 : 0;
+    if (inp > 0 || out > 0 || cache > 0 || is429 === 1) {
+      records.push([ts, row.model || 'unknown', inp, cache, out, is429]);
+    }
+  }
+  return records;
+}
+
+function loadTranscriptIndex(indexPath) {
+  if (!indexPath || !fs.existsSync(indexPath)) return { schema: 1, files: {} };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+    if (parsed && parsed.schema === 1 && parsed.files && typeof parsed.files === 'object' && !Array.isArray(parsed.files)) {
+      return parsed;
+    }
+  } catch {}
+  return { schema: 1, files: {} };
+}
+
 function scanAgyTranscriptUsage(options = {}) {
   const nowMs = options.nowMs ?? Date.now();
   const defaultBrain = process.env.CODEX_EXECUTOR_TEST_ROOT ? null : path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
   const brainDir = options.brainDir || inferBrainDir(options.transcriptPath) || defaultBrain;
+  const indexPath = options.indexPath || null;
   const maxFiles = options.maxFiles ?? 80;
   const maxBytesPerFile = options.maxBytesPerFile ?? (2 * 1024 * 1024);
   const cutoff7d = nowMs - 7 * 24 * 3600 * 1000;
@@ -789,13 +920,18 @@ function scanAgyTranscriptUsage(options = {}) {
     const file = path.join(brainDir, entry.name, '.system_generated', 'logs', 'transcript.jsonl');
     try {
       const st = fs.statSync(file);
-      if (st.isFile() && st.mtimeMs >= cutoff7d) candidates.push({ file, mtimeMs: st.mtimeMs });
+      if (st.isFile() && st.mtimeMs >= cutoff7d) candidates.push({ file, mtimeMs: st.mtimeMs, size: st.size });
     } catch {}
   }
   candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
   const selected = candidates.slice(0, maxFiles);
 
   let quotaErrors5h = 0, latestQuotaErrorAt = null, truncatedFiles = 0;
+  let cacheHits = 0, incrementalReads = 0, fullReads = 0, bytesRead = 0, dirty = false;
+  const prevIndex = indexPath ? loadTranscriptIndex(indexPath) : null;
+  const prevFiles = prevIndex?.files || {};
+  const nextFiles = {};
+
   const addUsage = (bucket, model, inp, cache, out) => {
     const total = inp + out;
     const weighted = Math.round(inp + cache * 0.1 + out * 5);
@@ -812,26 +948,70 @@ function scanAgyTranscriptUsage(options = {}) {
   };
 
   for (const item of selected) {
-    let text, truncated;
-    try { ({ text, truncated } = readTailUtf8(item.file, maxBytesPerFile)); } catch { continue; }
-    if (truncated) truncatedFiles += 1;
-    for (const line of text.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      let row; try { row = JSON.parse(line); } catch { continue; }
-      const ts = Date.parse(row.created_at);
-      if (!Number.isFinite(ts) || ts < cutoff7d || ts > nowMs + 60000) continue;
-      const inp = Number.isSafeInteger(row.input_tokens) && row.input_tokens > 0 ? row.input_tokens : 0;
-      const cache = Number.isSafeInteger(row.cache_read_tokens) && row.cache_read_tokens > 0 ? row.cache_read_tokens : 0;
-      const out = Number.isSafeInteger(row.output_tokens) && row.output_tokens > 0 ? row.output_tokens : 0;
-      if (inp > 0 || out > 0 || cache > 0) {
-        addUsage(win7d, row.model, inp, cache, out);
-        if (ts >= cutoff5h) addUsage(win5h, row.model, inp, cache, out);
+    let records;
+    let itemTruncated = false;
+    const prev = indexPath ? prevFiles[item.file] : null;
+    if (prev && prev.mtime_ms === item.mtimeMs && prev.size === item.size && prev.offset === item.size && Array.isArray(prev.records)) {
+      cacheHits += 1;
+      itemTruncated = Boolean(prev.truncated);
+      records = prev.records.filter(r => Array.isArray(r) && r[0] >= cutoff7d);
+      if (records.length !== prev.records.length) dirty = true;
+      nextFiles[item.file] = { mtime_ms: item.mtimeMs, size: item.size, offset: prev.offset, truncated: itemTruncated, records };
+    } else if (prev && Array.isArray(prev.records) && typeof prev.offset === 'number' && prev.offset >= 0 && item.size >= prev.offset && (item.size - prev.offset) <= maxBytesPerFile) {
+      const priorTruncated = Boolean(prev.truncated);
+      if (item.size === prev.offset) {
+        cacheHits += 1;
+        itemTruncated = priorTruncated;
+        records = prev.records.filter(r => Array.isArray(r) && r[0] >= cutoff7d);
+        nextFiles[item.file] = { mtime_ms: item.mtimeMs, size: item.size, offset: prev.offset, truncated: itemTruncated, records };
+        if (prev.mtime_ms !== item.mtimeMs || records.length !== prev.records.length) dirty = true;
+      } else {
+        let delta;
+        try { delta = readSliceCompleteLines(item.file, prev.offset, item.size, maxBytesPerFile); } catch { continue; }
+        incrementalReads += 1;
+        bytesRead += delta.bytesRead;
+        dirty = true;
+        itemTruncated = priorTruncated || Boolean(delta.truncated);
+        const appended = parseTranscriptCompactRecords(delta.text, cutoff7d, nowMs);
+        records = [...prev.records.filter(r => Array.isArray(r) && r[0] >= cutoff7d), ...appended];
+        nextFiles[item.file] = { mtime_ms: item.mtimeMs, size: item.size, offset: delta.consumedOffset, truncated: itemTruncated, records };
       }
-      const errText = typeof row.error === 'string' ? row.error : (row.error?.message || '');
-      if (ts >= cutoff5h && isAgyQuotaError(errText)) {
+    } else if (indexPath) {
+      let full;
+      try { full = readSliceCompleteLines(item.file, 0, item.size, maxBytesPerFile); } catch { continue; }
+      fullReads += 1;
+      bytesRead += full.bytesRead;
+      dirty = true;
+      itemTruncated = Boolean(full.truncated);
+      records = parseTranscriptCompactRecords(full.text, cutoff7d, nowMs);
+      nextFiles[item.file] = { mtime_ms: item.mtimeMs, size: item.size, offset: full.consumedOffset, truncated: itemTruncated, records };
+    } else {
+      let text, truncated;
+      try { ({ text, truncated } = readTailUtf8(item.file, maxBytesPerFile)); } catch { continue; }
+      fullReads += 1;
+      bytesRead += Buffer.byteLength(text, 'utf8');
+      itemTruncated = truncated;
+      records = parseTranscriptCompactRecords(text, cutoff7d, nowMs);
+    }
+
+    if (itemTruncated) truncatedFiles += 1;
+    for (const rec of records) {
+      const [ts, model, inp, cache, out, is429] = rec;
+      if (inp > 0 || out > 0 || cache > 0) {
+        addUsage(win7d, model, inp, cache, out);
+        if (ts >= cutoff5h) addUsage(win5h, model, inp, cache, out);
+      }
+      if (is429 === 1 && ts >= cutoff5h) {
         quotaErrors5h += 1;
         if (!latestQuotaErrorAt || ts > latestQuotaErrorAt) latestQuotaErrorAt = ts;
       }
+    }
+  }
+
+  if (indexPath) {
+    if (!dirty && Object.keys(prevFiles).length !== Object.keys(nextFiles).length) dirty = true;
+    if (dirty) {
+      try { saveAtomic(indexPath, { schema: 1, updated_at: new Date(nowMs).toISOString(), files: nextFiles }); } catch {}
     }
   }
 
@@ -840,49 +1020,203 @@ function scanAgyTranscriptUsage(options = {}) {
     source: 'local_transcripts',
     scanned_sessions: selected.length,
     truncated_files: truncatedFiles,
+    sync_stats: {
+      index_used: Boolean(indexPath),
+      cache_hits: cacheHits,
+      incremental_reads: incrementalReads,
+      full_reads: fullReads,
+      bytes_read: bytesRead
+    },
     window_5h: win5h,
     window_7d: win7d,
     quota_errors_5h: quotaErrors5h,
     latest_quota_error_at: latestQuotaErrorAt ? new Date(latestQuotaErrorAt).toISOString() : null,
     auto_degraded: latestQuotaErrorAt !== null && latestQuotaErrorAt >= recentDegradeCutoff,
-    note: 'Local transcript token aggregation only; Antigravity does not expose an official public remaining-quota percentage API.'
+    note: 'Incremental local transcript token aggregation; install official agy CLI (`agy --print /usage --output-format json`) or set agy_quota_command for live bucket percentages.'
+  };
+}
+
+function isLegacyAgyWrapper(filePath) {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buf = Buffer.alloc(256);
+      const n = fs.readSync(fd, buf, 0, 256, 0);
+      return buf.subarray(0, n).toString('utf8').includes('cc-switch-agy-wrapper');
+    } finally { fs.closeSync(fd); }
+  } catch { return false; }
+}
+
+function resolveRealAgyBin(options = {}) {
+  if (options.agyBin !== undefined) return options.agyBin || null;
+  if (process.env.CODEX_EXECUTOR_TEST_ROOT) return null;
+  const home = os.homedir();
+  const pathDirs = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  const extraDirs = process.platform === 'win32'
+    ? [path.join(home, '.local', 'bin'), ...(process.env.LOCALAPPDATA ? [path.join(process.env.LOCALAPPDATA, 'agy', 'bin')] : [])]
+    : [path.join(home, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin'];
+  const names = process.platform === 'win32' ? ['agy.exe', 'agy.cmd', 'agy'] : ['agy'];
+  for (const dir of [...pathDirs, ...extraDirs]) {
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      try {
+        if (fs.statSync(candidate).isFile() && !isLegacyAgyWrapper(candidate)) return candidate;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+function cleanOfficialAgyEnv(baseEnv = process.env) {
+  const env = { ...baseEnv };
+  for (const k of Object.keys(env)) {
+    const upper = k.toUpperCase();
+    if (upper === 'GEMINI_API_KEY' || upper === 'GOOGLE_GEMINI_BASE_URL') delete env[k];
+  }
+  return env;
+}
+
+function parseAgyProbePayload(parsed) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { available: false, error: 'Probe output is not a JSON object' };
+  }
+  const num = v => typeof v === 'number' && Number.isFinite(v) ? round2(clamp(v, 0, 100)) : null;
+
+  // 1. Official `agy --print /usage --output-format json` or bucket-group schema (same 5 buckets as CC Switch)
+  if (parsed.status !== undefined && String(parsed.status).toUpperCase() !== 'SUCCESS') {
+    return { available: false, error: `agy /usage returned status=${parsed.status}` };
+  }
+  const groups = Array.isArray(parsed?.command?.data?.groups) ? parsed.command.data.groups
+    : (Array.isArray(parsed?.groups) ? parsed.groups : null);
+  if (groups) {
+    const buckets = {};
+    for (const group of groups) {
+      if (!Array.isArray(group?.buckets)) continue;
+      for (const b of group.buckets) {
+        const id = typeof (b?.id ?? b?.bucketId) === 'string' ? (b.id ?? b.bucketId).trim() : '';
+        const remRaw = b?.remaining_fraction ?? b?.remainingFraction;
+        if (!id || typeof remRaw !== 'number' || !Number.isFinite(remRaw)) continue;
+        const rem = clamp(remRaw, 0, 1);
+        const used = round2((1 - rem) * 100);
+        const resetRaw = b?.reset_time ?? b?.resetTime;
+        const resetsAt = typeof resetRaw === 'string' && Number.isFinite(Date.parse(resetRaw))
+          ? new Date(Date.parse(resetRaw)).toISOString() : null;
+        buckets[id] = {
+          id,
+          window: typeof b.window === 'string' ? b.window : null,
+          used_percent: used,
+          remaining_percent: round2(100 - used),
+          resets_at: resetsAt
+        };
+      }
+    }
+    const g5h = buckets['gemini-5h'] || null;
+    const g7d = buckets['gemini-weekly'] || null;
+    const anyBucket = g5h || g7d || Object.values(buckets)[0] || null;
+    if (!anyBucket) {
+      return { available: false, error: 'agy /usage output contained no valid quota buckets' };
+    }
+    return {
+      available: true,
+      remaining_percent: g5h ? g5h.remaining_percent : (g7d ? g7d.remaining_percent : anyBucket.remaining_percent),
+      five_hour_used_percent: g5h ? g5h.used_percent : null,
+      five_hour_resets_at: g5h ? g5h.resets_at : null,
+      weekly_used_percent: g7d ? g7d.used_percent : null,
+      weekly_resets_at: g7d ? g7d.resets_at : null,
+      reset_at: g5h?.resets_at || g7d?.resets_at || anyBucket.resets_at || null,
+      buckets,
+      source: typeof parsed.source === 'string' ? parsed.source : 'agy_cli_usage'
+    };
+  }
+
+  // 2. Flat external probe JSON schema
+  const legacyRemaining = num(parsed.remaining_percent);
+  const fiveHourUsed = num(parsed.five_hour_used_percent)
+    ?? (num(parsed.five_hour_remaining_percent) !== null ? round2(100 - num(parsed.five_hour_remaining_percent)) : null)
+    ?? (legacyRemaining !== null ? round2(100 - legacyRemaining) : null);
+  const weeklyUsed = num(parsed.weekly_used_percent)
+    ?? (num(parsed.weekly_remaining_percent) !== null ? round2(100 - num(parsed.weekly_remaining_percent)) : null);
+
+  if (fiveHourUsed === null && weeklyUsed === null) {
+    return { available: false, error: 'Probe output missing numeric quota percent fields (remaining_percent / five_hour_used_percent / weekly_used_percent)' };
+  }
+  return {
+    available: true,
+    remaining_percent: legacyRemaining ?? (fiveHourUsed !== null ? round2(100 - fiveHourUsed) : round2(100 - weeklyUsed)),
+    five_hour_used_percent: fiveHourUsed,
+    five_hour_resets_at: typeof parsed.five_hour_resets_at === 'string' ? parsed.five_hour_resets_at : (typeof parsed.reset_at === 'string' ? parsed.reset_at : null),
+    weekly_used_percent: weeklyUsed,
+    weekly_resets_at: typeof parsed.weekly_resets_at === 'string' ? parsed.weekly_resets_at : null,
+    reset_at: typeof parsed.reset_at === 'string' ? parsed.reset_at : null,
+    buckets: parsed.buckets && typeof parsed.buckets === 'object' ? parsed.buckets : null,
+    model_group: typeof parsed.model_group === 'string' ? parsed.model_group : null,
+    source: typeof parsed.source === 'string' ? parsed.source : 'external_probe'
   };
 }
 
 function runExternalAgyProbe(command, options = {}) {
   if (!Array.isArray(command) || !command.length) return null;
-  const timeout = options.timeoutMs ?? 5000;
-  const num = v => typeof v === 'number' && Number.isFinite(v) ? round2(clamp(v, 0, 100)) : null;
+  const timeout = options.timeoutMs ?? 12000;
   try {
-    const res = spawnSync(command[0], command.slice(1), { encoding: 'utf8', windowsHide: true, timeout });
+    const res = spawnSync(command[0], command.slice(1), {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout,
+      env: cleanOfficialAgyEnv(options.env || process.env)
+    });
     if (res.error) return { available: false, error: res.error.message };
     if (res.status !== 0) return { available: false, error: (res.stderr || res.stdout || `exit ${res.status}`).trim().slice(0, 400) };
-    const parsed = JSON.parse((res.stdout || '').trim());
-
-    const legacyRemaining = num(parsed.remaining_percent);
-    const fiveHourUsed = num(parsed.five_hour_used_percent)
-      ?? (num(parsed.five_hour_remaining_percent) !== null ? round2(100 - num(parsed.five_hour_remaining_percent)) : null)
-      ?? (legacyRemaining !== null ? round2(100 - legacyRemaining) : null);
-    const weeklyUsed = num(parsed.weekly_used_percent)
-      ?? (num(parsed.weekly_remaining_percent) !== null ? round2(100 - num(parsed.weekly_remaining_percent)) : null);
-
-    if (fiveHourUsed === null && weeklyUsed === null) {
-      return { available: false, error: 'Probe output missing numeric quota percent fields (remaining_percent / five_hour_used_percent / weekly_used_percent)' };
-    }
-    return {
-      available: true,
-      remaining_percent: legacyRemaining ?? (fiveHourUsed !== null ? round2(100 - fiveHourUsed) : round2(100 - weeklyUsed)),
-      five_hour_used_percent: fiveHourUsed,
-      five_hour_resets_at: typeof parsed.five_hour_resets_at === 'string' ? parsed.five_hour_resets_at : (typeof parsed.reset_at === 'string' ? parsed.reset_at : null),
-      weekly_used_percent: weeklyUsed,
-      weekly_resets_at: typeof parsed.weekly_resets_at === 'string' ? parsed.weekly_resets_at : null,
-      reset_at: typeof parsed.reset_at === 'string' ? parsed.reset_at : null,
-      model_group: typeof parsed.model_group === 'string' ? parsed.model_group : null,
-      source: typeof parsed.source === 'string' ? parsed.source : 'external_probe'
-    };
+    return parseAgyProbePayload(JSON.parse((res.stdout || '').trim()));
   } catch (error) {
     return { available: false, error: error.message };
   }
+}
+
+function runExternalAgyProbeAsync(command, options = {}) {
+  if (!Array.isArray(command) || !command.length) return Promise.resolve(null);
+  const timeout = options.timeoutMs ?? 15000;
+  return new Promise(resolve => {
+    let stdout = '', stderr = '', settled = false;
+    const finish = result => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); };
+    let child;
+    try {
+      child = spawn(command[0], command.slice(1), {
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: cleanOfficialAgyEnv(options.env || process.env)
+      });
+    } catch (error) {
+      finish({ available: false, error: error.message });
+      return;
+    }
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      finish({ available: false, error: `AGY quota probe timed out after ${timeout}ms` });
+    }, timeout);
+    child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(-262144); });
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-4096); });
+    child.once('error', error => finish({ available: false, error: error.message }));
+    child.once('close', code => {
+      if (code !== 0) {
+        finish({ available: false, error: (stderr || stdout || `exit ${code}`).trim().slice(0, 400) });
+        return;
+      }
+      try {
+        finish(parseAgyProbePayload(JSON.parse(stdout.trim())));
+      } catch (error) {
+        finish({ available: false, error: error.message });
+      }
+    });
+  });
+}
+
+async function probeAgyQuotaAsync(projectPolicy, options = {}) {
+  if (Array.isArray(projectPolicy?.agy_quota_command) && projectPolicy.agy_quota_command.length > 0) {
+    return runExternalAgyProbeAsync(projectPolicy.agy_quota_command, options);
+  }
+  const agyBin = resolveRealAgyBin(options);
+  if (!agyBin) return null;
+  return runExternalAgyProbeAsync([agyBin, '--print', '/usage', '--output-format', 'json'], options);
 }
 
 function activeCodexTasks(projectScope) {
@@ -1040,7 +1374,7 @@ function decideRoute(input = {}) {
     }
   }
 
-  const agyPools = evaluateAgyModelPools({ agyUsage, projectPolicy: policy, codexPacing, nowMs });
+  const agyPools = evaluateAgyModelPools({ agyUsage, agyExternal, projectPolicy: policy, codexPacing, nowMs });
   const poolForModel = modelStr => {
     if (!modelStr || typeof modelStr !== 'string') return null;
     const lower = modelStr.toLowerCase();
@@ -1360,7 +1694,68 @@ function evaluateCodexConcurrencyGate({ args = {}, projectPolicy, codexPacing, a
 
 function writeQuotaCache(cachePath, payload) {
   if (!cachePath) return;
-  try { saveAtomic(cachePath, { ...payload, fetched_at: new Date().toISOString() }); } catch {}
+  try { saveAtomic(cachePath, { ...payload, fetched_at: payload?.fetched_at || new Date().toISOString() }); } catch {}
+}
+
+function resolveSharedQuotaSnapshot(scope, projectPolicy, options = {}) {
+  const nowMs = options.nowMs ?? Date.now();
+  const policyPath = options.policyPath || defaultPolicyPath(scope);
+  const cachePath = options.cachePath || defaultQuotaCachePath(policyPath, scope);
+  const indexPath = options.indexPath || defaultTranscriptIndexPath(policyPath, scope);
+  const sharedWindowSec = Math.max(projectPolicy?.cache_ttl_seconds || 300, 900);
+  const fresh = readQuotaCache(cachePath, sharedWindowSec, nowMs);
+
+  // Fast path across all Antigravity windows: reuse shared quota-cache.json with zero scans/subprocesses.
+  if (fresh && (fresh.codex_pacing?.available || !options.codexSessionsDir) && fresh.agy_usage) {
+    return {
+      codexPacing: fresh.codex_pacing || { available: false },
+      agyUsage: fresh.agy_usage,
+      agyExternal: fresh.agy_external || null,
+      reused_shared_cache: true
+    };
+  }
+
+  const stale = readStaleQuotaCache(cachePath, nowMs, 86400);
+  const release = takeQuotaRefreshClaim(cachePath, 30000, nowMs);
+  if (!release) {
+    // Another process/window is already refreshing: reuse existing snapshot immediately without duplicate work.
+    return {
+      codexPacing: stale?.codex_pacing ? { ...stale.codex_pacing, ...(fresh ? {} : { stale: true }) } : { available: false },
+      agyUsage: stale?.agy_usage || { available: false },
+      agyExternal: stale?.agy_external || null,
+      reused_shared_cache: true
+    };
+  }
+  try {
+    const sessionsDir = defaultCodexSessionsDir(scope, options);
+    const rollout = sessionsDir ? readLatestCodexRolloutRateLimits({ codexSessionsDir: sessionsDir, nowMs }) : null;
+    const fromRollout = rollout ? evaluateCodexPacing(rollout, projectPolicy?.pacing, nowMs) : null;
+    let codexPacing;
+    if (fromRollout?.available && (!stale?.codex_pacing?.available || fromRollout.used_percent >= stale.codex_pacing.used_percent)) {
+      codexPacing = { ...fromRollout, source: 'codex_rollout_log', observed_at: rollout.observed_at };
+    } else if (stale?.codex_pacing?.available) {
+      codexPacing = { ...stale.codex_pacing, source: stale.codex_pacing.source || 'shared_cache' };
+    } else {
+      codexPacing = { available: false };
+    }
+    const agyUsage = scanAgyTranscriptUsage({
+      transcriptPath: options.transcriptPath,
+      brainDir: options.brainDir,
+      indexPath,
+      nowMs
+    });
+    const agyExternal = stale?.agy_external || null;
+    writeQuotaCache(cachePath, {
+      ...(stale || {}),
+      codex_pacing: codexPacing,
+      agy_usage: agyUsage,
+      agy_external: agyExternal,
+      fetched_at: new Date(nowMs).toISOString()
+    });
+    return { codexPacing, agyUsage, agyExternal, reused_shared_cache: false };
+  } finally {
+    release();
+  }
 }
 
 module.exports = {
@@ -1375,7 +1770,9 @@ module.exports = {
   parsePolicy,
   defaultPolicyPath,
   defaultQuotaCachePath,
+  defaultTranscriptIndexPath,
   defaultCodexSessionsDir,
+  takeQuotaRefreshClaim,
   loadRoutingPolicy,
   saveRoutingPolicy,
   resolveProjectPolicy,
@@ -1384,7 +1781,12 @@ module.exports = {
   evaluateAgyModelPools,
   evaluateCodexConcurrencyGate,
   scanAgyTranscriptUsage,
+  resolveRealAgyBin,
+  parseAgyProbePayload,
   runExternalAgyProbe,
+  runExternalAgyProbeAsync,
+  probeAgyQuotaAsync,
+  resolveSharedQuotaSnapshot,
   activeCodexTasks,
   cooldownActive,
   decideRoute,
