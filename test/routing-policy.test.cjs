@@ -340,8 +340,18 @@ test('Mode CLI switches global/project modes with AGY aliases, quant thinking mo
   const out12 = JSON.parse(await runModeCli(['agy-models', '--clear', '--policy', f.policyPath]));
   assert.deepEqual(out12.agy_host_models, { standard: null, complex: null, expert: null });
 
-  // Independent model pool 90% weekly hard stop (reserve 10%) + failover to backup thinking chain
-  const outPool = JSON.parse(await runModeCli(['pool', '--name', 'family-x', '--match', 'famx', '--weekly-protect', '90', '--5h-protect', '88', '--weekly-used', '90', '--policy', f.policyPath]));
+  // Independent model pool linear 7-day 90% pacing + hard stop (reserve 10%) + failover to backup thinking chain
+  const resetLinear = new Date(Date.now() + 84 * 3600000).toISOString(); // 50% elapsed => 45% linear target of 90% cap
+  await runModeCli(['pool', '--name', 'family-x', '--match', 'famx', '--weekly-protect', '90', '--5h-protect', '88', '--weekly-used', '60', '--weekly-reset', resetLinear, '--policy', f.policyPath]);
+  const ctxAhead = contextHook(
+    { hookEventName: 'SessionStart', conversationId: 'conv-pool-ahead', modelName: 'famx-top-high', workspacePaths: [f.quantProject] },
+    [{ project: f.quantProject, data: f.quantData, review_category: 'quant' }],
+    { policyPath: f.policyPath, markerFile: path.join(f.root, 'm3a.json') }
+  );
+  assert.match(ctxAhead.injectSteps[0].systemMessage.systemMessage, /7天线性目标 45% \/ 已用 60%（偏差 \+15%）/);
+  assert.match(ctxAhead.injectSteps[0].systemMessage.systemMessage, /状态=超前建议控速/);
+
+  const outPool = JSON.parse(await runModeCli(['pool', '--name', 'family-x', '--match', 'famx', '--weekly-protect', '90', '--5h-protect', '88', '--weekly-used', '90', '--weekly-reset', resetLinear, '--policy', f.policyPath]));
   assert.equal(outPool.pool.weekly_protect_used_percent, 90);
   assert.equal(outPool.pool.manual_snapshot.weekly_used_percent, 90);
   await runModeCli(['quant-thinking', '--model', 'famx-top', '--general', 'famx-mid', '--backups', 'backup-1,backup-last', '--policy', f.policyPath]);

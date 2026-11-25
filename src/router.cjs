@@ -176,9 +176,14 @@ function contextHook(payload, projects, options = {}) {
     hostModels.expert ? `expert(顶配思考)→${hostModels.expert}` : null
   ].filter(Boolean);
   const poolLines = Object.entries(route.agy_model_pools || {}).map(([name, st]) => {
-    const pctText = st.weekly_used_percent !== null ? `7天已用 ${st.weekly_used_percent}%` : '7天未标定';
+    const pctText = st.weekly_used_percent !== null
+      ? (st.target_used_percent !== null
+        ? `7天线性目标 ${st.target_used_percent}% / 已用 ${st.weekly_used_percent}%（偏差 ${st.pacing_delta >= 0 ? '+' : ''}${st.pacing_delta}%）`
+        : `7天已用 ${st.weekly_used_percent}%`)
+      : `7天线性(上限${st.weekly_protect_used_percent}%未标定)`;
     const h5Text = st.five_hour_used_percent !== null ? `5h已用 ${st.five_hour_used_percent}%` : (st.tokens_5h ? `5h=${st.tokens_5h} tokens` : '5h正常');
-    return `${name}池(${pctText}，≥${st.weekly_protect_used_percent}%硬停留${st.buffer_percent}%缓冲，${h5Text}，状态=${st.stopped ? '已硬停' : st.caution ? '5h警戒' : '可用'})`;
+    const stateLabel = st.stopped ? '已硬停' : st.caution ? '5h警戒' : st.band === 'ahead_of_pace' ? '超前建议控速' : '可用';
+    return `${name}池(${pctText}，≥${st.weekly_protect_used_percent}%硬停留${st.buffer_percent}%缓冲，${h5Text}，状态=${stateLabel})`;
   });
   const agyTargetPct = projectPolicy.agy_pacing?.target_utilization ?? 90;
   const agyBufferPct = Math.max(0, Math.round((100 - (projectPolicy.agy_pacing?.weekly_protect_used_percent ?? 90)) * 100) / 100);

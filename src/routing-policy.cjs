@@ -626,8 +626,9 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
   };
 }
 
-function evaluateAgyModelPools({ agyUsage, projectPolicy, nowMs = Date.now() }) {
+function evaluateAgyModelPools({ agyUsage, projectPolicy, codexPacing, nowMs = Date.now() }) {
   const poolsCfg = projectPolicy?.agy_model_pools || {};
+  const window7dMs = (projectPolicy?.agy_pacing?.window_minutes || DEFAULT_AGY_PACING.window_minutes) * 60 * 1000;
   const result = {};
   for (const [name, cfg] of Object.entries(poolsCfg)) {
     const token = String(cfg.match || name).toLowerCase();
@@ -651,6 +652,30 @@ function evaluateAgyModelPools({ agyUsage, projectPolicy, nowMs = Date.now() }) 
     const used7d = valid7d ? round2(clamp(snap.weekly_used_percent, 0, 100))
       : (cfg.window_7d_tokens && typeof tokens7d === 'number' ? round2(clamp((tokens7d / cfg.window_7d_tokens) * 100, 0, 100)) : null);
 
+    let weeklyResetsAtMs = valid7d && snap.weekly_resets_at && Number.isFinite(Date.parse(snap.weekly_resets_at))
+      ? Date.parse(snap.weekly_resets_at) : null;
+    if (!weeklyResetsAtMs && projectPolicy?.agy_pacing?.weekly_resets_at) {
+      weeklyResetsAtMs = advanceResetAnchor(Date.parse(projectPolicy.agy_pacing.weekly_resets_at), window7dMs, nowMs);
+    }
+    if (!weeklyResetsAtMs && codexPacing?.available && codexPacing.resets_at) {
+      weeklyResetsAtMs = Date.parse(codexPacing.resets_at);
+    }
+
+    let elapsedPercent = null, targetUsedPercent = null, pacingDelta = null, band = 'uncalibrated';
+    if (used7d !== null && Number.isFinite(weeklyResetsAtMs)) {
+      const remainingMs = Math.max(0, weeklyResetsAtMs - nowMs);
+      const elapsedRatio = clamp(1 - remainingMs / window7dMs, 0, 1);
+      elapsedPercent = round2(elapsedRatio * 100);
+      targetUsedPercent = round2(elapsedRatio * cfg.weekly_protect_used_percent);
+      pacingDelta = round2(used7d - targetUsedPercent);
+      if (used7d >= cfg.weekly_protect_used_percent) band = 'hard_stop';
+      else if (pacingDelta > 5) band = 'ahead_of_pace';
+      else if (pacingDelta >= -3) band = 'on_pace';
+      else band = 'below_pace';
+    } else if (used7d !== null && used7d >= cfg.weekly_protect_used_percent) {
+      band = 'hard_stop';
+    }
+
     const cooling = cooldownActive(cfg.cooldown, nowMs);
     const weeklyStopped = used7d !== null && used7d >= cfg.weekly_protect_used_percent;
     const fiveHourLimited = cooling || (used5h !== null && used5h >= cfg.window_5h_protect_percent);
@@ -667,6 +692,11 @@ function evaluateAgyModelPools({ agyUsage, projectPolicy, nowMs = Date.now() }) 
       buffer_percent: round2(Math.max(0, 100 - cfg.weekly_protect_used_percent)),
       weekly_used_percent: used7d,
       weekly_remaining_percent: used7d !== null ? round2(Math.max(0, 100 - used7d)) : null,
+      usable_remaining_percent: used7d !== null ? round2(Math.max(0, cfg.weekly_protect_used_percent - used7d)) : null,
+      elapsed_percent: elapsedPercent,
+      target_used_percent: targetUsedPercent,
+      pacing_delta: pacingDelta,
+      band,
       five_hour_used_percent: used5h,
       five_hour_caution_percent: cfg.window_5h_caution_percent,
       five_hour_protect_percent: cfg.window_5h_protect_percent,
@@ -978,7 +1008,7 @@ function decideRoute(input = {}) {
     }
   }
 
-  const agyPools = evaluateAgyModelPools({ agyUsage, projectPolicy: policy, nowMs });
+  const agyPools = evaluateAgyModelPools({ agyUsage, projectPolicy: policy, codexPacing, nowMs });
   const poolForModel = modelStr => {
     if (!modelStr || typeof modelStr !== 'string') return null;
     const lower = modelStr.toLowerCase();
