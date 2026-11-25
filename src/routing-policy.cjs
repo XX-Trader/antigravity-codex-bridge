@@ -54,6 +54,15 @@ const DEFAULT_AGY_TIERS = Object.freeze({
   expert: 'inherit'
 });
 
+const DEFAULT_AGY_GUARD = Object.freeze({
+  max_same_error_failures: 3,    // Same normalized error 3x in a row => genuine loop, stop!
+  max_consecutive_failures: 8,   // Distinct errors are allowed to self-heal; safety cap at 8 with zero successes
+  review_gate: 'advisory',       // 'off' | 'advisory' | 'strict'
+  review_valid_hours: 12,
+  quota_error_cooldown_minutes: 15
+});
+const REVIEW_GATES = new Set(['off', 'advisory', 'strict']);
+
 const round2 = value => Math.round(value * 100) / 100;
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const samePath = (a, b) => process.platform === 'win32'
@@ -109,6 +118,7 @@ function defaultPolicy() {
     projects: {},
     pacing: { ...DEFAULT_PACING },
     agy_pacing: { ...DEFAULT_AGY_PACING },
+    agy_guard: { ...DEFAULT_AGY_GUARD },
     agy_tiers: { ...DEFAULT_AGY_TIERS },
     subagent_default_model: 'flash',
     subagent_research_model: 'flash_lite',
@@ -148,6 +158,9 @@ function parsePolicy(raw) {
         if (entry.review_category && ['general', 'quant'].includes(entry.review_category)) next.review_category = entry.review_category;
         if (entry.subagent_default_model !== undefined) next.subagent_default_model = normalizeSubagentModel(entry.subagent_default_model, base.subagent_default_model);
         if (entry.enforce_subagent_low_cost !== undefined) next.enforce_subagent_low_cost = Boolean(entry.enforce_subagent_low_cost);
+        if (typeof entry.agy_review_gate === 'string' && REVIEW_GATES.has(entry.agy_review_gate.trim().toLowerCase())) {
+          next.agy_review_gate = entry.agy_review_gate.trim().toLowerCase();
+        }
         projects[root] = next;
       }
     }
@@ -199,6 +212,25 @@ function parsePolicy(raw) {
       ap.weekly_resets_at = new Date(Date.parse(raw.agy_pacing.weekly_resets_at)).toISOString();
     }
     policy.agy_pacing = ap;
+  }
+  if (raw.agy_guard && typeof raw.agy_guard === 'object' && !Array.isArray(raw.agy_guard)) {
+    const ag = { ...base.agy_guard };
+    if (typeof raw.agy_guard.max_same_error_failures === 'number' && Number.isFinite(raw.agy_guard.max_same_error_failures) && raw.agy_guard.max_same_error_failures >= 0 && raw.agy_guard.max_same_error_failures <= 20) {
+      ag.max_same_error_failures = Math.floor(raw.agy_guard.max_same_error_failures);
+    }
+    if (typeof raw.agy_guard.max_consecutive_failures === 'number' && Number.isFinite(raw.agy_guard.max_consecutive_failures) && raw.agy_guard.max_consecutive_failures >= 0 && raw.agy_guard.max_consecutive_failures <= 50) {
+      ag.max_consecutive_failures = Math.floor(raw.agy_guard.max_consecutive_failures);
+    }
+    if (typeof raw.agy_guard.review_gate === 'string' && REVIEW_GATES.has(raw.agy_guard.review_gate.trim().toLowerCase())) {
+      ag.review_gate = raw.agy_guard.review_gate.trim().toLowerCase();
+    }
+    if (typeof raw.agy_guard.review_valid_hours === 'number' && Number.isFinite(raw.agy_guard.review_valid_hours) && raw.agy_guard.review_valid_hours >= 1 && raw.agy_guard.review_valid_hours <= 168) {
+      ag.review_valid_hours = raw.agy_guard.review_valid_hours;
+    }
+    if (typeof raw.agy_guard.quota_error_cooldown_minutes === 'number' && Number.isFinite(raw.agy_guard.quota_error_cooldown_minutes) && raw.agy_guard.quota_error_cooldown_minutes >= 1 && raw.agy_guard.quota_error_cooldown_minutes <= 300) {
+      ag.quota_error_cooldown_minutes = Math.floor(raw.agy_guard.quota_error_cooldown_minutes);
+    }
+    policy.agy_guard = ag;
   }
   if (raw.agy_tiers && typeof raw.agy_tiers === 'object' && !Array.isArray(raw.agy_tiers)) {
     const tiers = { ...base.agy_tiers };
@@ -314,6 +346,7 @@ function resolveProjectPolicy(policy, projectScope) {
     enforce_subagent_low_cost: override?.enforce_subagent_low_cost ?? base.enforce_subagent_low_cost,
     pacing: { ...base.pacing },
     agy_pacing: { ...base.agy_pacing },
+    agy_guard: { ...base.agy_guard, ...(override?.agy_review_gate ? { review_gate: override.agy_review_gate } : {}) },
     agy_quota_hint: base.agy_quota_hint,
     agy_manual_snapshot: base.agy_manual_snapshot ? { ...base.agy_manual_snapshot } : null,
     agy_quota_command: base.agy_quota_command,
@@ -422,7 +455,8 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
   }
 
   const agyCooling = cooldownActive(projectPolicy?.cooldowns?.agy, nowMs);
-  const recentQuotaErr = agyUsage?.auto_degraded === true;
+  const guardCooling = cooldownActive(projectPolicy?.guard_quota_cooldown, nowMs);
+  const recentQuotaErr = agyUsage?.auto_degraded === true || guardCooling;
   const hintLow = projectPolicy?.agy_quota_hint === 'low';
   let status5h = 'ok';
   let reason5h = null;
@@ -970,6 +1004,7 @@ module.exports = {
   MODE_ALIASES,
   DEFAULT_PACING,
   DEFAULT_AGY_PACING,
+  DEFAULT_AGY_GUARD,
   DEFAULT_AGY_TIERS,
   normalizeMode,
   normalizeSubagentModel,

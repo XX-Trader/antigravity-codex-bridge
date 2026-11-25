@@ -14,6 +14,7 @@ const {
   resolveProjectPolicy,
   activeCodexTasks
 } = require('../src/routing-policy.cjs');
+const { defaultGuardStatePath, resetAgyGuard } = require('../src/agy-guard.cjs');
 
 function usage() {
   return [
@@ -27,6 +28,8 @@ function usage() {
     '  agy-hint --level plenty|normal|low [--config MCP_JSON] [--policy POLICY_JSON]',
     '  agy-quota [--weekly-used PCT] [--weekly-reset ISO] [--5h-used PCT] [--5h-reset ISO] [--clear]',
     '  agy-budget [--tokens-5h N] [--tokens-7d N] [--weekly-reset ISO] [--5h-caution PCT] [--5h-protect PCT] [--clear]',
+    '  agy-review-gate --level off|advisory|strict [--project ABS_PATH] [--valid-hours N] [--max-same N] [--max-total N]',
+    '  reset-agy-guard [--conversation UUID] [--policy POLICY_JSON]',
     '  quant-thinking (--model NAME | --clear) [--config MCP_JSON] [--policy POLICY_JSON]',
     '  tier [--simple MODEL] [--standard MODEL] [--complex MODEL] [--expert MODEL] [--enforce-low-cost true|false]',
     '  cooldown --engine codex|agy --minutes N [--reason TEXT]',
@@ -198,6 +201,42 @@ async function run(argv) {
     current.agy_pacing = ap;
     const saved = saveRoutingPolicy(policyFile, current);
     return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_pacing: saved.agy_pacing }, null, 2);
+  }
+
+  if (opts.command === 'agy-review-gate') {
+    const level = opts.level !== undefined ? String(opts.level).trim().toLowerCase() : undefined;
+    if (level !== undefined && !['off', 'advisory', 'strict'].includes(level)) throw new Error('--level must be off, advisory, or strict');
+    if (opts.project) {
+      if (!level) throw new Error('--level is required when setting a project override');
+      const target = fs.existsSync(opts.project) ? fs.realpathSync(opts.project) : path.resolve(opts.project);
+      current.projects[target] = { ...(current.projects[target] || {}), agy_review_gate: level };
+    } else {
+      current.agy_guard = { ...(current.agy_guard || {}) };
+      if (level !== undefined) current.agy_guard.review_gate = level;
+    }
+    if (opts['valid-hours'] !== undefined) {
+      const n = Number(opts['valid-hours']);
+      if (!Number.isFinite(n) || n < 1 || n > 168) throw new Error('--valid-hours must be in 1..168');
+      current.agy_guard = { ...(current.agy_guard || {}), review_valid_hours: n };
+    }
+    if (opts['max-same'] !== undefined) {
+      const n = Number(opts['max-same']);
+      if (!Number.isFinite(n) || n < 0 || n > 20) throw new Error('--max-same must be in 0..20');
+      current.agy_guard = { ...(current.agy_guard || {}), max_same_error_failures: Math.floor(n) };
+    }
+    if (opts['max-total'] !== undefined) {
+      const n = Number(opts['max-total']);
+      if (!Number.isFinite(n) || n < 0 || n > 50) throw new Error('--max-total must be in 0..50');
+      current.agy_guard = { ...(current.agy_guard || {}), max_consecutive_failures: Math.floor(n) };
+    }
+    const saved = saveRoutingPolicy(policyFile, current);
+    return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_guard: saved.agy_guard, projects: saved.projects }, null, 2);
+  }
+
+  if (opts.command === 'reset-agy-guard') {
+    const stateFile = defaultGuardStatePath(policyFile, settings);
+    const next = resetAgyGuard(stateFile, opts.conversation || null);
+    return JSON.stringify({ state: 'reset', guard_state_path: stateFile, conversation: opts.conversation || 'all', remaining_conversations: Object.keys(next.conversations).length }, null, 2);
   }
 
   if (opts.command === 'quant-thinking') {

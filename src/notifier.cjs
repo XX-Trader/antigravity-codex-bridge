@@ -14,6 +14,10 @@ function contextHook(payload, project, options) {
   const projects = typeof project === 'string' ? [{ project: fs.realpathSync(project) }] : project;
   return require('./router.cjs').contextHook(payload, projects, options);
 }
+function postToolHook(payload, project, options) {
+  const projects = typeof project === 'string' ? [{ project: fs.realpathSync(project) }] : project;
+  return require('./router.cjs').postToolHook(payload, projects, options);
+}
 
 function agentCall(executable, args) {
   return new Promise((resolve, reject) => {
@@ -403,10 +407,11 @@ function watch(broker, send, options = {}) {
   interval = setInterval(reconcile, health.interval_ms);
   heartbeat(); void drain(); return { close, reconcile };
 }
-module.exports = { originHook, contextHook, deliver, watch, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
+module.exports = { originHook, contextHook, postToolHook, deliver, watch, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
 if (require.main === module) {
-  if (process.argv[2] === '--origin-hook' || process.argv[2] === '--context-hook') {
-    const isContext = process.argv[2] === '--context-hook';
+  if (['--origin-hook', '--context-hook', '--post-tool-hook'].includes(process.argv[2])) {
+    const mode = process.argv[2];
+    const failOpen = mode !== '--origin-hook';
     let input = '';
     process.stdin.setEncoding('utf8'); process.stdin.on('data', data => { input += data; });
     process.stdin.on('end', () => {
@@ -417,11 +422,11 @@ if (require.main === module) {
           const settings = config({ ...process.env, ...entry.env }); project = settings.projects || [settings];
         }
         const payload = input.trim() ? JSON.parse(input) : {};
-        const reply = isContext ? contextHook(payload, project) : originHook(payload, project);
+        const reply = mode === '--context-hook' ? contextHook(payload, project) : mode === '--post-tool-hook' ? postToolHook(payload, project) : originHook(payload, project);
         process.stdout.write(JSON.stringify(reply) + '\n');
       }
       catch (error) {
-        if (isContext) process.stdout.write('{}\n');
+        if (failOpen) process.stdout.write('{}\n');
         else process.stdout.write(JSON.stringify({ decision: 'deny', reason: `无法验证当前项目及任务身份，未执行：${error.message}` }) + '\n');
       }
     });

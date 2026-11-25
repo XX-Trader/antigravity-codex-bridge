@@ -304,6 +304,11 @@ Antigravity 切换回读：两个 MCP 入口均引用当前 main 所在的同一
 - **AGY 对称执行档位**（默认，可通过本机策略自定义）：`simple`/只读 `research` → `flash_lite`，`standard`（执行默认兜底）→ `flash`，`complex` → `pro`，`expert` → `inherit`。在 `auto`/`agy` 模式下，`PreToolUse` Hook 通过官方 `overwrite` 自动把未指定模型（或普通子任务误传 `inherit`）的 `invoke_subagent` 路由到低成本档位，防止误烧高配主模型。
 - **量化策略研究最强思考**：可在本地策略中通过 `scripts/Mode.ps1 quant-thinking --model MODEL_NAME` 配置本机量化最强思考模型（不写入公开仓库代码）。在 `review_category=quant` 项目中，`SessionStart`/`PreInvocation` 钩子会核对主会话模型并在不匹配时提示切换；同时量化策略思考类子任务显式保留 `inherit`/`pro` 不降级，日常清洗/检索/测试仍下沉低成本执行。
 
+### AGY 黄金混血审核与智能防死循环门禁
+
+- **先审后做门禁（`agy_guard.review_gate`）**：支持全局或按项目配置 `off` / `advisory`（默认）/ `strict`。在 `strict` 模式下，AGY 执行写文件或启动非只读执行子代理前，`PreToolUse` 会核查当前项目最近 `review_valid_hours`（默认 12 小时）内是否存在已通过的 Codex 独立审核回执（`plan_review.status=approved`）；缺失时返回 `[AGY_REVIEW_REQUIRED]`，只读 `read_file` 与 `research` 子代理不受阻。
+- **智能防死循环（`PostToolUse` + `PreToolUse`）**：区分“正常多点排错”与“同错死循环”——不同文件或不同错误连续失败时允许代理自主修复；仅当**同一规范化错误连续重复 3 次**（`max_same_error_failures=3`）或**连续 8 次工具全失败且中间零成功进展**（`max_consecutive_failures=8`）才触发 `[AGY_LOOP_GUARD]` 熔断。任何成功执行或新用户输入自动清零；捕获 429/配额错仅触发 AGY 15 分钟冷却交由 Codex 兜底，不计实现失败。
+
 ### 常用控制命令（免重启）
 
 ```pwsh
@@ -315,5 +320,7 @@ pwsh -NoProfile -File scripts/Mode.ps1 quant-thinking --model 'YOUR_STRONGEST_TH
 pwsh -NoProfile -File scripts/Mode.ps1 agy-hint --level low
 pwsh -NoProfile -File scripts/Mode.ps1 agy-quota --weekly-used 35 --weekly-reset '2026-11-28T15:14:55Z' --5h-used 40 --5h-reset '2026-11-25T13:00:00Z'
 pwsh -NoProfile -File scripts/Mode.ps1 agy-budget --tokens-5h 8000000 --tokens-7d 80000000
+pwsh -NoProfile -File scripts/Mode.ps1 agy-review-gate --level strict --project 'C:/work/my-project'
+pwsh -NoProfile -File scripts/Mode.ps1 reset-agy-guard
 pwsh -NoProfile -File scripts/Mode.ps1 cooldown --engine agy --minutes 60 --reason '5h quota low'
 ```

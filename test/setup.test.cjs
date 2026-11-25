@@ -22,8 +22,10 @@ test('quote-free hook survives normal argv escaping, raw CMD and shell transport
     const plan = buildPlan({ ...f.options, home, project, pwsh }); apply(plan);
     const hooks = JSON.parse(fs.readFileSync(path.join(home, '.gemini/config/hooks.json'), 'utf8'));
     const command = hooks['codex-executor-origin'].PreToolUse[0].hooks[0].command;
+    const postCommand = hooks['codex-executor-origin'].PostToolUse[0].hooks[0].command;
     const contextCommand = hooks['codex-executor-origin'].SessionStart[0].command;
     assert.doesNotMatch(command, /["']/); assert.doesNotMatch(command, /-NodeEntry|^&|^call /);
+    assert.doesNotMatch(postCommand, /["']/); assert.doesNotMatch(postCommand, /-NodeEntry|^&|^call /);
     assert.doesNotMatch(contextCommand, /["']/); assert.doesNotMatch(contextCommand, /-NodeEntry|^&|^call /);
     assert.equal(hooks['codex-executor-origin'].PreInvocation[0].command, contextCommand);
     assert.ok(plan.entry.enabledTools.includes('codex_quota'));

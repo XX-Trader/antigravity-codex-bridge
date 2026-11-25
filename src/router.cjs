@@ -14,6 +14,12 @@ const {
   scanAgyTranscriptUsage,
   saveAtomic
 } = require('./routing-policy.cjs');
+const {
+  defaultGuardStatePath,
+  checkAgyExecutionGate,
+  recordToolOutcome,
+  readGuardQuotaCooldown
+} = require('./agy-guard.cjs');
 
 const real = p => fs.realpathSync(p);
 const same = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
@@ -54,14 +60,22 @@ function bindOrigin(payload, projects, options = {}) {
   if (!match) {
     const scopes = scopesFor(payload.workspacePaths || [], projects);
     if (!executionPattern.test(name) || !scopes.length) return { decision: 'allow' };
-    const { selected } = effectiveScopePolicy(scopes, options);
+    const { policyPath, selected } = effectiveScopePolicy(scopes, options);
     const projectPolicy = selected.policy;
     if (projectPolicy.mode === 'codex') {
       return { decision: 'deny', reason: '本项目当前处于 codex 锁定模式：由 Antigravity 规划和验收，执行必须交给 codex_run；需要子 agent 时由 Codex 会话启动原生子 agent。如需同时启用 AGY 低成本多子代理，请将模式切回 auto 或 agy。' };
     }
+    const gate = checkAgyExecutionGate(payload, selected.scope, projectPolicy, {
+      policyPath,
+      guardStateFile: options.guardStateFile,
+      nowMs: options.nowMs
+    });
+    if (gate.blocked) return { decision: 'deny', reason: gate.reason };
     const args = payload.toolCall?.args || {};
     const active = activeCodexTasks(selected.scope);
     const notes = [];
+    if (gate.advisory) notes.push(gate.advisory);
+    if (gate.review) notes.push(`已关联 Codex 只读审核(${gate.review.job_id.slice(0, 8)})。`);
     let overwrite;
     if (subagentInvokePattern.test(name)) {
       const sub = evaluateSubagentCall(args, projectPolicy);
@@ -111,7 +125,9 @@ function contextHook(payload, projects, options = {}) {
   const scopes = scopesFor(payload?.workspacePaths || [], projects);
   if (!scopes.length) return {};
   const { rawPolicy, policyPath, selected } = effectiveScopePolicy(scopes, options);
-  const projectPolicy = selected.policy;
+  const guardFile = options.guardStateFile || defaultGuardStatePath(policyPath, selected.scope);
+  const guardCooldown = readGuardQuotaCooldown(guardFile, options.nowMs);
+  const projectPolicy = { ...selected.policy, ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
   const cachePath = options.cachePath || defaultQuotaCachePath(policyPath, selected.scope);
   const cached = readQuotaCache(cachePath, Math.max(projectPolicy.cache_ttl_seconds || 60, 300), options.nowMs);
   const agyUsage = cached?.agy_usage || scanAgyTranscriptUsage({ transcriptPath: payload?.transcriptPath, brainDir: options.brainDir, nowMs: options.nowMs });
@@ -155,7 +171,8 @@ function contextHook(payload, projects, options = {}) {
   const lines = [
     `[双引擎路由状态] ${route.summary_line}`,
     `执行模式：${route.mode}（支持缩写 agy/AGY/Agy 与 codex；用户显式点名优先；同事项粘性锁定单执行端；Codex 与 AGY 均按 7 天 100% 等比例均衡，AGY 叠加 5 小时窗口限制，AGY 5h 吃紧/受限时由 Codex 兜底）。`,
-    `AGY 低成本多子代理分层：simple/research→${projectPolicy.agy_tiers.simple}，standard(默认)→${projectPolicy.agy_tiers.standard}，complex→${projectPolicy.agy_tiers.complex}，expert→${projectPolicy.agy_tiers.expert}；高配主会话做拆解与验收，多步执行下沉低成本子代理，批量扇出用 run_workflow，并行写用 Workspace="share"，Git 串行收口。`
+    `AGY 低成本多子代理分层：simple/research→${projectPolicy.agy_tiers.simple}，standard(默认)→${projectPolicy.agy_tiers.standard}，complex→${projectPolicy.agy_tiers.complex}，expert→${projectPolicy.agy_tiers.expert}；高配主会话做拆解与验收，多步执行下沉低成本子代理，批量扇出用 run_workflow，并行写用 Workspace="share"，Git 串行收口。`,
+    `AGY 安全门禁：先审后做=${projectPolicy.agy_guard.review_gate}（重要/量化改动建议先 codex_run(review_only=true) 再交 AGY 实施）；防死循环=同一错误连错 ${projectPolicy.agy_guard.max_same_error_failures} 次或无进展连错 ${projectPolicy.agy_guard.max_consecutive_failures} 次自动熔断（不同错误允许自行修复，成功即清零）。`
   ];
   if (route.thinking_guidance?.reminder) lines.push(`[思考模型提示] ${route.thinking_guidance.reminder}`);
   if (active.count > 0) lines.push(`[并发防撞] 当前项目有 ${active.count} 个活跃 Codex 任务；AGY 写操作请避开重叠文件或使用 Workspace="share"。`);
@@ -163,6 +180,19 @@ function contextHook(payload, projects, options = {}) {
   return {
     injectSteps: [{ systemMessage: { systemMessage: lines.join('\n') } }]
   };
+}
+
+function postToolHook(payload, projects, options = {}) {
+  const scopes = scopesFor(payload?.workspacePaths || [], projects);
+  if (!scopes.length) return {};
+  const { policyPath, selected } = effectiveScopePolicy(scopes, options);
+  if (selected.policy.mode === 'codex') return {};
+  recordToolOutcome(payload, selected.scope, selected.policy, {
+    policyPath,
+    guardStateFile: options.guardStateFile,
+    nowMs: options.nowMs
+  });
+  return {};
 }
 
 class ProjectRouter {
@@ -219,4 +249,4 @@ class ProjectRouter {
   }
 }
 
-module.exports = { ProjectRouter, bindOrigin, contextHook, hookMatcher };
+module.exports = { ProjectRouter, bindOrigin, contextHook, postToolHook, hookMatcher };

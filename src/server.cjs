@@ -25,6 +25,7 @@ const {
   readQuotaCache,
   writeQuotaCache
 } = require('./routing-policy.cjs');
+const { defaultGuardStatePath, readGuardQuotaCooldown } = require('./agy-guard.cjs');
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'timed_out', 'needs_input', 'blocked', 'execution_blocked', 'review_revise', 'review_needs_evidence']);
 const capacityMessage = 'Selected model is at capacity. Please try a different model';
@@ -735,7 +736,8 @@ class Broker {
     const nowMs = Date.now();
     const policyPath = defaultPolicyPath(this.settings);
     const policy = loadRoutingPolicy(policyPath);
-    const projectPolicy = resolveProjectPolicy(policy, this.settings);
+    const guardCooldown = readGuardQuotaCooldown(defaultGuardStatePath(policyPath, this.settings), nowMs);
+    const projectPolicy = { ...resolveProjectPolicy(policy, this.settings), ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
     const cachePath = defaultQuotaCachePath(policyPath, this.settings);
     const cached = input.refresh === true ? null : readQuotaCache(cachePath, projectPolicy.cache_ttl_seconds, nowMs);
     let codexPacing = cached?.codex_pacing || null;

@@ -18,9 +18,10 @@ const {
   evaluateSubagentCall,
   isAgyQuotaError
 } = require('../src/routing-policy.cjs');
-const { bindOrigin, contextHook, hookMatcher, ProjectRouter } = require('../src/router.cjs');
+const { bindOrigin, contextHook, postToolHook, hookMatcher, ProjectRouter } = require('../src/router.cjs');
 const { Broker, dispatch, save } = require('../src/server.cjs');
 const { run: runModeCli } = require('../scripts/mode.cjs');
+const { loadGuardState, readGuardQuotaCooldown } = require('../src/agy-guard.cjs');
 
 function fixture(t) {
   const base = fs.realpathSync(process.env.CODEX_EXECUTOR_TEST_ROOT);
@@ -395,4 +396,112 @@ test('dual 7-day 100% proportional pacing + AGY 5-hour limit guard + Codex fallb
   assert.equal(apBudget.window_7d.available, true);
   assert.equal(apBudget.window_7d.used_percent, 40);
   assert.equal(apBudget.window_7d.pacing_delta, -10);
+});
+
+test('AGY smart loop guard allows distinct errors to self-heal, trips only on 3 identical repeats or 8 no-progress cap, and resets on success or human turn', t => {
+  const f = fixture(t);
+  const projects = [{ project: f.project, data: f.data, review_category: 'general' }];
+  const convId = '33333333-3333-3333-3333-333333333333';
+  const guardFile = path.join(f.root, 'runtime', 'agy-guard-state.json');
+  const opts = { policyPath: f.policyPath, guardStateFile: guardFile };
+
+  // 1. Three DIFFERENT errors in different places must NOT trip the guard (keeps efficiency high)
+  for (const [tool, args, error] of [
+    ['run_command', { CommandLine: 'npm test' }, 'ReferenceError: foo is not defined at a.js:12'],
+    ['edit_file', { Path: 'src/b.js' }, 'Target not found in src/b.js'],
+    ['run_command', { CommandLine: 'npm run lint' }, 'ESLint error: unused variable bar']
+  ]) {
+    postToolHook({ conversationId: convId, workspacePaths: [f.project], lastUserInput: 'fix bugs', toolCall: { name: tool, args }, error }, projects, opts);
+  }
+  const afterDistinct = bindOrigin({ conversationId: convId, workspacePaths: [f.project], lastUserInput: 'fix bugs', toolCall: { name: 'edit_file', args: { Path: 'src/c.js' } } }, projects, opts);
+  assert.equal(afterDistinct.decision, 'allow', 'Distinct errors must not prematurely halt normal debugging');
+
+  // 2. One successful tool call resets consecutive failure count completely
+  postToolHook({ conversationId: convId, workspacePaths: [f.project], lastUserInput: 'fix bugs', toolCall: { name: 'edit_file', args: { Path: 'src/c.js' } } }, projects, opts);
+  assert.equal(loadGuardState(guardFile).conversations[convId].consecutive_failures, 0);
+
+  // 3. Three IDENTICAL normalized errors (even with changing timestamps/line numbers) trip the loop guard
+  for (const line of [10, 14, 22]) {
+    postToolHook({
+      conversationId: convId,
+      workspacePaths: [f.project],
+      lastUserInput: 'fix bugs',
+      toolCall: { name: 'run_command', args: { CommandLine: 'pytest tests/test_alpha.py' } },
+      error: `2026-11-25T10:00:${line}Z AssertionError: mismatch at test_alpha.py:${line} (120ms)`
+    }, projects, opts);
+  }
+  const tripped = bindOrigin({ conversationId: convId, workspacePaths: [f.project], lastUserInput: 'fix bugs', toolCall: { name: 'edit_file', args: { Path: 'src/a.py' } } }, projects, opts);
+  assert.equal(tripped.decision, 'deny');
+  assert.match(tripped.reason, /\[AGY_LOOP_GUARD\]/);
+  assert.match(tripped.reason, /同一错误已连续重复失败 3 次/);
+
+  // Read-only research subagent remains allowed even while tripped
+  const readOnly = bindOrigin({ conversationId: convId, workspacePaths: [f.project], lastUserInput: 'fix bugs', toolCall: { name: 'invoke_subagent', args: { TypeName: 'research', Role: 'Diagnose', Prompt: 'check logs' } } }, projects, opts);
+  assert.equal(readOnly.decision, 'allow');
+
+  // 4. New human input automatically unlocks the tripped guard
+  const unlocked = bindOrigin({ conversationId: convId, workspacePaths: [f.project], lastUserInput: '换个方向排查并重跑', toolCall: { name: 'edit_file', args: { Path: 'src/a.py' } } }, projects, opts);
+  assert.equal(unlocked.decision, 'allow');
+
+  // 5. 429 quota error sets AGY cooldown (triggers Codex fallback) without counting as business failure; 401 auth error does neither
+  postToolHook({ conversationId: convId, workspacePaths: [f.project], lastUserInput: '换个方向排查并重跑', toolCall: { name: 'invoke_subagent', args: { TypeName: 'self' } }, error: '401 Unauthenticated invalid token' }, projects, opts);
+  assert.equal(loadGuardState(guardFile).conversations[convId].consecutive_failures, 0);
+  assert.equal(readGuardQuotaCooldown(guardFile), null);
+
+  postToolHook({ conversationId: convId, workspacePaths: [f.project], lastUserInput: '换个方向排查并重跑', toolCall: { name: 'invoke_subagent', args: { TypeName: 'self' } }, error: 'HTTP 429 RESOURCE_EXHAUSTED quota exceeded' }, projects, opts);
+  assert.equal(loadGuardState(guardFile).conversations[convId].consecutive_failures, 0);
+  assert.ok(readGuardQuotaCooldown(guardFile)?.until);
+
+  // 6. Safety cap at 8 distinct consecutive failures with zero successes still trips no_progress_cap
+  for (let i = 1; i <= 8; i++) {
+    postToolHook({ conversationId: convId, workspacePaths: [f.project], lastUserInput: '大范围排查', toolCall: { name: 'run_command', args: { CommandLine: `check_${i}` } }, error: `distinct error number ${i}` }, projects, opts);
+  }
+  const capTripped = bindOrigin({ conversationId: convId, workspacePaths: [f.project], lastUserInput: '大范围排查', toolCall: { name: 'run_command', args: { CommandLine: 'next' } } }, projects, opts);
+  assert.equal(capTripped.decision, 'deny');
+  assert.match(capTripped.reason, /已连续失败 8 次且中间无成功进展/);
+});
+
+test('Hybrid review-before-AGY gate blocks writes in strict mode until Codex review_only approval exists, and CLI configures/resets guards', async t => {
+  const f = fixture(t);
+  const projects = [{ project: f.quantProject, data: f.quantData, review_category: 'quant' }];
+  const convId = '44444444-4444-4444-4444-444444444444';
+  const guardFile = path.join(f.root, 'runtime', 'agy-guard-state.json');
+  const opts = { policyPath: f.policyPath, guardStateFile: guardFile };
+
+  // Default advisory mode allows writes in quant project with a helpful reminder
+  const adv = bindOrigin({ conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'edit_file', args: { Path: 'strategy.py' } } }, projects, opts);
+  assert.equal(adv.decision, 'allow');
+  assert.match(adv.reason, /review_only=true/);
+
+  // Switch this project to strict via Mode CLI
+  const gateOut = JSON.parse(await runModeCli(['agy-review-gate', '--level', 'strict', '--project', f.quantProject, '--max-same', '3', '--max-total', '8', '--policy', f.policyPath]));
+  assert.equal(gateOut.projects[fs.realpathSync(f.quantProject)].agy_review_gate, 'strict');
+
+  // Without approved Codex review, AGY write & execution subagent are denied while read-only research stays allowed
+  const deniedWrite = bindOrigin({ conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'edit_file', args: { Path: 'strategy.py' } } }, projects, opts);
+  assert.equal(deniedWrite.decision, 'deny');
+  assert.match(deniedWrite.reason, /\[AGY_REVIEW_REQUIRED\]/);
+  const allowedResearch = bindOrigin({ conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'invoke_subagent', args: { TypeName: 'research', Role: 'Inspect', Prompt: 'read code' } } }, projects, opts);
+  assert.equal(allowedResearch.decision, 'allow');
+
+  // Seed a recent approved Codex review_only receipt in this project => AGY execution immediately unlocks
+  const reviewJobId = '222222222222222222222222';
+  fs.mkdirSync(path.join(f.quantData, 'jobs', reviewJobId), { recursive: true });
+  save(path.join(f.quantData, 'jobs', reviewJobId, 'job.json'), {
+    job_id: reviewJobId,
+    conversation_id: convId,
+    review_only: true,
+    stage: 'review_complete',
+    status: 'completed',
+    created_at: new Date().toISOString(),
+    plan_review: { status: 'approved', reviewed_at: new Date().toISOString(), allowed_scope: ['只修改 strategy.py'], reason: '审核通过' }
+  });
+  const allowedAfterReview = bindOrigin({ conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'invoke_subagent', args: { TypeName: 'self', Role: 'Implement', Prompt: '按审核实施' } } }, projects, opts);
+  assert.equal(allowedAfterReview.decision, 'allow');
+  assert.equal(allowedAfterReview.overwrite.Model, 'flash');
+  assert.match(allowedAfterReview.reason, /已关联 Codex 只读审核\(22222222\)/);
+
+  // reset-agy-guard CLI clears saved guard state cleanly
+  const resetOut = JSON.parse(await runModeCli(['reset-agy-guard', '--policy', f.policyPath]));
+  assert.equal(resetOut.state, 'reset');
 });
