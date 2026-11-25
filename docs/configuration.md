@@ -281,3 +281,35 @@ Antigravity 切换回读：两个 MCP 入口均引用当前 main 所在的同一
 按用户要求，桥接仓库自身允许 Antigravity 直接修改、测试和上传，不再要求通过 Codex MCP 派发；保持自身未登记与规则排除，其它业务项目的执行约束不变。用户随后明确授权更新 main；2026-11-19 21:40（UTC+8），修复提交 `acbba4834dfef09d9758b0ee72177d89b05a400a` 已快进合入并普通推送到 main，远端 SHA 回读一致、分歧 0/0，工作区干净。切换 main 后源码与测试指纹不变，沿用上述 187/187 测试；没有创建 worktree。两个本机 MCP 入口仍指向同一源码目录，通知宿主运行指纹一致；两个现有 MCP 进程仍早于修复，重新尝试界面控制仍返回 `native pipe unavailable`，连接刷新与业务续接待验收。测试 fixture 已清理，最终测试日志和本次最小回滚记录保留在本功能外部运行目录，供宿主验收与回滚使用；没有新增工具、依赖环境或研究数据。
 
 任务分支 `fix/background-query-timeout` 已完整被远端 main 包含、独有提交为零且无 worktree 占用。首次按技能收尾尝试删除远端分支时，自动审批以“用户未明确授权删除任务分支”为由拒绝，未绕过。用户随后明确授权删除；重新核对远端 SHA、main 包含关系及工作树占用后，按预期 SHA 租约删除远端分支，并以 `git branch -d` 删除本地分支。独立回读确认两处分支均不存在，main 仍包含修复，其它分支未变。本段仅更新交付记录，不改运行器源码。
+
+## 双引擎负载均衡与 AGY 低成本多子代理
+
+桥接默认采用 `auto` 双引擎自动均衡模式（优先 Codex、7 天 100% 等比例消耗预算曲线、AGY 受限时由 Codex 兜底），也支持通过本机外部策略文件 `routing-policy.json`（位于默认运行目录的父目录，或由 `CODEX_EXECUTOR_ROUTING_CONFIG` 指定绝对路径，不进入 Git）随时切换为 `agy`（支持 `agy`/`AGY`/`Agy`/`antigravity` 缩写）或 `codex`（严格锁定模式），**无需重启 Antigravity 立即生效**。
+
+### 额度与熔断机制
+
+- **Codex 实时配额与 7 天等比例 Pacing**：通过本机 `codex --no-daemon app-server` 原生 JSON-RPC 方法 `account/rateLimits/read` 获取当前主窗口时长、已用百分比、精确重置时间、credits 与免费重置券（默认 60 秒本地缓存，`codex_quota(refresh=true)` 可强制刷新）。按公式 $P_{\text{target}} = \text{elapsedRatio} \times \text{target\_utilization}$ 与偏差 $\Delta = U - P_{\text{target}}$ 分段：
+  - `codex_priority`（$\Delta \le -3\%$）：未达到等比例消耗线，优先 Codex；
+  - `balanced`（$-3\% < \Delta \le +5\%$）：混合分流（Codex 主力/长后台/审核，AGY 低成本多子代理并行只读与中小改）；
+  - `agy_priority`（$\Delta > +5\%$ 或 $U \ge 92\%$）：优先 AGY 低成本多子代理，保留 Codex 撑满 7 天；
+  - `codex_protected`（$U \ge 97\%$ 或触发限流）：保护 Codex，新事项默认走 AGY；
+  - `codex_drain`（距重置 $\le 12\text{h}$ 且剩余 $\ge 10\%$）：末期冲刺优先 Codex，减少 7 天过期浪费。
+- **AGY 本地转录用量与 429 熔断**：由于 Antigravity 官方未提供公开的剩余额度百分比 API，桥接不探测未文档化的宿主私有接口，而是只读汇总本机 `brain/*/.system_generated/logs/transcript.jsonl` 近 5 小时与 7 天按模型分层的真实 token 消耗与近期配额限流错误（仅识别 429/quota/rate_limit，严格排除 401/403 认证和策略拒绝）。当 AGY 出现近期限流、处于手动冷却或被标记 `agy_quota_hint=low` 时，只要 Codex 未硬限流，路由立即回落由 **Codex 兜底**。
+- **可选外部探针**：可在本地 `routing-policy.json` 配置可选 `agy_quota_command`（命令行参数数组，输出含 `remaining_percent` 的 JSON），默认禁用；失败时显式报错，绝不伪造 100%。
+
+### 模型档位对齐与量化最强思考
+
+- **AGY 对称执行档位**（默认，可通过本机策略自定义）：`simple`/只读 `research` → `flash_lite`，`standard`（执行默认兜底）→ `flash`，`complex` → `pro`，`expert` → `inherit`。在 `auto`/`agy` 模式下，`PreToolUse` Hook 通过官方 `overwrite` 自动把未指定模型（或普通子任务误传 `inherit`）的 `invoke_subagent` 路由到低成本档位，防止误烧高配主模型。
+- **量化策略研究最强思考**：可在本地策略中通过 `scripts/Mode.ps1 quant-thinking --model MODEL_NAME` 配置本机量化最强思考模型（不写入公开仓库代码）。在 `review_category=quant` 项目中，`SessionStart`/`PreInvocation` 钩子会核对主会话模型并在不匹配时提示切换；同时量化策略思考类子任务显式保留 `inherit`/`pro` 不降级，日常清洗/检索/测试仍下沉低成本执行。
+
+### 常用控制命令（免重启）
+
+```pwsh
+pwsh -NoProfile -File scripts/Mode.ps1 status --refresh
+pwsh -NoProfile -File scripts/Mode.ps1 set --mode auto
+pwsh -NoProfile -File scripts/Mode.ps1 set --mode agy --project 'C:/work/my-project'
+pwsh -NoProfile -File scripts/Mode.ps1 set --mode codex --project 'C:/work/my-project'
+pwsh -NoProfile -File scripts/Mode.ps1 quant-thinking --model 'YOUR_STRONGEST_THINKING_MODEL'
+pwsh -NoProfile -File scripts/Mode.ps1 agy-hint --level low
+pwsh -NoProfile -File scripts/Mode.ps1 cooldown --engine agy --minutes 60 --reason '5h quota low'
+```

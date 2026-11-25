@@ -71,12 +71,12 @@ function buildPlan(options) {
   const found = projects.find(p => same(fs.realpathSync(p.project)) === same(project));
   if (found && same(fs.realpathSync(found.data)) !== same(data)) throw new Error('Project already has a different runtime directory; migrate the complete unit before changing it');
   if (!found) projects.push({ project, data });
-  Object.assign(env, { CODEX_EXECUTOR_PROJECT: env.CODEX_EXECUTOR_PROJECT || project, CODEX_EXECUTOR_DATA: env.CODEX_EXECUTOR_DATA || data, CODEX_EXECUTOR_PROJECTS: JSON.stringify(projects), CODEX_EXECUTOR_ENTRY: codex, CODEX_EXECUTOR_PWSH: pwsh, CODEX_EXECUTOR_REASONING_EFFORT: env.CODEX_EXECUTOR_REASONING_EFFORT || 'medium', CODEX_EXECUTOR_REVIEW_CONFIG: mcp, CODEX_EXECUTOR_BUILD: digest(['server.cjs', 'router.cjs', 'notifier.cjs', 'loop-guard.cjs', 'model-policy.cjs', 'invoke-codex.ps1', 'background.cjs', 'process-query.cjs', 'usage.cjs'].map(n => fs.readFileSync(path.join(root, 'src', n), 'utf8'))) });
+  Object.assign(env, { CODEX_EXECUTOR_PROJECT: env.CODEX_EXECUTOR_PROJECT || project, CODEX_EXECUTOR_DATA: env.CODEX_EXECUTOR_DATA || data, CODEX_EXECUTOR_PROJECTS: JSON.stringify(projects), CODEX_EXECUTOR_ENTRY: codex, CODEX_EXECUTOR_PWSH: pwsh, CODEX_EXECUTOR_REASONING_EFFORT: env.CODEX_EXECUTOR_REASONING_EFFORT || 'medium', CODEX_EXECUTOR_REVIEW_CONFIG: mcp, CODEX_EXECUTOR_BUILD: digest(['server.cjs', 'router.cjs', 'notifier.cjs', 'loop-guard.cjs', 'model-policy.cjs', 'routing-policy.cjs', 'invoke-codex.ps1', 'background.cjs', 'process-query.cjs', 'usage.cjs'].map(n => fs.readFileSync(path.join(root, 'src', n), 'utf8'))) });
   if (options.model) env.CODEX_EXECUTOR_MODEL = options.model;
   if (options.aliases) env.CODEX_EXECUTOR_MODEL_ALIASES = options.aliases;
   if (options.tier && !['default', 'fast'].includes(options.tier)) throw new Error('service tier must be default; fast is disabled');
   env.CODEX_EXECUTOR_SERVICE_TIER = 'default';
-  const entry = { ...previous, command: process.execPath, args: [path.join(root, 'src', 'server.cjs')], env, timeoutSeconds: 14460, disabled: false, enabledTools: ['codex_run', 'codex_wait', 'codex_sessions', 'codex_result', 'codex_cancel', 'codex_list'] };
+  const entry = { ...previous, command: process.execPath, args: [path.join(root, 'src', 'server.cjs')], env, timeoutSeconds: 14460, disabled: false, enabledTools: ['codex_run', 'codex_wait', 'codex_sessions', 'codex_result', 'codex_cancel', 'codex_list', 'codex_quota'] };
   const changes = [];
   const change = (file, parts, value) => {
     const doc = document(file), before = !parts.length && !fs.existsSync(file) ? { present: false } : getAt(doc, parts), after = { present: true, value };
@@ -87,7 +87,12 @@ function buildPlan(options) {
   // No quotes anywhere: the Go host escapes embedded quotes incompatibly with CMD.
   // Node's (possibly spaced) executable is read inside PowerShell from MCP config.
   const command = barePath(pwsh) + ' -NoProfile -NonInteractive -File ' + barePath(path.join(root, 'src', 'invoke-codex.ps1')) + ' -OriginHook -McpConfigPath ' + barePath(mcp);
-  change(hooksFile, ['codex-executor-origin'], { PreToolUse: [{ matcher: hookMatcher, hooks: [{ type: 'command', command, timeout: 10 }] }] });
+  const contextCommand = barePath(pwsh) + ' -NoProfile -NonInteractive -File ' + barePath(path.join(root, 'src', 'invoke-codex.ps1')) + ' -ContextHook -McpConfigPath ' + barePath(mcp);
+  change(hooksFile, ['codex-executor-origin'], {
+    PreToolUse: [{ matcher: hookMatcher, hooks: [{ type: 'command', command, timeout: 10 }] }],
+    SessionStart: [{ type: 'command', command: contextCommand, timeout: 10 }],
+    PreInvocation: [{ type: 'command', command: contextCommand, timeout: 10 }]
+  });
   const sidecarFile = target(path.join(configDir, 'sidecars', key, 'sidecar.json'));
   const oldSidecar = document(sidecarFile);
   const agentapi = options.agentapi || oldSidecar.env?.CODEX_EXECUTOR_AGENTAPI;

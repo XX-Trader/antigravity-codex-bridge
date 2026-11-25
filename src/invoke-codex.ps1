@@ -1,6 +1,6 @@
 #requires -Version 7.0
 [CmdletBinding()]
-param([string]$RequestPath, [switch]$AppServer, [string]$CodexEntry, [switch]$OriginHook, [switch]$Notify, [string]$ProjectRoot, [string]$McpConfigPath, [string]$NodeEntry, [string]$BackgroundRequest)
+param([string]$RequestPath, [switch]$AppServer, [string]$CodexEntry, [switch]$OriginHook, [switch]$ContextHook, [switch]$Notify, [string]$ProjectRoot, [string]$McpConfigPath, [string]$NodeEntry, [string]$BackgroundRequest)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
@@ -10,7 +10,7 @@ if ($BackgroundRequest) {
     & $env:CODEX_EXECUTOR_BACKGROUND_NODE (Join-Path $PSScriptRoot 'background.cjs') --start $BackgroundRequest
     exit $LASTEXITCODE
 }
-if (($OriginHook -or $Notify) -and -not $NodeEntry) {
+if (($OriginHook -or $ContextHook -or $Notify) -and -not $NodeEntry) {
     if ($McpConfigPath) {
         $mcp = Get-Content -LiteralPath $McpConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
         $NodeEntry = $mcp.mcpServers.'codex-executor'.command
@@ -20,6 +20,11 @@ if (($OriginHook -or $Notify) -and -not $NodeEntry) {
 if ($OriginHook) {
     [string[]]$hookArgs = if ($McpConfigPath) { @('--config', $McpConfigPath) } else { @($ProjectRoot) }
     [Console]::In.ReadToEnd() | & $NodeEntry (Join-Path $PSScriptRoot 'notifier.cjs') --origin-hook @hookArgs
+    exit $LASTEXITCODE
+}
+if ($ContextHook) {
+    [string[]]$hookArgs = if ($McpConfigPath) { @('--config', $McpConfigPath) } else { @($ProjectRoot) }
+    [Console]::In.ReadToEnd() | & $NodeEntry (Join-Path $PSScriptRoot 'notifier.cjs') --context-hook @hookArgs
     exit $LASTEXITCODE
 }
 if ($Notify) {

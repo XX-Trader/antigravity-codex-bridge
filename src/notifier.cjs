@@ -6,9 +6,13 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { Broker, config, terminal, read, save, alive, notificationEvents, publishNotification, latestProgress, chatAccess, commandPhase, takeFileClaim: takeClaim } = require('./server.cjs');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value);
-function originHook(payload, project) {
+function originHook(payload, project, options) {
   const projects = typeof project === 'string' ? [{ project: fs.realpathSync(project) }] : project;
-  return require('./router.cjs').bindOrigin(payload, projects);
+  return require('./router.cjs').bindOrigin(payload, projects, options);
+}
+function contextHook(payload, project, options) {
+  const projects = typeof project === 'string' ? [{ project: fs.realpathSync(project) }] : project;
+  return require('./router.cjs').contextHook(payload, projects, options);
 }
 
 function agentCall(executable, args) {
@@ -399,9 +403,10 @@ function watch(broker, send, options = {}) {
   interval = setInterval(reconcile, health.interval_ms);
   heartbeat(); void drain(); return { close, reconcile };
 }
-module.exports = { originHook, deliver, watch, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
+module.exports = { originHook, contextHook, deliver, watch, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
 if (require.main === module) {
-  if (process.argv[2] === '--origin-hook') {
+  if (process.argv[2] === '--origin-hook' || process.argv[2] === '--context-hook') {
+    const isContext = process.argv[2] === '--context-hook';
     let input = '';
     process.stdin.setEncoding('utf8'); process.stdin.on('data', data => { input += data; });
     process.stdin.on('end', () => {
@@ -411,9 +416,14 @@ if (require.main === module) {
           const entry = JSON.parse(fs.readFileSync(process.argv[4], 'utf8')).mcpServers['codex-executor'];
           const settings = config({ ...process.env, ...entry.env }); project = settings.projects || [settings];
         }
-        process.stdout.write(JSON.stringify(originHook(JSON.parse(input), project)) + '\n');
+        const payload = input.trim() ? JSON.parse(input) : {};
+        const reply = isContext ? contextHook(payload, project) : originHook(payload, project);
+        process.stdout.write(JSON.stringify(reply) + '\n');
       }
-      catch (error) { process.stdout.write(JSON.stringify({ decision: 'deny', reason: `无法验证当前项目及任务身份，未执行：${error.message}` }) + '\n'); }
+      catch (error) {
+        if (isContext) process.stdout.write('{}\n');
+        else process.stdout.write(JSON.stringify({ decision: 'deny', reason: `无法验证当前项目及任务身份，未执行：${error.message}` }) + '\n');
+      }
     });
   } else {
     try {

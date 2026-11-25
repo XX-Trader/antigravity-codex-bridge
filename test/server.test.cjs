@@ -224,7 +224,8 @@ exit 0
       const timeoutSchema = dispatch(broker, { method: 'tools/list' }).tools.find(x => x.name === 'codex_start').inputSchema.properties.timeout_seconds;
       assert.equal(timeoutSchema.default, 0); assert.equal(timeoutSchema.maximum, 2147483647);
       assert.throws(() => broker.status('../other'), /Invalid/);
-      assert.equal(dispatch(broker, { method: 'tools/list' }).tools.length, 9);
+      assert.equal(dispatch(broker, { method: 'tools/list' }).tools.length, 10);
+      assert.ok(dispatch(broker, { method: 'tools/list' }).tools.some(t => t.name === 'codex_quota'));
       assert.equal(dispatch(broker, { method: 'initialize', params: { protocolVersion: '2025-03-26' } }).protocolVersion, '2025-03-26');
       assert.equal(dispatch(broker, { method: 'tools/call', params: { name: 'missing' } }).isError, true);
       const original = { __COMPAT_LAYER: 'RunAsAdmin HIGHDPIAWARE', KEEP: 'unchanged' };
@@ -789,7 +790,7 @@ exit 0
       assert.equal(code, 0); assert.equal(err, '');
       const replies = out.trim().split('\n').map(JSON.parse);
       assert.equal(replies.length, 3); assert.equal(replies.find(reply => reply.id === 0).result.serverInfo.name, 'codex-executor');
-      assert.equal(replies.find(reply => reply.id === 1).result.tools.length, 9); assert.equal(replies.find(reply => reply.id === null).error.code, -32700);
+      assert.equal(replies.find(reply => reply.id === 1).result.tools.length, 10); assert.equal(replies.find(reply => reply.id === null).error.code, -32700);
     });
     await t.test('one real MCP execution response, no progress model turns, concurrent ping remains responsive', async t => {
       const child = spawn(process.execPath, [path.join(__dirname, '../src/server.cjs')], { windowsHide: true, env: { ...process.env, CODEX_EXECUTOR_PROJECT: project, CODEX_EXECUTOR_DATA: data, CODEX_EXECUTOR_ENTRY: entry }, stdio: ['pipe', 'pipe', 'pipe'] });

@@ -2,30 +2,78 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { Broker, inside, terminal, executionSandbox } = require('./server.cjs');
+const {
+  defaultPolicyPath,
+  defaultQuotaCachePath,
+  loadRoutingPolicy,
+  resolveProjectPolicy,
+  evaluateSubagentCall,
+  activeCodexTasks,
+  decideRoute,
+  readQuotaCache,
+  scanAgyTranscriptUsage,
+  saveAtomic
+} = require('./routing-policy.cjs');
+
 const real = p => fs.realpathSync(p);
 const same = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
-const executionTools = ['run_command', 'manage_task', 'send_command_input', 'command_status', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'apply_patch', 'edit_file', 'write_file', 'invoke_subagent', 'define_subagent', 'manage_subagents', 'spawn_agent', 'spawn_subagent', 'delegate_task', 'send_message', 'schedule'];
+const executionTools = ['run_command', 'manage_task', 'send_command_input', 'command_status', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'apply_patch', 'edit_file', 'write_file', 'invoke_subagent', 'define_subagent', 'manage_subagents', 'spawn_agent', 'spawn_subagent', 'delegate_task', 'send_message', 'schedule', 'run_workflow'];
 const executionPattern = new RegExp('(?:^|[_/.:-])(?:' + executionTools.join('|') + ')$|subagent|sub_agent', 'i');
-const hookMatcher = '(?:^|[_/.:-])(?:codex_(run|sessions|list|wait|result|cancel)|call_mcp_tool|' + executionTools.join('|') + ')$|subagent|sub_agent';
+const hookMatcher = '(?:^|[_/.:-])(?:codex_(run|sessions|list|wait|result|cancel|quota)|call_mcp_tool|' + executionTools.join('|') + ')$|subagent|sub_agent';
+const subagentInvokePattern = /(?:^|[_/.:-])invoke_subagent$/i;
+const readOnlySubagentType = args => String(args?.TypeName || args?.typeName || args?.type_name || '').trim().toLowerCase() === 'research';
+const isolatedWorkspace = args => ['share', 'branch'].includes(String(args?.Workspace || args?.workspace || '').trim().toLowerCase());
+
 function scopesFor(workspaces, projects) {
   return projects.filter(p => workspaces.some(w => {
     try { const root = real(w); return same(root, p.project) || inside(root, p.project) || inside(p.project, root); } catch { return false; }
   }));
 }
-function bindOrigin(payload, projects) {
+
+function effectiveScopePolicy(scopes, options = {}) {
+  const first = scopes[0];
+  const policyPath = options.policyPath || defaultPolicyPath(first);
+  const policy = options.policy || loadRoutingPolicy(policyPath, { defaultMode: options.defaultMode || 'auto' });
+  const resolved = scopes.map(scope => ({ scope, policy: resolveProjectPolicy(policy, scope) }));
+  // If any matched workspace is locked to codex-only, keep the stricter lock.
+  const locked = resolved.find(item => item.policy.mode === 'codex');
+  return { rawPolicy: policy, policyPath, selected: locked || resolved[0] };
+}
+
+function bindOrigin(payload, projects, options = {}) {
   const name = payload?.toolCall?.name || '';
   if (/(?:^|[_/.:-])call_mcp_tool$/.test(name)) {
     const outer = payload.toolCall.args || {}, key = Object.hasOwn(outer, 'Arguments') ? 'Arguments' : 'arguments';
     const innerName = outer.ToolName || outer.toolName || outer.tool_name || '';
     const args = outer[key] || {};
     if (typeof args !== 'object' || Array.isArray(args)) return { decision: 'deny', reason: 'MCP Arguments 必须是对象，未执行。' };
-    const result = bindOrigin({ ...payload, toolCall: { name: innerName, args } }, projects);
+    const result = bindOrigin({ ...payload, toolCall: { name: innerName, args } }, projects, options);
     return result.overwrite ? { ...result, overwrite: { [key]: { ...args, ...result.overwrite } } } : result;
   }
-  const match = name.match(/(?:^|[_/.:-])(codex_run|codex_sessions|codex_list|codex_wait|codex_result|codex_cancel)$/);
+  const match = name.match(/(?:^|[_/.:-])(codex_run|codex_sessions|codex_list|codex_wait|codex_result|codex_cancel|codex_quota)$/);
   if (!match) {
-    if (executionPattern.test(name) && scopesFor(payload.workspacePaths || [], projects).length) return { decision: 'deny', reason: '本项目由 Antigravity 规划和验收，执行必须交给 codex_run；需要子 agent 时由 Codex 会话启动自己的原生子 agent，禁止 Antigravity 原生执行或子 agent 代做。' };
-    return { decision: 'allow' };
+    const scopes = scopesFor(payload.workspacePaths || [], projects);
+    if (!executionPattern.test(name) || !scopes.length) return { decision: 'allow' };
+    const { selected } = effectiveScopePolicy(scopes, options);
+    const projectPolicy = selected.policy;
+    if (projectPolicy.mode === 'codex') {
+      return { decision: 'deny', reason: '本项目当前处于 codex 锁定模式：由 Antigravity 规划和验收，执行必须交给 codex_run；需要子 agent 时由 Codex 会话启动原生子 agent。如需同时启用 AGY 低成本多子代理，请将模式切回 auto 或 agy。' };
+    }
+    const args = payload.toolCall?.args || {};
+    const active = activeCodexTasks(selected.scope);
+    const notes = [];
+    let overwrite;
+    if (subagentInvokePattern.test(name)) {
+      const sub = evaluateSubagentCall(args, projectPolicy);
+      if (sub.overwrite) overwrite = sub.overwrite;
+      if (sub.note) notes.push(sub.note);
+      if (active.count > 0 && !readOnlySubagentType(args) && !isolatedWorkspace(args)) {
+        notes.push(`注意：当前项目有 ${active.count} 个活跃 Codex 任务；并行写同一仓库时请切分非重叠目录或为子代理指定 Workspace="share"，并由主会话串行做 Git 提交。`);
+      }
+    } else if (active.count > 0 && !/(?:^|[_/.:-])(?:manage_subagents|define_subagent)$/i.test(name)) {
+      notes.push(`注意：当前项目有 ${active.count} 个活跃 Codex 任务，注意文件边界不重叠，Git 暂存与提交须串行协调。`);
+    }
+    return { decision: 'allow', ...(overwrite ? { overwrite } : {}), ...(notes.length ? { reason: notes.join(' ') } : {}) };
   }
   const tool = match[1], args = payload.toolCall.args || {};
   const scopes = scopesFor(payload.workspacePaths || [], projects);
@@ -38,6 +86,10 @@ function bindOrigin(payload, projects) {
   let cwd;
   try { if (args.cwd) cwd = real(args.cwd); } catch { return { decision: 'deny', reason: 'cwd 不存在。' }; }
   if (cwd && !scopes.some(p => inside(p.project, cwd))) return { decision: 'deny', reason: 'cwd 不属于当前项目登记的执行根。' };
+  if (tool === 'codex_quota') {
+    if (!cwd && scopes.length === 1) return { decision: 'allow', overwrite: { cwd: scopes[0].project } };
+    return { decision: 'allow', ...(cwd ? { overwrite: { cwd } } : {}) };
+  }
   if (!cwd && scopes.length !== 1) return { decision: 'deny', reason: '本项目有多个代码根；请按事项明确 cwd，不猜最近目录。' };
   cwd ||= scopes[0].project;
   const overwrite = { cwd };
@@ -49,6 +101,70 @@ function bindOrigin(payload, projects) {
   }
   return { decision: 'allow', overwrite };
 }
+
+function readContextMarker(file) {
+  if (!file || !fs.existsSync(file)) return {};
+  try { const doc = JSON.parse(fs.readFileSync(file, 'utf8')); return doc && typeof doc === 'object' ? doc : {}; } catch { return {}; }
+}
+
+function contextHook(payload, projects, options = {}) {
+  const scopes = scopesFor(payload?.workspacePaths || [], projects);
+  if (!scopes.length) return {};
+  const { rawPolicy, policyPath, selected } = effectiveScopePolicy(scopes, options);
+  const projectPolicy = selected.policy;
+  const cachePath = options.cachePath || defaultQuotaCachePath(policyPath, selected.scope);
+  const cached = readQuotaCache(cachePath, Math.max(projectPolicy.cache_ttl_seconds || 60, 300), options.nowMs);
+  const agyUsage = cached?.agy_usage || scanAgyTranscriptUsage({ transcriptPath: payload?.transcriptPath, brainDir: options.brainDir, nowMs: options.nowMs });
+  const active = activeCodexTasks(selected.scope);
+  const route = decideRoute({
+    policy: rawPolicy,
+    projectPolicy,
+    projectScope: selected.scope,
+    codexPacing: cached?.codex_pacing || { available: false },
+    agyUsage,
+    agyExternal: cached?.agy_external || null,
+    activeCodexTasks: active,
+    modelName: payload?.modelName || '',
+    nowMs: options.nowMs
+  });
+
+  const eventName = payload?.hookEventName || 'SessionStart';
+  const conversationId = payload?.conversationId || '';
+  const fingerprint = JSON.stringify({
+    mode: route.mode,
+    preferred: route.preferred_engine,
+    reason: route.reason,
+    updated_at: rawPolicy.updated_at || null,
+    quant_reminder: route.thinking_guidance?.matches_required === false ? route.thinking_guidance.required_thinking_model : null
+  });
+  const markerFile = options.markerFile || (policyPath ? path.join(path.dirname(policyPath), 'context-hook-state.json') : null);
+  if (eventName === 'PreInvocation' && conversationId && markerFile) {
+    const markers = readContextMarker(markerFile);
+    if (markers[conversationId]?.fingerprint === fingerprint) return {};
+  }
+  if (conversationId && markerFile) {
+    try {
+      const markers = readContextMarker(markerFile);
+      const entries = Object.entries(markers).slice(-40);
+      const next = Object.fromEntries(entries);
+      next[conversationId] = { fingerprint, at: new Date(options.nowMs ?? Date.now()).toISOString() };
+      saveAtomic(markerFile, next);
+    } catch {}
+  }
+
+  const lines = [
+    `[双引擎路由状态] ${route.summary_line}`,
+    `执行模式：${route.mode}（支持缩写 agy/AGY/Agy 与 codex；用户显式点名优先；同事项粘性锁定单执行端；AGY 受限时由 Codex 兜底）。`,
+    `AGY 低成本多子代理分层：simple/research→${projectPolicy.agy_tiers.simple}，standard(默认)→${projectPolicy.agy_tiers.standard}，complex→${projectPolicy.agy_tiers.complex}，expert→${projectPolicy.agy_tiers.expert}；高配主会话做拆解与验收，多步执行下沉低成本子代理，批量扇出用 run_workflow，并行写用 Workspace="share"，Git 串行收口。`
+  ];
+  if (route.thinking_guidance?.reminder) lines.push(`[思考模型提示] ${route.thinking_guidance.reminder}`);
+  if (active.count > 0) lines.push(`[并发防撞] 当前项目有 ${active.count} 个活跃 Codex 任务；AGY 写操作请避开重叠文件或使用 Workspace="share"。`);
+
+  return {
+    injectSteps: [{ systemMessage: { systemMessage: lines.join('\n') } }]
+  };
+}
+
 class ProjectRouter {
   constructor(settings) {
     this.settings = settings;
@@ -85,9 +201,22 @@ class ProjectRouter {
   wait(id, signal) { return this.forJob(id).wait(id, signal); }
   cancel(id) { return this.forJob(id).cancel(id); }
   async sessions(input = {}) { return this.forCwd(input.cwd).sessions(input); }
+  async quota(input = {}) {
+    const broker = input.cwd ? this.forCwd(input.cwd) : this.brokers[0];
+    const report = await broker.quota(input);
+    return {
+      ...report,
+      projects: this.brokers.map(b => ({
+        project: b.settings.project,
+        review_category: b.settings.review_category || 'general',
+        active_codex_tasks: activeCodexTasks(b.settings).count
+      }))
+    };
+  }
   list(limit = 20, cwd, activeOnly = false) {
     if (cwd) return this.forCwd(cwd).list(limit, undefined, activeOnly);
     return this.brokers.flatMap(b => b.list(limit, undefined, activeOnly)).filter(j => !activeOnly || !terminal.has(j.status)).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, activeOnly ? Number.MAX_SAFE_INTEGER : limit);
   }
 }
-module.exports = { ProjectRouter, bindOrigin, hookMatcher };
+
+module.exports = { ProjectRouter, bindOrigin, contextHook, hookMatcher };

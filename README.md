@@ -1,8 +1,8 @@
 # Antigravity Codex Bridge
 
-让 Antigravity 理解需求、提出方案并验收，由本机 Codex CLI 独立审核，通过后执行任务。
+让 Antigravity（简称 `agy`/`AGY`）与本机 Codex CLI 协同执行任务：默认处于 `auto` 自动均衡模式（优先 Codex、按 7 天 100% 等比例消耗预算曲线与 AGY 本地用量/熔断动态分流、AGY 受限时由 Codex 兜底），也可随时按项目或全局切换为纯 `codex` 或 `agy` 模式。
 
-接入桥接的业务项目中，执行和子 agent 都属于 Codex：Antigravity 不用自己的原生子 agent、命令或写文件工具代做。需要细分时，由 Codex 会话调用自己的原生 `spawn_agent` 并汇总结果。桥接启动时显式启用 `features.multi_agent=true`，不覆盖用户的原生子线程数量配置；这与多个独立顶层 Codex 任务是两件事。维护本桥接仓库自身时，Antigravity 可以直接修改、测试和上传代码，无需经 MCP 派发；见 [仓库约定](AGENTS.md)。
+走 Codex 执行时，Antigravity 理解需求、提出方案并验收，由 Codex 独立只读审核后在同一原生会话执行并支持 Codex 原生 `spawn_agent`；走 AGY 执行时，高配主会话负责思考、架构拆解与逐项验收，把具体检索、编码与测试下沉至低成本多子代理（`invoke_subagent` / `run_workflow`，默认 `simple→flash_lite`、`standard→flash`、`complex→pro`、`expert→inherit`），并支持为量化策略研究单独配置本机最强思考模型。锁定 `codex` 模式时，Hook 仍严格拦截 Antigravity 原生执行和子代理。维护本桥接仓库自身时，Antigravity 可以直接修改、测试和上传代码，无需经 MCP 派发；见 [仓库约定](AGENTS.md)。
 
 这是一个 Windows 优先的本地 stdio MCP 服务，不需要 npm 运行依赖，也不复制 Codex 登录凭证。默认启用完整文件系统/命令网络访问和实时联网搜索，适用于你信任的本机项目；不要接到不可信工作区或远程公开端口。
 
@@ -73,6 +73,9 @@ pwsh -NoProfile -File scripts/Setup.ps1 --project 'C:/work/my-project' --data 'C
 | `codex_result` | 领取原回执，或查看最后已落盘进度；`sync_title=true` 可补齐已结束旧任务的标题 |
 | `codex_wait` | 一次等待既有任务完成，不重新提交 |
 | `codex_cancel` | 只取消该任务拥有的子进程，不回滚源码改动 |
+| `codex_quota` | 只读查询 Codex 实时 7 天等比例消耗进度、AGY 本地 5h/7d 转录用量与限流态、活跃任务数及当前 `auto`/`agy`/`codex` 路由建议 |
+
+也可通过 `pwsh -NoProfile -File scripts/Mode.ps1` 免重启查看配额、切换全局或单项目 `auto`/`agy`/`codex` 模式、设置量化思考模型与熔断冷却。
 
 `topic` 应是“修复播放器切集失败”这样的实际任务，而不是“Codex 执行者”。首次新事项的会话建立事件带有原生聊天链接，不必等到最终回执；常规进度、同事项续接和通知恢复只留本地，不反复唤醒模型或刷聊天。通知正文保留本地时间、项目/短事项、具体结果或所需操作和一个详情链接，默认最多三行；用户选择完整展示。把 `chat.vscode_uri` 展示给用户；`chat=null` 不代表失败，也不是重复提交的理由。
 
