@@ -90,10 +90,10 @@ function buildPlan(options) {
   const contextCommand = barePath(pwsh) + ' -NoProfile -NonInteractive -File ' + barePath(path.join(root, 'src', 'invoke-codex.ps1')) + ' -ContextHook -McpConfigPath ' + barePath(mcp);
   const postToolCommand = barePath(pwsh) + ' -NoProfile -NonInteractive -File ' + barePath(path.join(root, 'src', 'invoke-codex.ps1')) + ' -PostToolHook -McpConfigPath ' + barePath(mcp);
   change(hooksFile, ['codex-executor-origin'], {
-    PreToolUse: [{ matcher: hookMatcher, hooks: [{ type: 'command', command, timeout: 10 }] }],
-    PostToolUse: [{ matcher: hookMatcher, hooks: [{ type: 'command', command: postToolCommand, timeout: 10 }] }],
-    SessionStart: [{ type: 'command', command: contextCommand, timeout: 10 }],
-    PreInvocation: [{ type: 'command', command: contextCommand, timeout: 10 }]
+    PreToolUse: [{ matcher: hookMatcher, hooks: [{ type: 'command', command, timeout: 30 }] }],
+    PostToolUse: [{ matcher: hookMatcher, hooks: [{ type: 'command', command: postToolCommand, timeout: 30 }] }],
+    SessionStart: [{ type: 'command', command: contextCommand, timeout: 30 }],
+    PreInvocation: [{ type: 'command', command: contextCommand, timeout: 30 }]
   });
   const sidecarFile = target(path.join(configDir, 'sidecars', key, 'sidecar.json'));
   const oldSidecar = document(sidecarFile);

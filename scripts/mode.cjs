@@ -28,12 +28,12 @@ function usage() {
     '  agy-hint --level plenty|normal|low [--config MCP_JSON] [--policy POLICY_JSON]',
     '  agy-quota [--weekly-used PCT] [--weekly-reset ISO] [--5h-used PCT] [--5h-reset ISO] [--clear]',
     '  agy-budget [--tokens-5h N] [--tokens-7d N] [--weekly-reset ISO] [--target PCT] [--weekly-protect PCT] [--5h-caution PCT] [--5h-protect PCT] [--clear]',
-    '  codex-pacing [--days N] [--target PCT] [--policy POLICY_JSON]',
+    '  codex-pacing [--days N] [--target PCT] [--ahead-max N] [--high-max N] [--protect-max N] [--policy POLICY_JSON]',
     '  agy-review-gate --level off|advisory|strict [--project ABS_PATH] [--valid-hours N] [--max-same N] [--max-total N]',
     '  reset-agy-guard [--conversation UUID] [--policy POLICY_JSON]',
     '  quant-thinking [--model NAME] [--general NAME] [--backups A,B] [--clear] [--config MCP_JSON] [--policy POLICY_JSON]',
     '  agy-models [--standard NAME] [--complex NAME] [--expert NAME] [--clear] [--policy POLICY_JSON]',
-    '  pool --name POOL [--match TEXT] [--weekly-protect PCT] [--5h-caution PCT] [--5h-protect PCT] [--weekly-used PCT] [--weekly-reset ISO] [--5h-used PCT] [--5h-reset ISO] [--clear-snapshot] [--remove]',
+    '  pool --name POOL [--match TEXT] [--weekly-protect PCT] [--5h-caution PCT] [--5h-protect PCT] [--tokens-5h N] [--tokens-7d N] [--weekly-used PCT] [--weekly-reset ISO] [--5h-used PCT] [--5h-reset ISO] [--clear-snapshot] [--remove]',
     '  tier [--simple MODEL] [--standard MODEL] [--complex MODEL] [--expert MODEL] [--enforce-low-cost true|false]',
     '  cooldown --engine codex|agy --minutes N [--reason TEXT]',
     '  clear-cooldown --engine codex|agy'
@@ -228,7 +228,17 @@ async function run(argv) {
       if (!Number.isFinite(n) || n < 10 || n > 100) throw new Error('--target must be a number in 10..100');
       p.target_utilization = n;
     }
-    if (opts.days === undefined && opts.target === undefined) throw new Error('Specify --days N and/or --target PCT');
+    for (const [flag, key] of [['ahead-max', 'ahead_max_concurrent'], ['high-max', 'high_max_concurrent'], ['protect-max', 'protect_max_concurrent']]) {
+      if (opts[flag] !== undefined) {
+        if (String(opts[flag]).toLowerCase() === 'none') { p[key] = null; continue; }
+        const n = Number(opts[flag]);
+        if (!Number.isFinite(n) || n < 1 || n > 50) throw new Error(`--${flag} must be 1..50 or none`);
+        p[key] = Math.floor(n);
+      }
+    }
+    if (opts.days === undefined && opts.target === undefined && opts['ahead-max'] === undefined && opts['high-max'] === undefined && opts['protect-max'] === undefined) {
+      throw new Error('Specify --days, --target, --ahead-max, --high-max, or --protect-max');
+    }
     current.pacing = p;
     const saved = saveRoutingPolicy(policyFile, current);
     return JSON.stringify({ state: 'updated', policy_path: saved.path, pacing: saved.pacing }, null, 2);
@@ -311,6 +321,16 @@ async function run(argv) {
     if (opts['weekly-protect'] !== undefined) next.weekly_protect_used_percent = parseRange('weekly-protect', 50, 100);
     if (opts['5h-caution'] !== undefined) next.window_5h_caution_percent = parseRange('5h-caution', 30, 99);
     if (opts['5h-protect'] !== undefined) next.window_5h_protect_percent = parseRange('5h-protect', 40, 100);
+    if (opts['tokens-5h'] !== undefined) {
+      const n = Number(opts['tokens-5h']);
+      if (!Number.isFinite(n) || n <= 0) throw new Error('--tokens-5h must be positive');
+      next.window_5h_tokens = Math.floor(n);
+    }
+    if (opts['tokens-7d'] !== undefined) {
+      const n = Number(opts['tokens-7d']);
+      if (!Number.isFinite(n) || n <= 0) throw new Error('--tokens-7d must be positive');
+      next.window_7d_tokens = Math.floor(n);
+    }
     if (opts['clear-snapshot']) {
       next.manual_snapshot = null;
     } else if (opts['weekly-used'] !== undefined || opts['5h-used'] !== undefined || opts['weekly-reset'] !== undefined || opts['5h-reset'] !== undefined) {

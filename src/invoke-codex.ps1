@@ -12,25 +12,38 @@ if ($BackgroundRequest) {
 }
 if (($OriginHook -or $ContextHook -or $PostToolHook -or $Notify) -and -not $NodeEntry) {
     if ($McpConfigPath) {
-        $mcp = Get-Content -LiteralPath $McpConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        $NodeEntry = $mcp.mcpServers.'codex-executor'.command
+        for ($attempt = 0; $attempt -lt 4; $attempt++) {
+            try {
+                $mcp = Get-Content -LiteralPath $McpConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $NodeEntry = $mcp.mcpServers.'codex-executor'.command
+                break
+            } catch {
+                if ($attempt -eq 3) { throw }
+                Start-Sleep -Milliseconds 35
+            }
+        }
     }
     if (-not $NodeEntry) { $NodeEntry = (Get-Command node.exe -CommandType Application -ErrorAction Stop).Source }
 }
 if ($OriginHook) {
     [string[]]$hookArgs = if ($McpConfigPath) { @('--config', $McpConfigPath) } else { @($ProjectRoot) }
-    [Console]::In.ReadToEnd() | & $NodeEntry (Join-Path $PSScriptRoot 'notifier.cjs') --origin-hook @hookArgs
+    $stdinPayload = try { [Console]::In.ReadToEnd() } catch { '' }
+    $stdinPayload | & $NodeEntry (Join-Path $PSScriptRoot 'notifier.cjs') --origin-hook @hookArgs
     exit $LASTEXITCODE
 }
 if ($ContextHook) {
     [string[]]$hookArgs = if ($McpConfigPath) { @('--config', $McpConfigPath) } else { @($ProjectRoot) }
-    [Console]::In.ReadToEnd() | & $NodeEntry (Join-Path $PSScriptRoot 'notifier.cjs') --context-hook @hookArgs
-    exit $LASTEXITCODE
+    $stdinPayload = try { [Console]::In.ReadToEnd() } catch { '' }
+    $stdinPayload | & $NodeEntry (Join-Path $PSScriptRoot 'notifier.cjs') --context-hook @hookArgs
+    if ($LASTEXITCODE -ne 0) { Write-Output '{}'; exit 0 }
+    exit 0
 }
 if ($PostToolHook) {
     [string[]]$hookArgs = if ($McpConfigPath) { @('--config', $McpConfigPath) } else { @($ProjectRoot) }
-    [Console]::In.ReadToEnd() | & $NodeEntry (Join-Path $PSScriptRoot 'notifier.cjs') --post-tool-hook @hookArgs
-    exit $LASTEXITCODE
+    $stdinPayload = try { [Console]::In.ReadToEnd() } catch { '' }
+    $stdinPayload | & $NodeEntry (Join-Path $PSScriptRoot 'notifier.cjs') --post-tool-hook @hookArgs
+    if ($LASTEXITCODE -ne 0) { Write-Output '{}'; exit 0 }
+    exit 0
 }
 if ($Notify) {
     & $NodeEntry (Join-Path $PSScriptRoot 'notifier.cjs')

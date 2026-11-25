@@ -15,6 +15,7 @@ const { ModelPolicyError, selectedModel, modelPolicy, executionRoute, assertAvai
 const {
   defaultPolicyPath,
   defaultQuotaCachePath,
+  defaultCodexSessionsDir,
   loadRoutingPolicy,
   resolveProjectPolicy,
   evaluateCodexPacing,
@@ -23,6 +24,8 @@ const {
   activeCodexTasks,
   decideRoute,
   readQuotaCache,
+  readStaleQuotaCache,
+  readLatestCodexRolloutRateLimits,
   writeQuotaCache
 } = require('./routing-policy.cjs');
 const { defaultGuardStatePath, readGuardQuotaCooldown } = require('./agy-guard.cjs');
@@ -740,22 +743,42 @@ class Broker {
     const projectPolicy = { ...resolveProjectPolicy(policy, this.settings), ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
     const cachePath = defaultQuotaCachePath(policyPath, this.settings);
     const cached = input.refresh === true ? null : readQuotaCache(cachePath, projectPolicy.cache_ttl_seconds, nowMs);
-    let codexPacing = cached?.codex_pacing || null;
+    const sessionsDir = defaultCodexSessionsDir(this.settings, { codexSessionsDir: input.codex_sessions_dir });
+    let codexPacing = cached?.codex_pacing?.available ? cached.codex_pacing : null;
     let codexError = null;
+    if (!codexPacing && input.refresh !== true && sessionsDir && this.metadataCall === metadataCall) {
+      const recentRollout = readLatestCodexRolloutRateLimits({ codexSessionsDir: sessionsDir, maxAgeMs: 90 * 1000, nowMs });
+      if (recentRollout) {
+        codexPacing = { ...evaluateCodexPacing(recentRollout, projectPolicy.pacing, nowMs), source: 'codex_rollout_log', observed_at: recentRollout.observed_at };
+      }
+    }
     if (!codexPacing) {
       try {
         const reply = await this.metadataCall(this.settings, 'account/rateLimits/read', {});
-        codexPacing = evaluateCodexPacing(reply, projectPolicy.pacing, nowMs);
+        codexPacing = { ...evaluateCodexPacing(reply, projectPolicy.pacing, nowMs), source: 'app_server' };
       } catch (error) {
         codexError = error.message;
-        codexPacing = { available: false, reason: error.message };
+        const rolloutFallback = sessionsDir ? readLatestCodexRolloutRateLimits({ codexSessionsDir: sessionsDir, nowMs }) : null;
+        const fromRollout = rolloutFallback ? evaluateCodexPacing(rolloutFallback, projectPolicy.pacing, nowMs) : null;
+        const stale = readStaleQuotaCache(cachePath, nowMs)?.codex_pacing || null;
+        if (fromRollout?.available && (!stale?.available || fromRollout.used_percent >= stale.used_percent)) {
+          codexPacing = { ...fromRollout, source: 'codex_rollout_log', observed_at: rolloutFallback.observed_at, fallback_after_timeout: true };
+        } else if (stale?.available) {
+          codexPacing = { ...stale, stale: true, source: 'stale_cache', fallback_after_timeout: true };
+        } else {
+          codexPacing = { available: false, reason: error.message };
+        }
       }
     }
     const agyUsage = cached?.agy_usage || scanAgyTranscriptUsage({ brainDir: input.brain_dir, nowMs });
     const agyExternal = cached?.agy_external !== undefined
       ? cached.agy_external
       : (projectPolicy.agy_quota_command ? runExternalAgyProbe(projectPolicy.agy_quota_command) : null);
-    if (!cached) writeQuotaCache(cachePath, { codex_pacing: codexPacing, agy_usage: agyUsage, agy_external: agyExternal });
+    if (!cached) {
+      const prevStale = readStaleQuotaCache(cachePath, nowMs);
+      const persistCodex = codexPacing?.available ? codexPacing : (prevStale?.codex_pacing || codexPacing);
+      writeQuotaCache(cachePath, { codex_pacing: persistCodex, agy_usage: agyUsage, agy_external: agyExternal });
+    }
     const active = activeCodexTasks(this.settings);
     const route = decideRoute({
       policy,

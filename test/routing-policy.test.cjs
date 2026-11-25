@@ -366,6 +366,65 @@ test('Mode CLI switches global/project modes with AGY aliases, quant thinking mo
   assert.match(poolMsg, /backup-1 → backup-last/);
   const outPoolCleared = JSON.parse(await runModeCli(['pool', '--name', 'family-x', '--remove', '--policy', f.policyPath]));
   assert.equal(outPoolCleared.removed, 'family-x');
+
+  // Rollout log fallback + stale cache preservation + HTTP 503 exclusion + high-water Codex concurrency throttle
+  const { readLatestCodexRolloutRateLimits, isAgyQuotaError } = require('../src/routing-policy.cjs');
+  assert.equal(isAgyQuotaError('HTTP 503: No capacity available for model x on the server'), false);
+  assert.equal(isAgyQuotaError('HTTP 429 RESOURCE_EXHAUSTED: quota exceeded'), true);
+
+  const sessDir = path.join(f.root, 'codex-sessions', '2026', '11', '25');
+  fs.mkdirSync(sessDir, { recursive: true });
+  const futureResetSec = Math.floor((Date.now() + 72 * 3600000) / 1000);
+  fs.writeFileSync(path.join(sessDir, 'rollout-test.jsonl'), JSON.stringify({
+    timestamp: new Date().toISOString(),
+    type: 'event_msg',
+    payload: { rate_limits: { plan_type: 'pro', primary: { used_percent: 98, window_minutes: 10080, resets_at: futureResetSec } } }
+  }) + '\n', 'utf8');
+  const roll = readLatestCodexRolloutRateLimits({ codexSessionsDir: path.join(f.root, 'codex-sessions') });
+  assert.equal(roll.rateLimits.primary.used_percent, 98);
+
+  // Broker.quota falls back to rollout log when app-server times out, and never overwrites good cache with unavailable
+  const brokerTimeout = new Broker({ project: f.project, data: f.data, routing_config_file: f.policyPath, codex_sessions_dir: path.join(f.root, 'codex-sessions') });
+  brokerTimeout.metadataCall = async () => { throw new Error('Local Codex session metadata request timed out'); };
+  const qFallback = await brokerTimeout.quota({ refresh: true });
+  assert.equal(qFallback.codex_pacing.available, true);
+  assert.equal(qFallback.codex_pacing.used_percent, 98);
+  assert.equal(qFallback.codex_pacing.source, 'codex_rollout_log');
+  assert.equal(qFallback.preferred_engine, 'agy');
+
+  // While agy_quota_hint is 'low' (from earlier in test), AGY is constrained so Codex still acts as fallback even at 98%
+  await runModeCli(['set', '--mode', 'auto', '--policy', f.policyPath]);
+  const fallbackAllowed = bindOrigin(
+    { conversationId: '11111111-1111-1111-1111-111111111111', workspacePaths: [f.project], toolCall: { name: 'codex_run', args: { prompt: 'AGY受限时的兜底任务' } } },
+    [{ project: f.project, data: f.data }],
+    { policyPath: f.policyPath, codexSessionsDir: path.join(f.root, 'codex-sessions') }
+  );
+  assert.equal(fallbackAllowed.decision, 'allow');
+
+  // Once AGY is healthy (normal), PreToolUse throttles new general codex_run at 98% protected while allowing read-only manage_task(status) fast-path
+  await runModeCli(['agy-hint', '--level', 'normal', '--policy', f.policyPath]);
+  const fastStatus = bindOrigin(
+    { conversationId: '11111111-1111-1111-1111-111111111111', workspacePaths: [f.project], toolCall: { name: 'manage_task', args: { Action: 'status', TaskId: 't1' } } },
+    [{ project: f.project, data: f.data }],
+    { policyPath: f.policyPath }
+  );
+  assert.equal(fastStatus.decision, 'allow');
+
+  const blockedNew = bindOrigin(
+    { conversationId: '11111111-1111-1111-1111-111111111111', workspacePaths: [f.project], toolCall: { name: 'codex_run', args: { prompt: '普通改一个小样式' } } },
+    [{ project: f.project, data: f.data }],
+    { policyPath: f.policyPath, codexSessionsDir: path.join(f.root, 'codex-sessions') }
+  );
+  assert.equal(blockedNew.decision, 'deny');
+  assert.match(blockedNew.reason, /CODEX_QUOTA_PROTECTED/);
+
+  // Explicit native_luna pipeline task is still allowed when active tasks < protect_max_concurrent (1)
+  const allowedLuna = bindOrigin(
+    { conversationId: '11111111-1111-1111-1111-111111111111', workspacePaths: [f.project], toolCall: { name: 'codex_run', args: { prompt: '000938 native_luna_required Stage B 复核' } } },
+    [{ project: f.project, data: f.data }],
+    { policyPath: f.policyPath, codexSessionsDir: path.join(f.root, 'codex-sessions') }
+  );
+  assert.equal(allowedLuna.decision, 'allow');
 });
 
 test('dual 7-day 100% proportional pacing + AGY 5-hour limit guard + Codex fallback', () => {

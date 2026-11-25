@@ -30,7 +30,10 @@ const DEFAULT_PACING = Object.freeze({
   agy_priority_used_percent: 92,
   codex_protect_used_percent: 97,
   drain_window_hours: 12,
-  drain_min_remaining_percent: 10
+  drain_min_remaining_percent: 10,
+  ahead_max_concurrent: 3,        // Throttle Codex concurrency in auto mode when ahead of pace or >= 85%
+  high_max_concurrent: 2,         // Tighter cap when >= 92% used
+  protect_max_concurrent: 1       // Hard cap at >= 97% used so sticky continuations cannot stampede last 3%
 });
 
 const DEFAULT_AGY_PACING = Object.freeze({
@@ -190,6 +193,12 @@ function parsePolicy(raw) {
     }
     if (p.balanced_upper_margin < p.codex_priority_margin) p.balanced_upper_margin = p.codex_priority_margin;
     if (p.codex_protect_used_percent < p.agy_priority_used_percent) p.codex_protect_used_percent = p.agy_priority_used_percent;
+    for (const k of ['ahead_max_concurrent', 'high_max_concurrent', 'protect_max_concurrent']) {
+      if (raw.pacing[k] === null) p[k] = null;
+      else if (typeof raw.pacing[k] === 'number' && Number.isFinite(raw.pacing[k]) && raw.pacing[k] >= 1 && raw.pacing[k] <= 50) {
+        p[k] = Math.floor(raw.pacing[k]);
+      }
+    }
     policy.pacing = p;
   }
   if (raw.agy_pacing && typeof raw.agy_pacing === 'object' && !Array.isArray(raw.agy_pacing)) {
@@ -405,11 +414,25 @@ function resolveProjectPolicy(policy, projectScope) {
 
 function evaluateCodexPacing(rateLimitReply, pacingCfg = DEFAULT_PACING, nowMs = Date.now()) {
   const cfg = { ...DEFAULT_PACING, ...(pacingCfg || {}) };
-  const limits = rateLimitReply?.rateLimits || rateLimitReply?.rateLimitsByLimitId?.codex || null;
-  const primary = limits?.primary || null;
-  if (!primary || typeof primary.usedPercent !== 'number' || typeof primary.windowDurationMins !== 'number' || primary.windowDurationMins <= 0 || typeof primary.resetsAt !== 'number') {
+  const rawLimits = rateLimitReply?.rateLimits || rateLimitReply?.rate_limits || rateLimitReply?.rateLimitsByLimitId?.codex || null;
+  const rawPrimary = rawLimits?.primary || null;
+  const usedRaw = rawPrimary?.usedPercent ?? rawPrimary?.used_percent;
+  const winMinsRaw = rawPrimary?.windowDurationMins ?? rawPrimary?.window_minutes;
+  const resetsAtRaw = rawPrimary?.resetsAt ?? rawPrimary?.resets_at;
+  if (!rawPrimary || typeof usedRaw !== 'number' || typeof winMinsRaw !== 'number' || winMinsRaw <= 0 || typeof resetsAtRaw !== 'number') {
     return { available: false, reason: 'Codex rate-limit primary window unavailable' };
   }
+  const limits = {
+    planType: rawLimits.planType ?? rawLimits.plan_type ?? null,
+    rateLimitReachedType: rawLimits.rateLimitReachedType ?? rawLimits.rate_limit_reached_type ?? null,
+    spendControlReached: rawLimits.spendControlReached ?? rawLimits.spend_control_reached ?? false,
+    credits: rawLimits.credits ? {
+      hasCredits: Boolean(rawLimits.credits.hasCredits ?? rawLimits.credits.has_credits),
+      unlimited: Boolean(rawLimits.credits.unlimited),
+      balance: rawLimits.credits.balance ?? null
+    } : null
+  };
+  const primary = { usedPercent: usedRaw, windowDurationMins: winMinsRaw, resetsAt: resetsAtRaw };
   const windowMs = primary.windowDurationMins * 60 * 1000;
   const resetsAtMs = primary.resetsAt * 1000;
   const remainingMs = Math.max(0, resetsAtMs - nowMs);
@@ -719,8 +742,8 @@ function inferBrainDir(transcriptPath) {
   return null;
 }
 
-const QUOTA_ERROR_RE = /\b429\b|resource_exhausted|quota\s*(?:exceeded|exhausted|limit|depleted)|rate[\s_-]*limit|too many requests|capacity/i;
-const NON_QUOTA_ERROR_RE = /\b(?:401|403)\b|unauthenticated|invalid.*(?:api[_ -]?key|token|credential)|permission_denied|blocked by policy/i;
+const QUOTA_ERROR_RE = /\b429\b|resource_exhausted|quota\s*(?:exceeded|exhausted|limit|depleted)|rate[\s_-]*limit|too many requests/i;
+const NON_QUOTA_ERROR_RE = /\b(?:401|403|503)\b|unauthenticated|invalid.*(?:api[_ -]?key|token|credential)|permission_denied|blocked by policy|no capacity available .* on the server|service unavailable/i;
 
 function isAgyQuotaError(text) {
   if (typeof text !== 'string' || !text.trim()) return false;
@@ -742,14 +765,15 @@ function readTailUtf8(file, maxBytes) {
 
 function scanAgyTranscriptUsage(options = {}) {
   const nowMs = options.nowMs ?? Date.now();
-  const brainDir = options.brainDir || inferBrainDir(options.transcriptPath) || path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
+  const defaultBrain = process.env.CODEX_EXECUTOR_TEST_ROOT ? null : path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
+  const brainDir = options.brainDir || inferBrainDir(options.transcriptPath) || defaultBrain;
   const maxFiles = options.maxFiles ?? 80;
   const maxBytesPerFile = options.maxBytesPerFile ?? (2 * 1024 * 1024);
   const cutoff7d = nowMs - 7 * 24 * 3600 * 1000;
   const cutoff5h = nowMs - 5 * 3600 * 1000;
   const recentDegradeCutoff = nowMs - 15 * 60 * 1000;
 
-  const emptyBucket = () => ({ requests: 0, input_tokens: 0, cache_read_tokens: 0, output_tokens: 0, total_tokens: 0, by_model: {} });
+  const emptyBucket = () => ({ requests: 0, input_tokens: 0, cache_read_tokens: 0, output_tokens: 0, total_tokens: 0, weighted_tokens: 0, by_model: {} });
   const win5h = emptyBucket(), win7d = emptyBucket();
   if (!brainDir || !fs.existsSync(brainDir)) {
     return { available: false, source: 'local_transcripts', brain_dir: brainDir || null, reason: 'Antigravity transcript directory not found' };
@@ -774,15 +798,17 @@ function scanAgyTranscriptUsage(options = {}) {
   let quotaErrors5h = 0, latestQuotaErrorAt = null, truncatedFiles = 0;
   const addUsage = (bucket, model, inp, cache, out) => {
     const total = inp + out;
+    const weighted = Math.round(inp + cache * 0.1 + out * 5);
     bucket.requests += 1;
     bucket.input_tokens += inp;
     bucket.cache_read_tokens += cache;
     bucket.output_tokens += out;
     bucket.total_tokens += total;
+    bucket.weighted_tokens += weighted;
     const key = model || 'unknown';
-    if (!bucket.by_model[key]) bucket.by_model[key] = { requests: 0, input_tokens: 0, cache_read_tokens: 0, output_tokens: 0, total_tokens: 0 };
+    if (!bucket.by_model[key]) bucket.by_model[key] = { requests: 0, input_tokens: 0, cache_read_tokens: 0, output_tokens: 0, total_tokens: 0, weighted_tokens: 0 };
     const m = bucket.by_model[key];
-    m.requests += 1; m.input_tokens += inp; m.cache_read_tokens += cache; m.output_tokens += out; m.total_tokens += total;
+    m.requests += 1; m.input_tokens += inp; m.cache_read_tokens += cache; m.output_tokens += out; m.total_tokens += total; m.weighted_tokens += weighted;
   };
 
   for (const item of selected) {
@@ -950,9 +976,15 @@ function decideRoute(input = {}) {
       fallbackEngine = 'codex';
       reason = 'both_constrained_codex_fallback';
     } else if (!codexPacing.available) {
-      preferredEngine = 'codex';
-      fallbackEngine = 'codex';
-      reason = 'codex_quota_unavailable_codex_first';
+      if ((activeTasks?.count || 0) >= 2 && !agyConstrained) {
+        preferredEngine = agy5hCaution ? 'balanced' : 'agy';
+        fallbackEngine = 'codex';
+        reason = 'codex_quota_unavailable_busy_route_agy';
+      } else {
+        preferredEngine = 'codex';
+        fallbackEngine = 'codex';
+        reason = 'codex_quota_unavailable_codex_first';
+      }
     } else if (codexPacing.band === 'codex_drain') {
       preferredEngine = 'codex';
       fallbackEngine = 'codex';
@@ -1037,9 +1069,10 @@ function decideRoute(input = {}) {
 
   const effectivePlanDays = codexPacing.plan_days ?? policy.pacing?.plan_days ?? null;
   const codexPlanLabel = effectivePlanDays ? `${effectivePlanDays}天` : '7天';
+  const codexSourceTag = codexPacing.stale ? '，缓存回退' : (codexPacing.fallback_after_timeout ? '，会话日志回退' : '');
   const codexText = codexPacing.available
-    ? `Codex ${codexPlanLabel}进度 ${codexPacing.elapsed_percent}% / 已用 ${codexPacing.used_percent}%（偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%，距重置 ${codexPacing.hours_until_reset}h）`
-    : 'Codex 实时配额暂未读取（默认优先 Codex）';
+    ? `Codex ${codexPlanLabel}进度 ${codexPacing.elapsed_percent}% / 已用 ${codexPacing.used_percent}%（偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%，距重置 ${codexPacing.hours_until_reset}h${codexSourceTag}）`
+    : ((activeTasks?.count || 0) >= 2 ? `Codex 实时配额超时（在途${activeTasks.count}个，暂分流AGY）` : 'Codex 实时配额暂未读取（默认优先 Codex）');
 
   const agy5hText = agyPacing.window_5h.used_percent !== null
     ? `AGY 5h已用 ${agyPacing.window_5h.used_percent}%（${agyPacing.window_5h.status}）`
@@ -1183,6 +1216,148 @@ function readQuotaCache(cachePath, ttlSeconds = 60, nowMs = Date.now()) {
   } catch { return null; }
 }
 
+function readStaleQuotaCache(cachePath, nowMs = Date.now(), maxStaleSeconds = 43200) {
+  if (!cachePath || !fs.existsSync(cachePath)) return null;
+  try {
+    const doc = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    const fetchedAt = Date.parse(doc.fetched_at);
+    if (!Number.isFinite(fetchedAt) || nowMs - fetchedAt > maxStaleSeconds * 1000) return null;
+    const resetsAtMs = Date.parse(doc?.codex_pacing?.resets_at);
+    if (doc?.codex_pacing?.available && Number.isFinite(resetsAtMs) && resetsAtMs <= nowMs) return null;
+    return doc;
+  } catch { return null; }
+}
+
+function defaultCodexSessionsDir(settings, options = {}) {
+  if (options.codexSessionsDir !== undefined) return options.codexSessionsDir || null;
+  if (settings?.codex_sessions_dir !== undefined) return settings.codex_sessions_dir || null;
+  if (process.env.CODEX_EXECUTOR_TEST_ROOT) return null;
+  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+  return path.join(codexHome, 'sessions');
+}
+
+function listRecentRolloutFiles(sessionsDir, maxFiles = 6) {
+  if (!sessionsDir || !fs.existsSync(sessionsDir)) return [];
+  const results = [];
+  const descDirs = dir => {
+    try {
+      return fs.readdirSync(dir, { withFileTypes: true })
+        .filter(e => e.isDirectory())
+        .map(e => e.name)
+        .sort((a, b) => b.localeCompare(a));
+    } catch { return []; }
+  };
+  // Handle both YYYY/MM/DD nested layout and flat rollout-*.jsonl layout (for tests).
+  try {
+    const direct = fs.readdirSync(sessionsDir, { withFileTypes: true })
+      .filter(e => e.isFile() && e.name.startsWith('rollout-') && e.name.endsWith('.jsonl'))
+      .map(e => { const p = path.join(sessionsDir, e.name); return { p, st: fs.statSync(p) }; });
+    if (direct.length) {
+      return direct.sort((a, b) => b.st.mtimeMs - a.st.mtimeMs).slice(0, maxFiles);
+    }
+  } catch {}
+  let visitedDays = 0;
+  for (const yr of descDirs(sessionsDir).slice(0, 2)) {
+    for (const mo of descDirs(path.join(sessionsDir, yr)).slice(0, 2)) {
+      for (const dy of descDirs(path.join(sessionsDir, yr, mo)).slice(0, 3)) {
+        const dayDir = path.join(sessionsDir, yr, mo, dy);
+        try {
+          for (const e of fs.readdirSync(dayDir, { withFileTypes: true })) {
+            if (!e.isFile() || !e.name.startsWith('rollout-') || !e.name.endsWith('.jsonl')) continue;
+            const p = path.join(dayDir, e.name);
+            results.push({ p, st: fs.statSync(p) });
+          }
+        } catch {}
+        visitedDays += 1;
+        if (visitedDays >= 2 && results.length >= maxFiles) break;
+      }
+      if (visitedDays >= 2 && results.length >= maxFiles) break;
+    }
+    if (visitedDays >= 2 && results.length >= maxFiles) break;
+  }
+  return results.sort((a, b) => b.st.mtimeMs - a.st.mtimeMs).slice(0, maxFiles);
+}
+
+function readLatestCodexRolloutRateLimits(options = {}) {
+  const nowMs = options.nowMs ?? Date.now();
+  const maxAgeMs = options.maxAgeMs ?? (12 * 3600 * 1000);
+  const files = listRecentRolloutFiles(options.codexSessionsDir, options.maxFiles ?? 6);
+  let best = null;
+  for (const item of files) {
+    if (nowMs - item.st.mtimeMs > maxAgeMs + 60000) continue;
+    let text;
+    try { ({ text } = readTailUtf8(item.p, 262144)); } catch { continue; }
+    const lines = text.split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line || !line.includes('rate_limits')) continue;
+      let parsed;
+      try { parsed = JSON.parse(line); } catch { continue; }
+      const rl = parsed?.payload?.rate_limits || parsed?.rate_limits || null;
+      const primary = rl?.primary || null;
+      const resetsAt = primary?.resets_at ?? primary?.resetsAt;
+      const usedPct = primary?.used_percent ?? primary?.usedPercent;
+      if (typeof usedPct !== 'number' || typeof resetsAt !== 'number' || resetsAt * 1000 <= nowMs) continue;
+      const tsMs = Date.parse(parsed.timestamp) || item.st.mtimeMs;
+      if (nowMs - tsMs > maxAgeMs) continue;
+      if (!best || tsMs > best.tsMs) {
+        best = { tsMs, rateLimits: rl, observed_at: new Date(tsMs).toISOString() };
+      }
+      break; // Latest rate_limits in this file found.
+    }
+  }
+  return best;
+}
+
+const NATIVE_CODEX_REQUIRED_RE = /native_luna|spawn_agent|waiting_background|原生\s*luna|原生子\s*agent|后台托管/i;
+
+function evaluateCodexConcurrencyGate({ args = {}, projectPolicy, codexPacing, agyPacing, totalActiveCodexTasks = 0 }) {
+  if (!projectPolicy || projectPolicy.mode !== 'auto' || args.review_only === true) return { blocked: false };
+  if (agyPacing?.limited) return { blocked: false }; // AGY is limited => Codex acts as fallback without throttling.
+  if (!codexPacing?.available) return { blocked: false };
+
+  const cfg = { ...DEFAULT_PACING, ...(projectPolicy.pacing || {}) };
+  const used = codexPacing.used_percent;
+  const isContinuation = Boolean(args.topic_id || args.session_id || args.parent_job_id);
+  const text = `${args.topic || ''}\n${args.prompt || ''}`;
+
+  if (codexPacing.hard_limited || codexPacing.band === 'codex_protected') {
+    if (cfg.protect_max_concurrent !== null && totalActiveCodexTasks >= cfg.protect_max_concurrent) {
+      return {
+        blocked: true,
+        kind: 'codex_protect_concurrency',
+        reason: `[CODEX_CONCURRENCY_THROTTLED] Codex 当前已用 ${used}%（触及 ≥${cfg.codex_protect_used_percent}% 保护线），全局在途 Codex 任务 ${totalActiveCodexTasks} 个已达保护期并发上限 ${cfg.protect_max_concurrent}；请先等在途任务收口，或将不依赖 Codex 原生子代理的工作改由 AGY 执行。`
+      };
+    }
+    if (!isContinuation && !NATIVE_CODEX_REQUIRED_RE.test(text)) {
+      return {
+        blocked: true,
+        kind: 'codex_protect_new_task',
+        reason: `[CODEX_QUOTA_PROTECTED] Codex 当前已用 ${used}%（触及 ≥${cfg.codex_protect_used_percent}% 保护线）且 AGY 可用，普通新事项请直接改由 AGY 执行；如确属必须留 Codex 的原生 luna / spawn_agent 或长后台流水线，请在 prompt 中写明或临时切换为 codex 模式。`
+      };
+    }
+    return { blocked: false };
+  }
+
+  if (used >= cfg.agy_priority_used_percent && cfg.high_max_concurrent !== null && totalActiveCodexTasks >= cfg.high_max_concurrent) {
+    return {
+      blocked: true,
+      kind: 'codex_high_concurrency',
+      reason: `[CODEX_CONCURRENCY_THROTTLED] Codex 当前已用 ${used}%（≥${cfg.agy_priority_used_percent}% 高水位），全局在途 Codex 任务 ${totalActiveCodexTasks} 个已达高水位并发上限 ${cfg.high_max_concurrent}；避免粘性续接打穿剩余额度，请等在途任务收口后再派发，或将通用任务分流给 AGY 执行。`
+    };
+  }
+
+  if ((codexPacing.band === 'agy_priority' || used >= 85) && cfg.ahead_max_concurrent !== null && totalActiveCodexTasks >= cfg.ahead_max_concurrent) {
+    return {
+      blocked: true,
+      kind: 'codex_ahead_concurrency',
+      reason: `[CODEX_CONCURRENCY_THROTTLED] Codex 消耗超前（已用 ${used}%，相对线性目标偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%），全局在途 Codex 任务 ${totalActiveCodexTasks} 个已达超前并发上限 ${cfg.ahead_max_concurrent}；请等在途任务收口后再续派，或将通用任务交由 AGY 执行。`
+    };
+  }
+
+  return { blocked: false };
+}
+
 function writeQuotaCache(cachePath, payload) {
   if (!cachePath) return;
   try { saveAtomic(cachePath, { ...payload, fetched_at: new Date().toISOString() }); } catch {}
@@ -1200,12 +1375,14 @@ module.exports = {
   parsePolicy,
   defaultPolicyPath,
   defaultQuotaCachePath,
+  defaultCodexSessionsDir,
   loadRoutingPolicy,
   saveRoutingPolicy,
   resolveProjectPolicy,
   evaluateCodexPacing,
   evaluateAgyPacing,
   evaluateAgyModelPools,
+  evaluateCodexConcurrencyGate,
   scanAgyTranscriptUsage,
   runExternalAgyProbe,
   activeCodexTasks,
@@ -1213,6 +1390,8 @@ module.exports = {
   decideRoute,
   evaluateSubagentCall,
   readQuotaCache,
+  readStaleQuotaCache,
+  readLatestCodexRolloutRateLimits,
   writeQuotaCache,
   isAgyQuotaError,
   saveAtomic

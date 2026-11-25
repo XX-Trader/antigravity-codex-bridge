@@ -5,12 +5,18 @@ const { Broker, inside, terminal, executionSandbox } = require('./server.cjs');
 const {
   defaultPolicyPath,
   defaultQuotaCachePath,
+  defaultCodexSessionsDir,
   loadRoutingPolicy,
   resolveProjectPolicy,
+  evaluateCodexPacing,
+  evaluateAgyPacing,
+  evaluateCodexConcurrencyGate,
   evaluateSubagentCall,
   activeCodexTasks,
   decideRoute,
   readQuotaCache,
+  readStaleQuotaCache,
+  readLatestCodexRolloutRateLimits,
   scanAgyTranscriptUsage,
   saveAtomic
 } = require('./routing-policy.cjs');
@@ -46,6 +52,33 @@ function effectiveScopePolicy(scopes, options = {}) {
   return { rawPolicy: policy, policyPath, selected: locked || resolved[0] };
 }
 
+function isReadOnlyTaskStatusCall(name, args = {}) {
+  if (/(?:^|[_/.:-])command_status$/i.test(name)) return true;
+  const action = String(args.Action || args.action || '').trim().toLowerCase();
+  if (/(?:^|[_/.:-])manage_task$/i.test(name) && ['list', 'status'].includes(action)) return true;
+  if (/(?:^|[_/.:-])manage_subagents$/i.test(name) && action === 'list') return true;
+  return false;
+}
+
+function resolveFastCodexPacing(scope, projectPolicy, options = {}) {
+  const nowMs = options.nowMs ?? Date.now();
+  const policyPath = options.policyPath || defaultPolicyPath(scope);
+  const cachePath = options.cachePath || defaultQuotaCachePath(policyPath, scope);
+  const fresh = readQuotaCache(cachePath, Math.max(projectPolicy.cache_ttl_seconds || 60, 300), nowMs);
+  if (fresh?.codex_pacing?.available) return { codexPacing: fresh.codex_pacing, cached: fresh };
+  const sessionsDir = defaultCodexSessionsDir(scope, options);
+  const rollout = sessionsDir ? readLatestCodexRolloutRateLimits({ codexSessionsDir: sessionsDir, nowMs }) : null;
+  const fromRollout = rollout ? evaluateCodexPacing(rollout, projectPolicy.pacing, nowMs) : null;
+  const stale = readStaleQuotaCache(cachePath, nowMs);
+  if (fromRollout?.available && (!stale?.codex_pacing?.available || fromRollout.used_percent >= stale.codex_pacing.used_percent)) {
+    return { codexPacing: { ...fromRollout, source: 'codex_rollout_log', observed_at: rollout.observed_at }, cached: stale };
+  }
+  if (stale?.codex_pacing?.available) {
+    return { codexPacing: { ...stale.codex_pacing, stale: true, source: 'stale_cache' }, cached: stale };
+  }
+  return { codexPacing: { available: false }, cached: fresh || stale || null };
+}
+
 function bindOrigin(payload, projects, options = {}) {
   const name = payload?.toolCall?.name || '';
   if (/(?:^|[_/.:-])call_mcp_tool$/.test(name)) {
@@ -59,19 +92,21 @@ function bindOrigin(payload, projects, options = {}) {
   const match = name.match(/(?:^|[_/.:-])(codex_run|codex_sessions|codex_list|codex_wait|codex_result|codex_cancel|codex_quota)$/);
   if (!match) {
     const scopes = scopesFor(payload.workspacePaths || [], projects);
-    if (!executionPattern.test(name) || !scopes.length) return { decision: 'allow' };
+    if (!executionPattern.test(name)) return { decision: 'allow' };
+    if (!scopes.length) return { decision: 'allow' };
     const { policyPath, selected } = effectiveScopePolicy(scopes, options);
     const projectPolicy = selected.policy;
     if (projectPolicy.mode === 'codex') {
       return { decision: 'deny', reason: '本项目当前处于 codex 锁定模式：由 Antigravity 规划和验收，执行必须交给 codex_run；需要子 agent 时由 Codex 会话启动原生子 agent。如需同时启用 AGY 低成本多子代理，请将模式切回 auto 或 agy。' };
     }
+    const args = payload.toolCall?.args || {};
+    if (isReadOnlyTaskStatusCall(name, args)) return { decision: 'allow' };
     const gate = checkAgyExecutionGate(payload, selected.scope, projectPolicy, {
       policyPath,
       guardStateFile: options.guardStateFile,
       nowMs: options.nowMs
     });
     if (gate.blocked) return { decision: 'deny', reason: gate.reason };
-    const args = payload.toolCall?.args || {};
     const active = activeCodexTasks(selected.scope);
     const notes = [];
     if (gate.advisory) notes.push(gate.advisory);
@@ -108,9 +143,24 @@ function bindOrigin(payload, projects, options = {}) {
   cwd ||= scopes[0].project;
   const overwrite = { cwd };
   if (tool === 'codex_run') {
-    try { executionSandbox(args, scopes.find(p => inside(p.project, cwd))); }
+    const ownerScope = scopes.find(p => inside(p.project, cwd)) || scopes[0];
+    try { executionSandbox(args, ownerScope); }
     catch (error) { return { decision: 'deny', reason: error.message }; }
     if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(payload.conversationId || '')) return { decision: 'deny', reason: '缺少真实发起会话 ID。' };
+    const { policyPath, selected } = effectiveScopePolicy([ownerScope], options);
+    const guardFile = options.guardStateFile || defaultGuardStatePath(policyPath, selected.scope);
+    const guardCooldown = readGuardQuotaCooldown(guardFile, options.nowMs);
+    const effPolicy = { ...selected.policy, ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
+    if (effPolicy.mode === 'auto' && args.review_only !== true) {
+      const { codexPacing, cached } = resolveFastCodexPacing(selected.scope, effPolicy, { ...options, policyPath });
+      if (codexPacing.available) {
+        const agyUsage = cached?.agy_usage || { available: false };
+        const agyPacing = evaluateAgyPacing({ agyUsage, agyExternal: cached?.agy_external || null, projectPolicy: effPolicy, codexPacing, nowMs: options.nowMs });
+        const totalActive = projects.reduce((sum, p) => sum + activeCodexTasks(p).count, 0);
+        const concGate = evaluateCodexConcurrencyGate({ args, projectPolicy: effPolicy, codexPacing, agyPacing, totalActiveCodexTasks: totalActive });
+        if (concGate.blocked) return { decision: 'deny', reason: concGate.reason };
+      }
+    }
     overwrite.conversation_id = payload.conversationId;
   }
   return { decision: 'allow', overwrite };
@@ -128,15 +178,14 @@ function contextHook(payload, projects, options = {}) {
   const guardFile = options.guardStateFile || defaultGuardStatePath(policyPath, selected.scope);
   const guardCooldown = readGuardQuotaCooldown(guardFile, options.nowMs);
   const projectPolicy = { ...selected.policy, ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
-  const cachePath = options.cachePath || defaultQuotaCachePath(policyPath, selected.scope);
-  const cached = readQuotaCache(cachePath, Math.max(projectPolicy.cache_ttl_seconds || 60, 300), options.nowMs);
+  const { codexPacing, cached } = resolveFastCodexPacing(selected.scope, projectPolicy, { ...options, policyPath });
   const agyUsage = cached?.agy_usage || scanAgyTranscriptUsage({ transcriptPath: payload?.transcriptPath, brainDir: options.brainDir, nowMs: options.nowMs });
   const active = activeCodexTasks(selected.scope);
   const route = decideRoute({
     policy: rawPolicy,
     projectPolicy,
     projectScope: selected.scope,
-    codexPacing: cached?.codex_pacing || { available: false },
+    codexPacing,
     agyUsage,
     agyExternal: cached?.agy_external || null,
     activeCodexTasks: active,
