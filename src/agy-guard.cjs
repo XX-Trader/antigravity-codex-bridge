@@ -255,6 +255,15 @@ function checkAgyExecutionGate(payload, scope, projectPolicy, options = {}) {
     const validHours = guardCfg.review_valid_hours ?? 12;
     const review = findRecentCodexReview(scope, validHours, payload?.conversationId || null, nowMs);
     if (!review) {
+      if (options.codexExhausted === true) {
+        if (gateLevel === 'strict' || projectPolicy?.review_category === 'quant') {
+          return {
+            blocked: false,
+            advisory: '提示：当前 Codex 周额度已 100% 耗尽，先审后做门禁已自动免除 codex_run(review_only=true) 以防死锁；重要改动前请先派 AGY 只读 research 子代理完成独立核查。'
+          };
+        }
+        return { blocked: false };
+      }
       if (gateLevel === 'strict') {
         return {
           blocked: true,

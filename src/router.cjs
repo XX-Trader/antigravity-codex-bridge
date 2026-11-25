@@ -8,6 +8,7 @@ const {
   resolveProjectPolicy,
   evaluateAgyPacing,
   evaluateCodexConcurrencyGate,
+  evaluateAgyQuotaGate,
   evaluateSubagentCall,
   activeCodexTasks,
   decideRoute,
@@ -76,21 +77,31 @@ function bindOrigin(payload, projects, options = {}) {
     }
     const args = payload.toolCall?.args || {};
     if (isReadOnlyTaskStatusCall(name, args)) return { decision: 'allow' };
-    const gate = checkAgyExecutionGate(payload, selected.scope, projectPolicy, {
+    const guardFile = options.guardStateFile || defaultGuardStatePath(policyPath, selected.scope);
+    const guardCooldown = readGuardQuotaCooldown(guardFile, options.nowMs);
+    const effPolicy = { ...projectPolicy, ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
+    const { codexPacing, agyUsage, agyExternal } = resolveSharedQuotaSnapshot(selected.scope, effPolicy, { ...options, policyPath });
+    const agyPacing = evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy: effPolicy, codexPacing, nowMs: options.nowMs });
+    const gate = checkAgyExecutionGate(payload, selected.scope, effPolicy, {
       policyPath,
-      guardStateFile: options.guardStateFile,
+      guardStateFile: guardFile,
+      codexExhausted: Boolean(codexPacing?.available && codexPacing.exhausted),
       nowMs: options.nowMs
     });
     if (gate.blocked) return { decision: 'deny', reason: gate.reason };
+    const agyQuotaGate = evaluateAgyQuotaGate({ toolName: name, args, projectPolicy: effPolicy, codexPacing, agyPacing, nowMs: options.nowMs });
+    if (agyQuotaGate.blocked) return { decision: 'deny', reason: agyQuotaGate.reason };
     const active = activeCodexTasks(selected.scope);
     const notes = [];
     if (gate.advisory) notes.push(gate.advisory);
     if (gate.review) notes.push(`已关联 Codex 只读审核(${gate.review.job_id.slice(0, 8)})。`);
+    if (agyQuotaGate.note) notes.push(agyQuotaGate.note);
     let overwrite;
     if (subagentInvokePattern.test(name)) {
-      const sub = evaluateSubagentCall(args, projectPolicy);
+      const sub = evaluateSubagentCall(args, effPolicy);
       if (sub.overwrite) overwrite = sub.overwrite;
-      if (sub.note) notes.push(sub.note);
+      if (agyQuotaGate.overwrite) overwrite = { ...(overwrite || {}), ...agyQuotaGate.overwrite };
+      if (sub.note && !agyQuotaGate.overwrite) notes.push(sub.note);
       if (active.count > 0 && !readOnlySubagentType(args) && !isolatedWorkspace(args)) {
         notes.push(`注意：当前项目有 ${active.count} 个活跃 Codex 任务；并行写同一仓库时请切分非重叠目录或为子代理指定 Workspace="share"，并由主会话串行做 Git 提交。`);
       }
@@ -126,7 +137,7 @@ function bindOrigin(payload, projects, options = {}) {
     const guardFile = options.guardStateFile || defaultGuardStatePath(policyPath, selected.scope);
     const guardCooldown = readGuardQuotaCooldown(guardFile, options.nowMs);
     const effPolicy = { ...selected.policy, ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
-    if (effPolicy.mode === 'auto' && args.review_only !== true) {
+    if (effPolicy.mode === 'auto') {
       const { codexPacing, agyUsage, agyExternal } = resolveSharedQuotaSnapshot(selected.scope, effPolicy, { ...options, policyPath });
       if (codexPacing.available) {
         const agyPacing = evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy: effPolicy, codexPacing, nowMs: options.nowMs });
@@ -221,6 +232,7 @@ function contextHook(payload, projects, options = {}) {
     ...(poolLines.length ? [`AGY 独立模型池保护：${poolLines.join('；')}。`] : []),
     `AGY 安全门禁：先审后做=${projectPolicy.agy_guard.review_gate}（重要/量化改动建议先 codex_run(review_only=true) 再交 AGY 实施）；防死循环=同一错误连错 ${projectPolicy.agy_guard.max_same_error_failures} 次或无进展连错 ${projectPolicy.agy_guard.max_consecutive_failures} 次自动熔断（不同错误允许自行修复，成功即清零）。`
   ];
+  if (route.exhaustion_handover?.guidance) lines.push(`[额度耗尽与交接] ${route.exhaustion_handover.guidance}`);
   if (route.thinking_guidance?.reminder) lines.push(`${route.thinking_guidance.current_model_pool_stopped ? '[模型池硬停告警]' : '[思考模型提示]'} ${route.thinking_guidance.reminder}`);
   if (active.count > 0) lines.push(`[并发防撞] 当前项目有 ${active.count} 个活跃 Codex 任务；AGY 写操作请避开重叠文件或使用 Workspace="share"。`);
 

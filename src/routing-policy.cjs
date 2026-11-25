@@ -44,6 +44,7 @@ const DEFAULT_AGY_PACING = Object.freeze({
   window_5h_caution_percent: 75,  // AGY 5h >= 75% => throttle to balanced to avoid hitting 5h wall
   window_5h_protect_percent: 88,  // AGY 5h >= 88% => AGY 5h limited (keeps 12% 5h buffer), Codex takes over as fallback
   weekly_protect_used_percent: 90,// Hard reserve 10% weekly buffer for sudden burst usage
+  buffer_unlock_window_hours: 6,  // Auto-unlock reserved 10% buffer within final 6h before weekly reset
   drain_window_hours: 12,
   drain_min_remaining_percent: 10,// Only drain when >= 10% usable headroom remains below target_utilization
   window_5h_tokens: null,         // Optional local 5h token calibration budget
@@ -211,6 +212,7 @@ function parsePolicy(raw) {
       ['window_5h_caution_percent', 30, 99],
       ['window_5h_protect_percent', 40, 100],
       ['weekly_protect_used_percent', 60, 100],
+      ['buffer_unlock_window_hours', 0, 72],
       ['drain_window_hours', 0, 72],
       ['drain_min_remaining_percent', 1, 80]
     ]) {
@@ -280,6 +282,8 @@ function parsePolicy(raw) {
       pools[name] = {
         match,
         weekly_protect_used_percent: weeklyProtect,
+        buffer_unlock_window_hours: typeof cfg.buffer_unlock_window_hours === 'number' && Number.isFinite(cfg.buffer_unlock_window_hours) && cfg.buffer_unlock_window_hours >= 0 && cfg.buffer_unlock_window_hours <= 72
+          ? cfg.buffer_unlock_window_hours : null,
         window_5h_caution_percent: caution5h,
         window_5h_protect_percent: Math.max(caution5h, protect5hRaw),
         window_5h_tokens: typeof cfg.window_5h_tokens === 'number' && Number.isFinite(cfg.window_5h_tokens) && cfg.window_5h_tokens > 0 ? Math.floor(cfg.window_5h_tokens) : null,
@@ -506,15 +510,22 @@ function evaluateCodexPacing(rateLimitReply, pacingCfg = DEFAULT_PACING, nowMs =
   else band = 'codex_priority';
 
   const resetCredits = rateLimitReply?.rateLimitResetCredits;
+  const resetCreditsCount = Number(resetCredits?.availableCount || 0);
   const nextCreditExpiry = Array.isArray(resetCredits?.credits)
     ? resetCredits.credits.map(c => Number(c?.expiresAt)).filter(Number.isFinite).sort((a, b) => a - b)[0] || null
     : null;
+  const exhausted = hardLimited || usedPercent >= 100;
+  const numericBalance = limits.credits?.balance !== null && limits.credits?.balance !== undefined ? Number(limits.credits.balance) : 0;
+  const hasExtraCredits = Boolean(limits.credits && (limits.credits.unlimited || (limits.credits.hasCredits && Number.isFinite(numericBalance) && numericBalance > 0)));
 
   return {
     available: true,
     plan_type: limits.planType || null,
     ordinary_usage_allowed: rateLimitReply?.ordinaryUsageAllowed ?? null,
     hard_limited: hardLimited,
+    exhausted,
+    has_extra_credits: hasExtraCredits,
+    has_reset_credits: resetCreditsCount > 0,
     rate_limit_reached_type: limits.rateLimitReachedType || null,
     window_minutes: primary.windowDurationMins,
     plan_days: effectivePlanDays,
@@ -638,19 +649,24 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
   }
 
   let window7d;
+  const unlockHours = cfg.buffer_unlock_window_hours ?? DEFAULT_AGY_PACING.buffer_unlock_window_hours;
   if (weeklyUsed !== null && Number.isFinite(weeklyResetsAtMs)) {
     const remainingMs = Math.max(0, weeklyResetsAtMs - nowMs);
     const hoursUntilReset = round2(remainingMs / 3600000);
+    const bufferUnlocked = unlockHours > 0 && hoursUntilReset > 0 && hoursUntilReset <= unlockHours && cfg.weekly_protect_used_percent < 100;
+    const effectiveTarget = bufferUnlocked ? 100 : cfg.target_utilization;
+    const effectiveProtect = bufferUnlocked ? 100 : cfg.weekly_protect_used_percent;
     const elapsedRatio = clamp(1 - remainingMs / window7dMs, 0, 1);
     const elapsedPercent = round2(elapsedRatio * 100);
-    const targetUsedPercent = round2(elapsedRatio * cfg.target_utilization);
+    const targetUsedPercent = round2(elapsedRatio * effectiveTarget);
     const remainingPercent = round2(Math.max(0, 100 - weeklyUsed));
-    const bufferPercent = round2(Math.max(0, 100 - cfg.weekly_protect_used_percent));
-    const usableRemainingPercent = round2(Math.max(0, Math.min(cfg.target_utilization, cfg.weekly_protect_used_percent) - weeklyUsed));
+    const bufferPercent = round2(Math.max(0, 100 - effectiveProtect));
+    const usableRemainingPercent = round2(Math.max(0, Math.min(effectiveTarget, effectiveProtect) - weeklyUsed));
     const pacingDelta = round2(weeklyUsed - targetUsedPercent);
 
     let band;
-    if (weeklyUsed >= cfg.weekly_protect_used_percent) band = 'agy_protected';
+    if (weeklyUsed >= effectiveProtect) band = 'agy_protected';
+    else if (bufferUnlocked && usableRemainingPercent >= 1) band = 'agy_drain';
     else if (hoursUntilReset > 0 && hoursUntilReset <= cfg.drain_window_hours && usableRemainingPercent >= cfg.drain_min_remaining_percent) band = 'agy_drain';
     else if (pacingDelta <= -3) band = 'agy_priority';
     else if (pacingDelta <= 5) band = 'balanced';
@@ -660,8 +676,12 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
       available: true,
       source: weeklySource,
       window_minutes: cfg.window_minutes,
-      target_utilization: cfg.target_utilization,
-      protect_used_percent: cfg.weekly_protect_used_percent,
+      target_utilization: effectiveTarget,
+      configured_target_utilization: cfg.target_utilization,
+      protect_used_percent: effectiveProtect,
+      configured_protect_used_percent: cfg.weekly_protect_used_percent,
+      buffer_unlock_window_hours: unlockHours,
+      buffer_unlocked: bufferUnlocked,
       buffer_percent: bufferPercent,
       used_percent: weeklyUsed,
       remaining_percent: remainingPercent,
@@ -682,18 +702,27 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
       window_minutes: cfg.window_minutes,
       target_utilization: cfg.target_utilization,
       protect_used_percent: cfg.weekly_protect_used_percent,
+      buffer_unlock_window_hours: unlockHours,
+      buffer_unlocked: false,
       buffer_percent: round2(Math.max(0, 100 - cfg.weekly_protect_used_percent)),
       tokens_7d: agyUsage?.available ? (agyUsage.window_7d?.total_tokens ?? null) : null,
       budget_tokens_7d: cfg.window_7d_tokens,
-      note: `AGY 官方未公开剩余百分比 API（默认只用 ${cfg.target_utilization}% 额度、预留 ${round2(Math.max(0, 100 - cfg.weekly_protect_used_percent))}% 应急缓冲）；如需启用精确 AGY 7 天等比例竞比，可用 Mode.ps1 agy-quota 录入面板快照、配 agy-budget 本地预算，或挂外部只读探针。`
+      note: `AGY 默认只用 ${cfg.target_utilization}% 额度、预留 ${round2(Math.max(0, 100 - cfg.weekly_protect_used_percent))}% 应急缓冲（距周重置≤${unlockHours}h 自动解锁）；安装官方 agy CLI 或配置预算后启用精确 7 天竞比。`
     };
   }
+
+  const exhausted5h = recentQuotaErr || (fiveHourUsed !== null && fiveHourUsed >= 100);
+  const exhausted7d = window7d.available && window7d.used_percent >= 100;
+  const exhausted = exhausted5h || exhausted7d;
+  const limited = window5h.status === 'limited' || window7d.band === 'agy_protected';
 
   return {
     window_5h: window5h,
     window_7d: window7d,
-    limited: window5h.status === 'limited' || window7d.band === 'agy_protected',
-    caution: window5h.status === 'caution'
+    limited,
+    caution: window5h.status === 'caution',
+    exhausted,
+    soft_buffered: limited && !exhausted
   };
 }
 
@@ -748,23 +777,29 @@ function evaluateAgyModelPools({ agyUsage, agyExternal, projectPolicy, codexPaci
       weeklyResetsAtMs = Date.parse(codexPacing.resets_at);
     }
 
+    const unlockHours = cfg.buffer_unlock_window_hours ?? projectPolicy?.agy_pacing?.buffer_unlock_window_hours ?? DEFAULT_AGY_PACING.buffer_unlock_window_hours;
+    const hoursUntilReset = Number.isFinite(weeklyResetsAtMs) ? round2(Math.max(0, (weeklyResetsAtMs - nowMs) / 3600000)) : null;
+    const bufferUnlocked = hoursUntilReset !== null && unlockHours > 0 && hoursUntilReset > 0 && hoursUntilReset <= unlockHours && cfg.weekly_protect_used_percent < 100;
+    const effectiveProtect = bufferUnlocked ? 100 : cfg.weekly_protect_used_percent;
+
     let elapsedPercent = null, targetUsedPercent = null, pacingDelta = null, band = 'uncalibrated';
     if (used7d !== null && Number.isFinite(weeklyResetsAtMs)) {
       const remainingMs = Math.max(0, weeklyResetsAtMs - nowMs);
       const elapsedRatio = clamp(1 - remainingMs / window7dMs, 0, 1);
       elapsedPercent = round2(elapsedRatio * 100);
-      targetUsedPercent = round2(elapsedRatio * cfg.weekly_protect_used_percent);
+      targetUsedPercent = round2(elapsedRatio * effectiveProtect);
       pacingDelta = round2(used7d - targetUsedPercent);
-      if (used7d >= cfg.weekly_protect_used_percent) band = 'hard_stop';
+      if (used7d >= effectiveProtect) band = 'hard_stop';
+      else if (bufferUnlocked) band = 'buffer_unlocked_drain';
       else if (pacingDelta > 5) band = 'ahead_of_pace';
       else if (pacingDelta >= -3) band = 'on_pace';
       else band = 'below_pace';
-    } else if (used7d !== null && used7d >= cfg.weekly_protect_used_percent) {
+    } else if (used7d !== null && used7d >= effectiveProtect) {
       band = 'hard_stop';
     }
 
     const cooling = cooldownActive(cfg.cooldown, nowMs);
-    const weeklyStopped = used7d !== null && used7d >= cfg.weekly_protect_used_percent;
+    const weeklyStopped = used7d !== null && used7d >= effectiveProtect;
     const fiveHourLimited = cooling || (used5h !== null && used5h >= cfg.window_5h_protect_percent);
     const fiveHourCaution = !fiveHourLimited && used5h !== null && used5h >= cfg.window_5h_caution_percent;
     const stopped = weeklyStopped || fiveHourLimited;
@@ -776,11 +811,15 @@ function evaluateAgyModelPools({ agyUsage, agyExternal, projectPolicy, codexPaci
     result[name] = {
       match: token,
       source,
-      weekly_protect_used_percent: cfg.weekly_protect_used_percent,
-      buffer_percent: round2(Math.max(0, 100 - cfg.weekly_protect_used_percent)),
+      weekly_protect_used_percent: effectiveProtect,
+      configured_protect_used_percent: cfg.weekly_protect_used_percent,
+      buffer_unlock_window_hours: unlockHours,
+      buffer_unlocked: bufferUnlocked,
+      hours_until_reset: hoursUntilReset,
+      buffer_percent: round2(Math.max(0, 100 - effectiveProtect)),
       weekly_used_percent: used7d,
       weekly_remaining_percent: used7d !== null ? round2(Math.max(0, 100 - used7d)) : null,
-      usable_remaining_percent: used7d !== null ? round2(Math.max(0, cfg.weekly_protect_used_percent - used7d)) : null,
+      usable_remaining_percent: used7d !== null ? round2(Math.max(0, effectiveProtect - used7d)) : null,
       elapsed_percent: elapsedPercent,
       target_used_percent: targetUsedPercent,
       pacing_delta: pacingDelta,
@@ -1327,14 +1366,24 @@ function decideRoute(input = {}) {
   const agy5hCaution = agyPacing.window_5h.status === 'caution';
   const agy7dProtected = agyPacing.window_7d.band === 'agy_protected';
   const agyConstrained = agy5hLimited || agy7dProtected;
+  const agyExhausted = Boolean(agyPacing.exhausted);
+  const codexExhausted = Boolean(codexPacing.available && codexPacing.exhausted);
   const codexHardBlocked = codexCooling || codexPacing.hard_limited === true || codexPacing.band === 'codex_protected';
   const dualMargin = policy.agy_pacing?.dual_compare_margin ?? DEFAULT_AGY_PACING.dual_compare_margin;
+
+  const resetCandidates = [
+    codexPacing.hours_until_reset,
+    agyPacing.window_5h.hours_until_reset,
+    agyPacing.window_7d.hours_until_reset
+  ].filter(v => typeof v === 'number' && Number.isFinite(v) && v > 0);
+  const earliestResetHours = resetCandidates.length ? round2(Math.min(...resetCandidates)) : null;
 
   let preferredEngine = 'codex';
   let fallbackEngine = 'codex';
   let reason = 'default_codex_first';
   let agyAllowed = mode !== 'codex';
   let codexAllowed = mode !== 'agy';
+  let emergencyRationing = false;
 
   if (mode === 'codex') {
     preferredEngine = 'codex';
@@ -1345,27 +1394,60 @@ function decideRoute(input = {}) {
     fallbackEngine = 'codex';
     reason = agy5hLimited ? 'locked_agy_mode_5h_limited_warning' : 'locked_agy_mode';
   } else {
-    // Auto mode: Dual 7-day 100% proportional pacing + AGY 5h window limit + Codex fallback.
+    // Auto mode: Dual proportional pacing + final-6h AGY 10% buffer unlock + symmetric exhaustion handover.
     if (agyConstrained && !codexHardBlocked) {
       preferredEngine = 'codex';
       fallbackEngine = 'codex';
+      if (codexPacing.available) agyAllowed = false;
       reason = agy5hLimited
         ? (agyPacing.window_5h.reason === 'agy_recent_429_quota_error'
           ? 'agy_recent_quota_error_codex_fallback'
           : agyPacing.window_5h.reason === 'agy_manual_cooldown'
             ? 'agy_cooldown_codex_fallback'
             : agyPacing.window_5h.reason === 'agy_hint_low'
-              ? 'agy_hint_low_codex_fallback'
+               ? 'agy_hint_low_codex_fallback'
               : 'agy_5h_limited_codex_fallback')
         : 'agy_7d_protected_codex_fallback';
     } else if (codexHardBlocked && !agyConstrained) {
       preferredEngine = 'agy';
-      fallbackEngine = 'codex';
-      reason = codexCooling ? 'codex_cooldown_route_agy' : 'codex_protected_route_agy';
+      fallbackEngine = codexExhausted ? null : 'codex';
+      if (codexExhausted) codexAllowed = false;
+      reason = codexCooling
+        ? 'codex_cooldown_route_agy'
+        : (codexExhausted ? 'codex_exhausted_handover_agy' : 'codex_protected_route_agy');
     } else if (codexHardBlocked && agyConstrained) {
-      preferredEngine = 'codex';
-      fallbackEngine = 'codex';
-      reason = 'both_constrained_codex_fallback';
+      if (codexExhausted && agyExhausted) {
+        preferredEngine = 'paused';
+        fallbackEngine = null;
+        agyAllowed = false;
+        codexAllowed = false;
+        reason = 'both_engines_exhausted_await_user_or_switch';
+      } else if (codexExhausted && !agyExhausted) {
+        preferredEngine = 'agy';
+        fallbackEngine = null;
+        codexAllowed = false;
+        emergencyRationing = true;
+        reason = 'codex_exhausted_agy_emergency_rationing';
+      } else if (agyExhausted && !codexExhausted) {
+        preferredEngine = 'codex';
+        fallbackEngine = null;
+        agyAllowed = false;
+        emergencyRationing = true;
+        reason = 'agy_exhausted_codex_emergency_rationing';
+      } else {
+        const agyRem = Math.min(agyPacing.window_5h.remaining_percent ?? 100, agyPacing.window_7d.remaining_percent ?? 100);
+        const codexRem = codexPacing.remaining_percent ?? 0;
+        emergencyRationing = true;
+        if (agyRem > codexRem) {
+          preferredEngine = 'agy';
+          fallbackEngine = 'codex';
+          reason = 'both_soft_buffered_agy_more_headroom_rationing';
+        } else {
+          preferredEngine = 'codex';
+          fallbackEngine = 'agy';
+          reason = 'both_soft_buffered_codex_more_headroom_rationing';
+        }
+      }
     } else if (!codexPacing.available) {
       if ((activeTasks?.count || 0) >= 2 && !agyConstrained) {
         preferredEngine = agy5hCaution ? 'balanced' : 'agy';
@@ -1472,15 +1554,34 @@ function decideRoute(input = {}) {
       : `AGY 5h状态=${agyPacing.window_5h.status}`;
   const agyTargetPct = agyPacing.window_7d.target_utilization ?? policy.agy_pacing?.target_utilization ?? DEFAULT_AGY_PACING.target_utilization;
   const agyBufferPct = agyPacing.window_7d.buffer_percent ?? round2(Math.max(0, 100 - (policy.agy_pacing?.weekly_protect_used_percent ?? DEFAULT_AGY_PACING.weekly_protect_used_percent)));
+  const unlockTag = agyPacing.window_7d.buffer_unlocked ? `，≤${agyPacing.window_7d.buffer_unlock_window_hours}h已解锁10%缓冲` : '';
   const agy7dText = agyPacing.window_7d.available
-    ? `AGY 7天目标(${agyTargetPct}%上限/留${agyBufferPct}%缓冲) 进度 ${agyPacing.window_7d.target_used_percent}% / 已用 ${agyPacing.window_7d.used_percent}%（偏差 ${agyPacing.window_7d.pacing_delta >= 0 ? '+' : ''}${agyPacing.window_7d.pacing_delta}%）`
+    ? `AGY 7天目标(${agyTargetPct}%上限/留${agyBufferPct}%缓冲${unlockTag}) 进度 ${agyPacing.window_7d.target_used_percent}% / 已用 ${agyPacing.window_7d.used_percent}%（偏差 ${agyPacing.window_7d.pacing_delta >= 0 ? '+' : ''}${agyPacing.window_7d.pacing_delta}%）`
     : `AGY 7天未标定（上限${agyTargetPct}%/留${agyBufferPct}%缓冲，按本地5h+Codex${codexPlanLabel}均衡）`;
 
-  const engineLabel = preferredEngine === 'codex' ? '优先 Codex（Codex 兜底）'
-    : preferredEngine === 'balanced' ? 'Codex 与 AGY 混合均衡（Codex 兜底）'
-    : '优先 AGY 低成本多子代理（Codex 兜底）';
+  const engineLabel = preferredEngine === 'paused'
+    ? `双端耗尽暂停（最快 ${earliestResetHours ?? '?'}h 后重置 / 可用 CC Switch 切备用号）`
+    : emergencyRationing
+      ? `应急省流 → ${preferredEngine === 'agy' ? 'AGY 剩余缓冲' : 'Codex 剩余缓冲'}`
+      : preferredEngine === 'codex'
+        ? '优先 Codex（Codex 兜底）'
+        : preferredEngine === 'balanced'
+          ? 'Codex 与 AGY 混合均衡（Codex 兜底）'
+          : codexExhausted
+            ? 'AGY 全量接管（Codex 已100%耗尽，自动解粘性跨端交接）'
+            : '优先 AGY 低成本多子代理（Codex 兜底）';
 
   const summaryLine = `模式=${mode}｜路由=${engineLabel}｜${codexText}｜${agy7dText}｜${agy5hText}${activeTasks.count ? `｜在途Codex任务=${activeTasks.count}` : ''}`;
+
+  const handoverGuidance = preferredEngine === 'paused'
+    ? `Codex 与 AGY 当前均已耗尽可用额度（最快重置倒计时：${earliestResetHours ?? '未知'}h）。已停止自动派发与空转重试；请向用户展示三个选项：① 等待最快窗口重置；② 在 CC Switch 切换到备用账号（自动共享生效）；③ 是否授权使用额外 Credits / 重置券。`
+    : emergencyRationing
+      ? `单边已 100% 硬归零，另一边已进入软缓冲应急区（当前启用 ${preferredEngine.toUpperCase()} 应急省流模式）：禁止批量扇出（run_workflow），仅用最低成本档位处理用户紧急指令，并提示最快重置剩余 ${earliestResetHours ?? '未知'}h。`
+      : codexExhausted
+        ? `Codex 周额度已 100% 耗尽（距重置 ${codexPacing.hours_until_reset ?? '?'}h）：原 Codex 未完事项自动解除粘性锁定，请先只读读取原任务 codex_result/job.json 与 Git 差异，在 AGY 无缝接力完成（未经用户明确授权禁止静默消耗额外 Credits 或重置券）。`
+        : (agyConstrained && !codexHardBlocked && codexPacing.available)
+          ? `AGY 已触及保护线（7天缓冲线或 5h 窗口限制），为保住主聊天窗不断粮，执行与子代理已硬性切往 Codex 接管。`
+          : null;
 
   return {
     mode,
@@ -1489,15 +1590,25 @@ function decideRoute(input = {}) {
     fallback_engine: fallbackEngine,
     agy_allowed: agyAllowed,
     codex_allowed: codexAllowed,
+    emergency_rationing: emergencyRationing,
     reason,
     codex_pacing: codexPacing,
     agy_pacing: agyPacing,
     agy_usage: agyUsage,
     agy_external: agyExternal,
     agy_constrained: agyConstrained,
+    agy_exhausted: agyExhausted,
     agy_5h_limited: agy5hLimited,
     agy_5h_caution: agy5hCaution,
     codex_hard_blocked: codexHardBlocked,
+    codex_exhausted: codexExhausted,
+    exhaustion_handover: {
+      codex_exhausted: codexExhausted,
+      agy_exhausted: agyExhausted,
+      emergency_rationing: emergencyRationing,
+      earliest_reset_hours: earliestResetHours,
+      guidance: handoverGuidance
+    },
     active_codex_tasks: activeTasks,
     agy_tiers: policy.agy_tiers,
     agy_host_models: policy.agy_host_models,
@@ -1701,16 +1812,43 @@ function readLatestCodexRolloutRateLimits(options = {}) {
 }
 
 const NATIVE_CODEX_REQUIRED_RE = /native_luna|spawn_agent|waiting_background|原生\s*luna|原生子\s*agent|后台托管/i;
+const ALLOW_EXTRA_CREDITS_RE = /CODEX_ALLOW_EXTRA_CREDITS/i;
+const HEAVY_AGY_EXEC_RE = /(?:^|[_/.:-])(?:invoke_subagent|run_workflow|write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content|apply_patch)$/i;
 
 function evaluateCodexConcurrencyGate({ args = {}, projectPolicy, codexPacing, agyPacing, totalActiveCodexTasks = 0 }) {
-  if (!projectPolicy || projectPolicy.mode !== 'auto' || args.review_only === true) return { blocked: false };
-  if (agyPacing?.limited) return { blocked: false }; // AGY is limited => Codex acts as fallback without throttling.
+  if (!projectPolicy || projectPolicy.mode !== 'auto') return { blocked: false };
   if (!codexPacing?.available) return { blocked: false };
 
   const cfg = { ...DEFAULT_PACING, ...(projectPolicy.pacing || {}) };
   const used = codexPacing.used_percent;
   const isContinuation = Boolean(args.topic_id || args.session_id || args.parent_job_id);
   const text = `${args.topic || ''}\n${args.prompt || ''}`;
+
+  // Hard 100% exhaustion: unstick continuations, review_only, and native subagent tasks so they don't hit 429 or silently burn paid credits!
+  if (codexPacing.exhausted) {
+    if (ALLOW_EXTRA_CREDITS_RE.test(text)) return { blocked: false };
+    if (agyPacing?.exhausted) {
+      const resetHint = [codexPacing.hours_until_reset, agyPacing.window_5h?.hours_until_reset, agyPacing.window_7d?.hours_until_reset]
+        .filter(v => typeof v === 'number' && v > 0);
+      const minH = resetHint.length ? round2(Math.min(...resetHint)) : null;
+      return {
+        blocked: true,
+        kind: 'dual_quota_exhausted',
+        reason: `[DUAL_QUOTA_EXHAUSTED] Codex（已用 ${used}%）与 AGY 当前均已耗尽可用额度${minH !== null ? `（最快约 ${minH}h 后窗口重置）` : ''}，已熔断停止派发。请向用户汇报并等待决定：① 等待最快窗口重置；② 在 CC Switch 切换到备用账号；③ 若明确授权动用额外 Credits，可在 prompt 附带 CODEX_ALLOW_EXTRA_CREDITS。`
+      };
+    }
+    const creditHint = (codexPacing.has_extra_credits || codexPacing.has_reset_credits)
+      ? '（检测到账号有额外 Credits 或重置券，未经用户明确授权禁止静默消耗；如用户明确批准动用，可在 prompt 写入 CODEX_ALLOW_EXTRA_CREDITS）'
+      : '';
+    return {
+      blocked: true,
+      kind: 'codex_exhausted_handover',
+      reason: `[CODEX_EXHAUSTED_HANDOVER] Codex 当前周额度已 100% 耗尽（已用 ${used}%，距重置 ${codexPacing.hours_until_reset}h），已自动解除原事项粘性锁定并触发跨端交接：请勿继续调用 codex_run（含续接、review_only 审核与原生子代理），改为先只读读取原任务 codex_result / job.json 与当前 Git 工作区差异，在 AGY 侧无缝接力完成剩余步骤（原审核改用 AGY research 只读子代理，批量扇出改用 flash_lite + run_workflow）。${creditHint}`
+    };
+  }
+
+  if (args.review_only === true) return { blocked: false };
+  if (agyPacing?.limited) return { blocked: false }; // AGY is limited & Codex < 100% => Codex acts as fallback.
 
   if (codexPacing.hard_limited || codexPacing.band === 'codex_protected') {
     if (cfg.protect_max_concurrent !== null && totalActiveCodexTasks >= cfg.protect_max_concurrent) {
@@ -1744,6 +1882,66 @@ function evaluateCodexConcurrencyGate({ args = {}, projectPolicy, codexPacing, a
       kind: 'codex_ahead_concurrency',
       reason: `[CODEX_CONCURRENCY_THROTTLED] Codex 消耗超前（已用 ${used}%，相对线性目标偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%），全局在途 Codex 任务 ${totalActiveCodexTasks} 个已达超前并发上限 ${cfg.ahead_max_concurrent}；请等在途任务收口后再续派，或将通用任务交由 AGY 执行。`
     };
+  }
+
+  return { blocked: false };
+}
+
+function evaluateAgyQuotaGate({ toolName = '', args = {}, projectPolicy, codexPacing, agyPacing, nowMs = Date.now() }) {
+  if (!projectPolicy || projectPolicy.mode !== 'auto') return { blocked: false };
+  if (!HEAVY_AGY_EXEC_RE.test(toolName)) return { blocked: false };
+
+  const isInvokeSubagent = /(?:^|[_/.:-])invoke_subagent$/i.test(toolName);
+  const isWorkflow = /(?:^|[_/.:-])run_workflow$/i.test(toolName);
+  const subType = String(args.TypeName || args.typeName || args.type_name || 'self').trim().toLowerCase();
+  const isReadOnlyResearch = isInvokeSubagent && subType === 'research';
+  const codexCooling = cooldownActive(projectPolicy.cooldowns?.codex, nowMs);
+  const codexHasRoom = Boolean(codexPacing?.available && !codexPacing.exhausted && !codexCooling);
+  const codexDead = Boolean(codexPacing?.available && codexPacing.exhausted);
+
+  // 1. Both engines 100% exhausted => stop all LLM subagents/workflows/writes and return actionable recovery options
+  if (codexDead && agyPacing?.exhausted) {
+    const resetHint = [codexPacing.hours_until_reset, agyPacing.window_5h?.hours_until_reset, agyPacing.window_7d?.hours_until_reset]
+      .filter(v => typeof v === 'number' && v > 0);
+    const minH = resetHint.length ? round2(Math.min(...resetHint)) : null;
+    return {
+      blocked: true,
+      kind: 'dual_quota_exhausted',
+      reason: `[DUAL_QUOTA_EXHAUSTED] AGY 与 Codex 当前均已耗尽可用额度${minH !== null ? `（最快约 ${minH}h 后窗口重置）` : ''}，已暂停执行防空转报错。请向用户汇报三个选择：① 等待最快窗口重置；② 在 CC Switch 切换到备用账号（自动共用生效）；③ 是否授权启用额外 Credits / 重置券。`
+    };
+  }
+
+  // 2. AGY hit protection line (7d >= 90% when >6h before reset, or 5h >= 88%, or 429) while Codex still has quota => protect AGY's 10% main-chat buffer!
+  if (agyPacing?.limited && codexHasRoom) {
+    if (isReadOnlyResearch && !agyPacing.exhausted) return { blocked: false };
+    const agyDetail = agyPacing.window_7d?.band === 'agy_protected'
+      ? `7天已用 ${agyPacing.window_7d.used_percent}%（已达 ${agyPacing.window_7d.protect_used_percent}% 保护线，保留 ${agyPacing.window_7d.buffer_percent}% 主窗口救命缓冲，距周重置 ${agyPacing.window_7d.hours_until_reset}h；剩余 ≤${agyPacing.window_7d.buffer_unlock_window_hours}h 时将自动解锁）`
+      : `5h窗口受限（${agyPacing.window_5h?.reason || 'limited'}${agyPacing.window_5h?.used_percent !== null ? `，已用 ${agyPacing.window_5h.used_percent}%` : ''}）`;
+    return {
+      blocked: true,
+      kind: 'agy_quota_protected',
+      reason: `[AGY_QUOTA_PROTECTED] AGY 当前${agyDetail}，且 Codex 仍有可用额度（已用 ${codexPacing.used_percent}%）：为保证主聊天窗口不断粮，AGY 写操作与子代理已硬性保护，请将当前任务（含在途事项的已完成上下文与文件差异）跨端交接给 codex_run 执行。`
+    };
+  }
+
+  // 3. Codex is 100% exhausted AND AGY is in its soft buffer (e.g. 90%~99% with >6h to reset) => Emergency Rationing Mode!
+  if (codexDead && agyPacing?.soft_buffered) {
+    if (isWorkflow) {
+      return {
+        blocked: true,
+        kind: 'agy_emergency_rationing_no_workflow',
+        reason: '[AGY_EMERGENCY_RATIONING] Codex 已 100% 耗尽且 AGY 处于最后 10% 应急缓冲省流模式：已拦截 run_workflow 批量扇出，请仅对用户明确要求的紧急任务使用单个 flash_lite 子代理或最小化直接修改。'
+      };
+    }
+    if (isInvokeSubagent && !['browser', 'image-generator'].includes(subType)) {
+      const modelKey = Object.hasOwn(args, 'Model') ? 'Model' : Object.hasOwn(args, 'model') ? 'model' : 'Model';
+      const minTier = projectPolicy.agy_tiers?.simple || 'flash_lite';
+      return {
+        blocked: false,
+        overwrite: { [modelKey]: minTier },
+        note: `[应急省流模式] Codex 已 100% 耗尽且 AGY 进入应急缓冲（距周重置 ${agyPacing.window_7d?.hours_until_reset ?? '?'}h），子代理已强制降为最低成本 ${minTier} 省流执行。`
+      };
+    }
   }
 
   return { blocked: false };
@@ -1837,6 +2035,7 @@ module.exports = {
   evaluateAgyPacing,
   evaluateAgyModelPools,
   evaluateCodexConcurrencyGate,
+  evaluateAgyQuotaGate,
   scanAgyTranscriptUsage,
   resolveRealAgyBin,
   parseAgyProbePayload,

@@ -524,26 +524,43 @@ test('dual 7-day 100% proportional pacing + AGY 5-hour limit guard + Codex fallb
   assert.equal(rBufferHit.preferred_engine, 'codex');
   assert.equal(rBufferHit.reason, 'agy_7d_protected_codex_fallback');
 
-  // 9. Last-12h drain never eats into AGY's reserved 10% buffer (85% used => 5% usable < 10% => no drain; 75% used => 15% usable >= 10% => drain)
-  const resetSoon = new Date(now + 6 * 3600000).toISOString();
+  // 9. Last-12h drain (>6h before reset) keeps AGY's reserved 10% buffer; <=6h before reset automatically unlocks the remaining 10% buffer!
+  const reset8h = new Date(now + 8 * 3600000).toISOString(); // 8h > 6h => 10% buffer still locked
   const apNoDrain = evaluateAgyPacing({
     agyUsage: { available: false }, agyExternal: null, codexPacing: codexAhead, nowMs: now,
     projectPolicy: resolveProjectPolicy({
       ...base,
-      agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 85, weekly_resets_at: resetSoon, five_hour_used_percent: 10, five_hour_resets_at: reset5h }
+      agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 85, weekly_resets_at: reset8h, five_hour_used_percent: 10, five_hour_resets_at: reset5h }
     }, scope)
   });
+  assert.equal(apNoDrain.window_7d.buffer_unlocked, false);
   assert.equal(apNoDrain.window_7d.usable_remaining_percent, 5);
   assert.notEqual(apNoDrain.window_7d.band, 'agy_drain');
   const apDrain = evaluateAgyPacing({
     agyUsage: { available: false }, agyExternal: null, codexPacing: codexAhead, nowMs: now,
     projectPolicy: resolveProjectPolicy({
       ...base,
-      agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 75, weekly_resets_at: resetSoon, five_hour_used_percent: 10, five_hour_resets_at: reset5h }
+      agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 75, weekly_resets_at: reset8h, five_hour_used_percent: 10, five_hour_resets_at: reset5h }
     }, scope)
   });
   assert.equal(apDrain.window_7d.usable_remaining_percent, 15);
   assert.equal(apDrain.window_7d.band, 'agy_drain');
+
+  // Within final 6h before weekly reset (e.g. 4h left): 93% used unlocks the remaining 10% buffer (effective cap 100%, usable = 7%)!
+  const reset4h = new Date(now + 4 * 3600000).toISOString();
+  const apUnlocked = evaluateAgyPacing({
+    agyUsage: { available: false }, agyExternal: null, codexPacing: codexAhead, nowMs: now,
+    projectPolicy: resolveProjectPolicy({
+      ...base,
+      agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 93, weekly_resets_at: reset4h, five_hour_used_percent: 10, five_hour_resets_at: reset5h }
+    }, scope)
+  });
+  assert.equal(apUnlocked.window_7d.buffer_unlocked, true);
+  assert.equal(apUnlocked.window_7d.protect_used_percent, 100);
+  assert.equal(apUnlocked.window_7d.buffer_percent, 0);
+  assert.equal(apUnlocked.window_7d.usable_remaining_percent, 7);
+  assert.equal(apUnlocked.window_7d.band, 'agy_drain');
+  assert.equal(apUnlocked.limited, false);
 });
 
 test('AGY smart loop guard allows distinct errors to self-heal, trips only on 3 identical repeats or 8 no-progress cap, and resets on success or human turn', t => {
@@ -861,4 +878,225 @@ test('official agy /usage 5-bucket JSON parser, incremental transcript index, cr
     if (prevKey === undefined) delete process.env.GEMINI_API_KEY;
     else process.env.GEMINI_API_KEY = prevKey;
   }
+});
+
+test('6h automatic buffer unlock, 100% exhaustion cross-engine handover, strict gate unlock, symmetric AGY guard, and dual-exhaustion matrix', t => {
+  const f = fixture(t);
+  const { writeQuotaCache, defaultQuotaCachePath, evaluateCodexPacing } = require('../src/routing-policy.cjs');
+  const now = Date.parse('2026-11-26T00:00:00Z');
+  const cachePath = defaultQuotaCachePath(f.policyPath, { data: f.quantData });
+  const projects = [{ project: f.quantProject, data: f.quantData, review_category: 'quant' }];
+  const convId = '77777777-7777-7777-7777-777777777777';
+
+  const makeCodex = (usedPct, hoursLeft, balance = '0') => evaluateCodexPacing({
+    ordinaryUsageAllowed: usedPct < 100,
+    rateLimits: {
+      planType: 'pro',
+      primary: { usedPercent: usedPct, windowDurationMins: 10080, resetsAt: Math.floor((now + hoursLeft * 3600000) / 1000) },
+      credits: { hasCredits: Number(balance) > 0, unlimited: false, balance }
+    }
+  }, undefined, now);
+
+  // 1. Codex 100% exhausted + AGY healthy:
+  //    - Unsticks sticky continuations, native_luna, and review_only=true -> [CODEX_EXHAUSTED_HANDOVER]
+  //    - Explicit CODEX_ALLOW_EXTRA_CREDITS override still works when user authorizes credits
+  //    - strict review-before-AGY gate automatically unlocks so AGY writes don't deadlock!
+  saveRoutingPolicy(f.policyPath, {
+    ...defaultPolicy(),
+    agy_guard: { ...defaultPolicy().agy_guard, review_gate: 'strict' },
+    agy_manual_snapshot: {
+      recorded_at: new Date(now - 60000).toISOString(),
+      weekly_used_percent: 20,
+      weekly_resets_at: new Date(now + 96 * 3600000).toISOString(),
+      five_hour_used_percent: 10,
+      five_hour_resets_at: new Date(now + 4 * 3600000).toISOString()
+    }
+  });
+  writeQuotaCache(cachePath, {
+    codex_pacing: makeCodex(100, 68, '50'),
+    agy_usage: { available: true, window_5h: { total_tokens: 0 }, window_7d: { total_tokens: 0 }, quota_errors_5h: 0, auto_degraded: false },
+    agy_external: null,
+    fetched_at: new Date(now).toISOString()
+  });
+
+  for (const args of [
+    { topic_id: 'aaaaaaaaaaaaaaaaaaaaaaaa', prompt: '原事项续接' },
+    { prompt: 'native_luna 批量流水线' },
+    { review_only: true, prompt: '只读审核方案' }
+  ]) {
+    const res = bindOrigin(
+      { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'codex_run', args } },
+      projects,
+      { policyPath: f.policyPath, nowMs: now }
+    );
+    assert.equal(res.decision, 'deny');
+    assert.match(res.reason, /\[CODEX_EXHAUSTED_HANDOVER\]/);
+    assert.match(res.reason, /额外 Credits/);
+  }
+  const explicitCredits = bindOrigin(
+    { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'codex_run', args: { prompt: '用户批准 CODEX_ALLOW_EXTRA_CREDITS 执行' } } },
+    projects,
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(explicitCredits.decision, 'allow');
+
+  // Strict review gate does NOT deadlock AGY write when Codex is 100% exhausted!
+  const strictUnlocked = bindOrigin(
+    { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'edit_file', args: { Path: 'alpha.py' } } },
+    projects,
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(strictUnlocked.decision, 'allow');
+  assert.match(strictUnlocked.reason, /100% 耗尽.*自动免除/);
+
+  // 2. Symmetric AGY protection (>6h before reset) vs <=6h automatic 10% buffer unlock (both main AGY and independent pool):
+  saveRoutingPolicy(f.policyPath, {
+    ...defaultPolicy(),
+    agy_manual_snapshot: {
+      recorded_at: new Date(now - 60000).toISOString(),
+      weekly_used_percent: 93,
+      weekly_resets_at: new Date(now + 24 * 3600000).toISOString(), // 24h > 6h => 90% protect active!
+      five_hour_used_percent: 15,
+      five_hour_resets_at: new Date(now + 4 * 3600000).toISOString()
+    },
+    agy_model_pools: {
+      extpool: {
+        match: 'extpool',
+        weekly_protect_used_percent: 90,
+        window_5h_caution_percent: 75,
+        window_5h_protect_percent: 88,
+        manual_snapshot: {
+          recorded_at: new Date(now - 60000).toISOString(),
+          weekly_used_percent: 93,
+          weekly_resets_at: new Date(now + 24 * 3600000).toISOString(),
+          five_hour_used_percent: 10,
+          five_hour_resets_at: new Date(now + 4 * 3600000).toISOString()
+        }
+      }
+    }
+  });
+  writeQuotaCache(cachePath, {
+    codex_pacing: makeCodex(40, 68),
+    agy_usage: { available: true, window_5h: { total_tokens: 0 }, window_7d: { total_tokens: 0 }, quota_errors_5h: 0, auto_degraded: false },
+    agy_external: null,
+    fetched_at: new Date(now).toISOString()
+  });
+
+  // At 24h before reset (>6h), AGY 93% >= 90% blocks AGY write & execution subagent so 10% main-chat buffer stays intact, while research stays open
+  const blockedAgySub = bindOrigin(
+    { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'invoke_subagent', args: { TypeName: 'self', Role: 'Impl', Prompt: 'code' } } },
+    projects,
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(blockedAgySub.decision, 'deny');
+  assert.match(blockedAgySub.reason, /\[AGY_QUOTA_PROTECTED\]/);
+  const allowedAgyResearch = bindOrigin(
+    { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'invoke_subagent', args: { TypeName: 'research', Role: 'Read', Prompt: 'scan' } } },
+    projects,
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(allowedAgyResearch.decision, 'allow');
+
+  // Advance clock to 4h before weekly reset (now + 20h => 4h <= 6h left): remaining 10% buffer unlocks automatically for BOTH main AGY and extpool!
+  const nowAt4hLeft = now + 20 * 3600000;
+  writeQuotaCache(cachePath, {
+    codex_pacing: makeCodex(40, 48),
+    agy_usage: { available: true, window_5h: { total_tokens: 0 }, window_7d: { total_tokens: 0 }, quota_errors_5h: 0, auto_degraded: false },
+    agy_external: null,
+    fetched_at: new Date(nowAt4hLeft).toISOString()
+  });
+  const unlockedAgySub = bindOrigin(
+    { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'invoke_subagent', args: { TypeName: 'self', Role: 'Impl', Prompt: 'drain remaining 7%' } } },
+    projects,
+    { policyPath: f.policyPath, nowMs: nowAt4hLeft }
+  );
+  assert.equal(unlockedAgySub.decision, 'allow');
+  const polAt4h = loadRoutingPolicy(f.policyPath);
+  const routeAt4h = decideRoute({
+    policy: polAt4h,
+    projectPolicy: resolveProjectPolicy(polAt4h, projects[0]),
+    projectScope: projects[0],
+    codexPacing: makeCodex(40, 48),
+    nowMs: nowAt4hLeft
+  });
+  assert.equal(routeAt4h.agy_pacing.window_7d.buffer_unlocked, true);
+  assert.equal(routeAt4h.agy_model_pools.extpool.buffer_unlocked, true);
+  assert.equal(routeAt4h.agy_model_pools.extpool.stopped, false);
+
+  // 3. Dual-Constrained Matrix:
+  //    (a) Codex 100% dead + AGY 93% soft buffer (>6h to reset) => routes to AGY Emergency Rationing (NEVER dead Codex!), blocks run_workflow, forces flash_lite!
+  writeQuotaCache(cachePath, {
+    codex_pacing: makeCodex(100, 68),
+    agy_usage: { available: true, window_5h: { total_tokens: 0 }, window_7d: { total_tokens: 0 }, quota_errors_5h: 0, auto_degraded: false },
+    agy_external: null,
+    fetched_at: new Date(now).toISOString()
+  });
+  const routeRation = decideRoute({
+    policy: polAt4h,
+    projectPolicy: resolveProjectPolicy(polAt4h, projects[0]),
+    projectScope: projects[0],
+    codexPacing: makeCodex(100, 68),
+    nowMs: now
+  });
+  assert.equal(routeRation.preferred_engine, 'agy');
+  assert.equal(routeRation.emergency_rationing, true);
+  assert.equal(routeRation.reason, 'codex_exhausted_agy_emergency_rationing');
+
+  const blockedWorkflow = bindOrigin(
+    { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'run_workflow', args: { Script: 'x' } } },
+    projects,
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(blockedWorkflow.decision, 'deny');
+  assert.match(blockedWorkflow.reason, /\[AGY_EMERGENCY_RATIONING\]/);
+
+  const rationSub = bindOrigin(
+    { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'invoke_subagent', args: { TypeName: 'self', Model: 'pro', Role: 'Urgent Fix', Prompt: 'fix' } } },
+    projects,
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(rationSub.decision, 'allow');
+  assert.equal(rationSub.overwrite.Model, 'flash_lite');
+  assert.match(rationSub.reason, /应急省流模式/);
+
+  //    (b) Both Codex 100% dead + AGY 100% dead => paused + [DUAL_QUOTA_EXHAUSTED] on both sides with earliest reset hours & CC Switch option!
+  saveRoutingPolicy(f.policyPath, {
+    ...defaultPolicy(),
+    agy_manual_snapshot: {
+      recorded_at: new Date(now - 60000).toISOString(),
+      weekly_used_percent: 100,
+      weekly_resets_at: new Date(now + 50 * 3600000).toISOString(),
+      five_hour_used_percent: 100,
+      five_hour_resets_at: new Date(now + 1.5 * 3600000).toISOString()
+    }
+  });
+  const polDualDead = loadRoutingPolicy(f.policyPath);
+  const routeDualDead = decideRoute({
+    policy: polDualDead,
+    projectPolicy: resolveProjectPolicy(polDualDead, projects[0]),
+    projectScope: projects[0],
+    codexPacing: makeCodex(100, 68),
+    nowMs: now
+  });
+  assert.equal(routeDualDead.preferred_engine, 'paused');
+  assert.equal(routeDualDead.reason, 'both_engines_exhausted_await_user_or_switch');
+  assert.equal(routeDualDead.exhaustion_handover.earliest_reset_hours, 1.5);
+
+  const dualDeadCodex = bindOrigin(
+    { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'codex_run', args: { prompt: 'try codex' } } },
+    projects,
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(dualDeadCodex.decision, 'deny');
+  assert.match(dualDeadCodex.reason, /\[DUAL_QUOTA_EXHAUSTED\]/);
+  assert.match(dualDeadCodex.reason, /1\.5h/);
+  assert.match(dualDeadCodex.reason, /CC Switch/);
+
+  const dualDeadAgy = bindOrigin(
+    { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'edit_file', args: { Path: 'a.py' } } },
+    projects,
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(dualDeadAgy.decision, 'deny');
+  assert.match(dualDeadAgy.reason, /\[DUAL_QUOTA_EXHAUSTED\]/);
 });

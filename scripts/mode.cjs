@@ -211,6 +211,11 @@ async function run(argv) {
       if (!Number.isFinite(n) || n < 60 || n > 100) throw new Error('--weekly-protect must be in 60..100');
       ap.weekly_protect_used_percent = n;
     }
+    if (opts['unlock-hours'] !== undefined) {
+      const n = Number(opts['unlock-hours']);
+      if (!Number.isFinite(n) || n < 0 || n > 72) throw new Error('--unlock-hours must be in 0..72');
+      ap.buffer_unlock_window_hours = n;
+    }
     current.agy_pacing = ap;
     const saved = saveRoutingPolicy(policyFile, current);
     return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_pacing: saved.agy_pacing }, null, 2);
@@ -319,6 +324,7 @@ async function run(argv) {
       return n;
     };
     if (opts['weekly-protect'] !== undefined) next.weekly_protect_used_percent = parseRange('weekly-protect', 50, 100);
+    if (opts['unlock-hours'] !== undefined) next.buffer_unlock_window_hours = parseRange('unlock-hours', 0, 72);
     if (opts['5h-caution'] !== undefined) next.window_5h_caution_percent = parseRange('5h-caution', 30, 99);
     if (opts['5h-protect'] !== undefined) next.window_5h_protect_percent = parseRange('5h-protect', 40, 100);
     if (opts['tokens-5h'] !== undefined) {
