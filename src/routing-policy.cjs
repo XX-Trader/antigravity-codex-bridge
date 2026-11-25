@@ -1253,18 +1253,26 @@ function runExternalAgyProbeAsync(command, options = {}) {
   });
 }
 
+function defaultAgyProbeHome() {
+  const candidates = [
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'agy', 'probe-home') : null,
+    path.join(os.tmpdir(), 'agy-probe-home'),
+    process.platform === 'win32' ? 'C:\\Windows\\Temp\\agy-probe-home' : '/tmp/agy-probe-home'
+  ].filter(Boolean);
+  return candidates.find(p => /^[\x20-\x7e]+$/.test(p)) || candidates[0];
+}
+
 async function probeAgyQuotaAsync(projectPolicy, options = {}) {
   if (Array.isArray(projectPolicy?.agy_quota_command) && projectPolicy.agy_quota_command.length > 0) {
     return runExternalAgyProbeAsync(projectPolicy.agy_quota_command, options);
   }
   const agyBin = resolveRealAgyBin(options);
   if (!agyBin) return null;
-  const probeHome = options.probeHomeDir
-    || (options.cachePath ? path.join(path.dirname(options.cachePath), 'agy-probe-home') : path.join(os.tmpdir(), 'agy-probe-home'));
+  const probeHome = options.probeHomeDir || defaultAgyProbeHome();
   try { fs.mkdirSync(probeHome, { recursive: true }); } catch {}
   return runExternalAgyProbeAsync(
     [agyBin, `--gemini_dir=${probeHome}`, '--print', '/usage', '--output-format', 'json'],
-    { timeoutMs: 35000, ...options }
+    { timeoutMs: 65000, ...options }
   );
 }
 

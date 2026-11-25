@@ -255,8 +255,9 @@ test('contextHook injects routing summary once per unchanged PreInvocation and s
 test('Broker/ProjectRouter codex_quota MCP tool and external AGY probe contract work end to end', async t => {
   const f = fixture(t);
   const nowSec = Math.floor(Date.now() / 1000);
+  const futureResetIso = new Date((nowSec + 2 * 3600) * 1000).toISOString();
   const probeScript = path.join(f.root, 'probe.cjs');
-  fs.writeFileSync(probeScript, 'console.log(JSON.stringify({ remaining_percent: 12, reset_at: "2026-11-25T12:00:00Z", source: "fixture-probe" }));\n', 'utf8');
+  fs.writeFileSync(probeScript, `console.log(JSON.stringify({ remaining_percent: 12, reset_at: ${JSON.stringify(futureResetIso)}, source: "fixture-probe" }));\n`, 'utf8');
   saveRoutingPolicy(f.policyPath, { ...defaultPolicy(), agy_quota_command: [process.execPath, probeScript] });
 
   const probe = runExternalAgyProbe([process.execPath, probeScript]);
