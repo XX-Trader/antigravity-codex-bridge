@@ -174,9 +174,11 @@ function contextHook(payload, projects, options = {}) {
     hostModels.complex ? `complex(复杂)→${hostModels.complex}` : null,
     hostModels.expert ? `expert(顶配思考)→${hostModels.expert}` : null
   ].filter(Boolean);
+  const agyTargetPct = projectPolicy.agy_pacing?.target_utilization ?? 90;
+  const agyBufferPct = Math.max(0, Math.round((100 - (projectPolicy.agy_pacing?.weekly_protect_used_percent ?? 90)) * 100) / 100);
   const lines = [
     `[双引擎路由状态] ${route.summary_line}`,
-    `执行模式：${route.mode}（支持缩写 agy/AGY/Agy 与 codex；用户显式点名优先；同事项粘性锁定单执行端；Codex 按 ${projectPolicy.pacing?.plan_days ?? 5} 天 100% 等比例消化、AGY 按 7 天 100% 等比例并叠加 5 小时窗口限制，AGY 5h 吃紧/受限时由 Codex 兜底）。`,
+    `执行模式：${route.mode}（支持缩写 agy/AGY/Agy 与 codex；用户显式点名优先；同事项粘性锁定单执行端；Codex 按 ${projectPolicy.pacing?.plan_days ?? 5} 天 100% 等比例消化、AGY 默认只用 ${agyTargetPct}% 额度并预留 ${agyBufferPct}% 应急缓冲且叠加 5 小时窗口限制，AGY 触及缓冲线/5h受限时由 Codex 兜底；凡需 Codex 原生子代理协作或依赖 Codex 原生子会话契约的任务固定留 Codex 执行）。`,
     `AGY 低成本多子代理分层与保缓存：simple/research→${projectPolicy.agy_tiers.simple}，standard(默认)→${projectPolicy.agy_tiers.standard}，complex→${projectPolicy.agy_tiers.complex}，expert→${projectPolicy.agy_tiers.expert}；同模块内通过 send_message 长期复用同一个低成本子代理以维持高缓存命中率，避免高配主会话亲自跑长循环或每次小改冷启动新子代理；Codex 未达保护线时，极轻量机械任务优先 Codex simple；批量扇出用 run_workflow，并行写用 Workspace="share"，Git 串行收口。`,
     ...(hostMapParts.length ? [`AGY 本机主对话档位对照：${hostMapParts.join('，')}（整段常规开发留 AGY 主对话执行时优先切 standard 档位）。`] : []),
     `AGY 安全门禁：先审后做=${projectPolicy.agy_guard.review_gate}（重要/量化改动建议先 codex_run(review_only=true) 再交 AGY 实施）；防死循环=同一错误连错 ${projectPolicy.agy_guard.max_same_error_failures} 次或无进展连错 ${projectPolicy.agy_guard.max_consecutive_failures} 次自动熔断（不同错误允许自行修复，成功即清零）。`

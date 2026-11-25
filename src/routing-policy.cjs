@@ -34,15 +34,15 @@ const DEFAULT_PACING = Object.freeze({
 });
 
 const DEFAULT_AGY_PACING = Object.freeze({
-  target_utilization: 100,
-  window_minutes: 10080,          // 7-day weekly quota window (mirrors Codex 7d 100% pacing)
+  target_utilization: 90,         // Consume up to 90% of AGY weekly quota, reserving 10% emergency buffer
+  window_minutes: 10080,          // 7-day weekly quota window
   window_5h_minutes: 300,         // AGY 5-hour rolling/refresh limit window
   dual_compare_margin: 5,         // |delta_codex - delta_agy| <= 5% => balanced
   window_5h_caution_percent: 75,  // AGY 5h >= 75% => throttle to balanced to avoid hitting 5h wall
-  window_5h_protect_percent: 88,  // AGY 5h >= 88% => AGY 5h limited, Codex takes over as fallback
-  weekly_protect_used_percent: 97,
+  window_5h_protect_percent: 88,  // AGY 5h >= 88% => AGY 5h limited (keeps 12% 5h buffer), Codex takes over as fallback
+  weekly_protect_used_percent: 90,// Hard reserve 10% weekly buffer for sudden burst usage
   drain_window_hours: 12,
-  drain_min_remaining_percent: 10,
+  drain_min_remaining_percent: 10,// Only drain when >= 10% usable headroom remains below target_utilization
   window_5h_tokens: null,         // Optional local 5h token calibration budget
   window_7d_tokens: null,         // Optional local 7d token calibration budget
   weekly_resets_at: null          // Optional ISO timestamp for AGY weekly reset anchor
@@ -543,11 +543,13 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
     const elapsedPercent = round2(elapsedRatio * 100);
     const targetUsedPercent = round2(elapsedRatio * cfg.target_utilization);
     const remainingPercent = round2(Math.max(0, 100 - weeklyUsed));
+    const bufferPercent = round2(Math.max(0, 100 - cfg.weekly_protect_used_percent));
+    const usableRemainingPercent = round2(Math.max(0, Math.min(cfg.target_utilization, cfg.weekly_protect_used_percent) - weeklyUsed));
     const pacingDelta = round2(weeklyUsed - targetUsedPercent);
 
     let band;
     if (weeklyUsed >= cfg.weekly_protect_used_percent) band = 'agy_protected';
-    else if (hoursUntilReset > 0 && hoursUntilReset <= cfg.drain_window_hours && remainingPercent >= cfg.drain_min_remaining_percent) band = 'agy_drain';
+    else if (hoursUntilReset > 0 && hoursUntilReset <= cfg.drain_window_hours && usableRemainingPercent >= cfg.drain_min_remaining_percent) band = 'agy_drain';
     else if (pacingDelta <= -3) band = 'agy_priority';
     else if (pacingDelta <= 5) band = 'balanced';
     else band = 'codex_priority';
@@ -556,8 +558,12 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
       available: true,
       source: weeklySource,
       window_minutes: cfg.window_minutes,
+      target_utilization: cfg.target_utilization,
+      protect_used_percent: cfg.weekly_protect_used_percent,
+      buffer_percent: bufferPercent,
       used_percent: weeklyUsed,
       remaining_percent: remainingPercent,
+      usable_remaining_percent: usableRemainingPercent,
       elapsed_percent: elapsedPercent,
       target_used_percent: targetUsedPercent,
       pacing_delta: pacingDelta,
@@ -572,9 +578,12 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
       available: false,
       source: 'uncalibrated',
       window_minutes: cfg.window_minutes,
+      target_utilization: cfg.target_utilization,
+      protect_used_percent: cfg.weekly_protect_used_percent,
+      buffer_percent: round2(Math.max(0, 100 - cfg.weekly_protect_used_percent)),
       tokens_7d: agyUsage?.available ? (agyUsage.window_7d?.total_tokens ?? null) : null,
       budget_tokens_7d: cfg.window_7d_tokens,
-      note: 'AGY 官方未公开剩余百分比 API；如需启用精确 AGY 7 天等比例竞比，可用 Mode.ps1 agy-quota 录入面板快照、配 agy-budget 本地预算，或挂外部只读探针。'
+      note: `AGY 官方未公开剩余百分比 API（默认只用 ${cfg.target_utilization}% 额度、预留 ${round2(Math.max(0, 100 - cfg.weekly_protect_used_percent))}% 应急缓冲）；如需启用精确 AGY 7 天等比例竞比，可用 Mode.ps1 agy-quota 录入面板快照、配 agy-budget 本地预算，或挂外部只读探针。`
     };
   }
 
@@ -901,9 +910,11 @@ function decideRoute(input = {}) {
     : agyUsage.available && agyUsage.window_5h
       ? `AGY 近5h消耗 ${agyUsage.window_5h.total_tokens} tokens（状态=${agyPacing.window_5h.status}，限流错 ${agyUsage.quota_errors_5h ?? 0}）`
       : `AGY 5h状态=${agyPacing.window_5h.status}`;
+  const agyTargetPct = agyPacing.window_7d.target_utilization ?? policy.agy_pacing?.target_utilization ?? DEFAULT_AGY_PACING.target_utilization;
+  const agyBufferPct = agyPacing.window_7d.buffer_percent ?? round2(Math.max(0, 100 - (policy.agy_pacing?.weekly_protect_used_percent ?? DEFAULT_AGY_PACING.weekly_protect_used_percent)));
   const agy7dText = agyPacing.window_7d.available
-    ? `AGY 7天进度 ${agyPacing.window_7d.elapsed_percent}% / 已用 ${agyPacing.window_7d.used_percent}%（偏差 ${agyPacing.window_7d.pacing_delta >= 0 ? '+' : ''}${agyPacing.window_7d.pacing_delta}%）`
-    : `AGY 7天未标定（按本地5h+Codex${codexPlanLabel}均衡）`;
+    ? `AGY 7天目标(${agyTargetPct}%上限/留${agyBufferPct}%缓冲) 进度 ${agyPacing.window_7d.target_used_percent}% / 已用 ${agyPacing.window_7d.used_percent}%（偏差 ${agyPacing.window_7d.pacing_delta >= 0 ? '+' : ''}${agyPacing.window_7d.pacing_delta}%）`
+    : `AGY 7天未标定（上限${agyTargetPct}%/留${agyBufferPct}%缓冲，按本地5h+Codex${codexPlanLabel}均衡）`;
 
   const engineLabel = preferredEngine === 'codex' ? '优先 Codex（Codex 兜底）'
     : preferredEngine === 'balanced' ? 'Codex 与 AGY 混合均衡（Codex 兜底）'

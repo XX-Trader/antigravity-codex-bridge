@@ -321,9 +321,11 @@ test('Mode CLI switches global/project modes with AGY aliases, quant thinking mo
   const out8 = JSON.parse(await runModeCli(['agy-quota', '--weekly-used', '32', '--weekly-reset', '2026-11-28T15:14:55Z', '--5h-used', '45', '--5h-reset', '2026-11-25T13:00:00Z', '--policy', f.policyPath]));
   assert.equal(out8.agy_manual_snapshot.weekly_used_percent, 32);
   assert.equal(out8.agy_manual_snapshot.five_hour_used_percent, 45);
-  const out9 = JSON.parse(await runModeCli(['agy-budget', '--tokens-5h', '10000000', '--tokens-7d', '100000000', '--5h-caution', '70', '--5h-protect', '85', '--policy', f.policyPath]));
+  const out9 = JSON.parse(await runModeCli(['agy-budget', '--tokens-5h', '10000000', '--tokens-7d', '100000000', '--target', '90', '--weekly-protect', '90', '--5h-caution', '70', '--5h-protect', '85', '--policy', f.policyPath]));
   assert.equal(out9.agy_pacing.window_5h_tokens, 10000000);
   assert.equal(out9.agy_pacing.window_7d_tokens, 100000000);
+  assert.equal(out9.agy_pacing.target_utilization, 90);
+  assert.equal(out9.agy_pacing.weekly_protect_used_percent, 90);
   assert.equal(out9.agy_pacing.window_5h_caution_percent, 70);
   assert.equal(out9.agy_pacing.window_5h_protect_percent, 85);
   const out10 = JSON.parse(await runModeCli(['codex-pacing', '--days', '5', '--target', '100', '--policy', f.policyPath]));
@@ -346,7 +348,7 @@ test('dual 7-day 100% proportional pacing + AGY 5-hour limit guard + Codex fallb
   const base = defaultPolicy();
   const scope = { project: 'P:/dual', review_category: 'general' };
 
-  // 1. Both calibrated: Codex at 80% (+30% ahead), AGY 7d at 30% (-20% behind), AGY 5h at 40% (ok) => prefer AGY
+  // 1. Both calibrated: Codex at 80% (+30% ahead), AGY 7d at 30% (-15% behind 45% target of 90% cap), AGY 5h at 40% (ok) => prefer AGY
   const p1 = resolveProjectPolicy({
     ...base,
     agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 30, weekly_resets_at: reset7d, five_hour_used_percent: 40, five_hour_resets_at: reset5h }
@@ -355,7 +357,9 @@ test('dual 7-day 100% proportional pacing + AGY 5-hour limit guard + Codex fallb
   const r1 = decideRoute({ policy: base, projectPolicy: p1, projectScope: scope, codexPacing: codexAhead, nowMs: now });
   assert.equal(r1.preferred_engine, 'agy');
   assert.equal(r1.reason, 'dual_7d_agy_further_behind_pace');
-  assert.equal(r1.agy_pacing.window_7d.pacing_delta, -20);
+  assert.equal(r1.agy_pacing.window_7d.target_used_percent, 45);
+  assert.equal(r1.agy_pacing.window_7d.pacing_delta, -15);
+  assert.equal(r1.agy_pacing.window_7d.buffer_percent, 10);
   assert.equal(r1.agy_pacing.window_5h.status, 'ok');
 
   // 2. Same 7d deltas, but AGY 5h hits caution (80% >= 75%) => throttle down to balanced to avoid 5h wall
@@ -420,7 +424,39 @@ test('dual 7-day 100% proportional pacing + AGY 5-hour limit guard + Codex fallb
   assert.equal(apBudget.window_5h.status, 'limited');
   assert.equal(apBudget.window_7d.available, true);
   assert.equal(apBudget.window_7d.used_percent, 40);
-  assert.equal(apBudget.window_7d.pacing_delta, -10);
+  assert.equal(apBudget.window_7d.pacing_delta, -5);
+
+  // 8. AGY 90% weekly cap reserves 10% emergency buffer and immediately falls back to Codex
+  const pBufferHit = resolveProjectPolicy({
+    ...base,
+    agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 90, weekly_resets_at: reset7d, five_hour_used_percent: 20, five_hour_resets_at: reset5h }
+  }, scope);
+  const rBufferHit = decideRoute({ policy: base, projectPolicy: pBufferHit, projectScope: scope, codexPacing: codexAhead, nowMs: now });
+  assert.equal(rBufferHit.agy_pacing.window_7d.band, 'agy_protected');
+  assert.equal(rBufferHit.agy_pacing.window_7d.usable_remaining_percent, 0);
+  assert.equal(rBufferHit.preferred_engine, 'codex');
+  assert.equal(rBufferHit.reason, 'agy_7d_protected_codex_fallback');
+
+  // 9. Last-12h drain never eats into AGY's reserved 10% buffer (85% used => 5% usable < 10% => no drain; 75% used => 15% usable >= 10% => drain)
+  const resetSoon = new Date(now + 6 * 3600000).toISOString();
+  const apNoDrain = evaluateAgyPacing({
+    agyUsage: { available: false }, agyExternal: null, codexPacing: codexAhead, nowMs: now,
+    projectPolicy: resolveProjectPolicy({
+      ...base,
+      agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 85, weekly_resets_at: resetSoon, five_hour_used_percent: 10, five_hour_resets_at: reset5h }
+    }, scope)
+  });
+  assert.equal(apNoDrain.window_7d.usable_remaining_percent, 5);
+  assert.notEqual(apNoDrain.window_7d.band, 'agy_drain');
+  const apDrain = evaluateAgyPacing({
+    agyUsage: { available: false }, agyExternal: null, codexPacing: codexAhead, nowMs: now,
+    projectPolicy: resolveProjectPolicy({
+      ...base,
+      agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 75, weekly_resets_at: resetSoon, five_hour_used_percent: 10, five_hour_resets_at: reset5h }
+    }, scope)
+  });
+  assert.equal(apDrain.window_7d.usable_remaining_percent, 15);
+  assert.equal(apDrain.window_7d.band, 'agy_drain');
 });
 
 test('AGY smart loop guard allows distinct errors to self-heal, trips only on 3 identical repeats or 8 no-progress cap, and resets on success or human turn', t => {

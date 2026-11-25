@@ -27,7 +27,7 @@ function usage() {
     '  reset-project --project ABS_PATH [--config MCP_JSON] [--policy POLICY_JSON]',
     '  agy-hint --level plenty|normal|low [--config MCP_JSON] [--policy POLICY_JSON]',
     '  agy-quota [--weekly-used PCT] [--weekly-reset ISO] [--5h-used PCT] [--5h-reset ISO] [--clear]',
-    '  agy-budget [--tokens-5h N] [--tokens-7d N] [--weekly-reset ISO] [--5h-caution PCT] [--5h-protect PCT] [--clear]',
+    '  agy-budget [--tokens-5h N] [--tokens-7d N] [--weekly-reset ISO] [--target PCT] [--weekly-protect PCT] [--5h-caution PCT] [--5h-protect PCT] [--clear]',
     '  codex-pacing [--days N] [--target PCT] [--policy POLICY_JSON]',
     '  agy-review-gate --level off|advisory|strict [--project ABS_PATH] [--valid-hours N] [--max-same N] [--max-total N]',
     '  reset-agy-guard [--conversation UUID] [--policy POLICY_JSON]',
@@ -199,6 +199,16 @@ async function run(argv) {
       const n = Number(opts['5h-protect']);
       if (!Number.isFinite(n) || n < 40 || n > 100) throw new Error('--5h-protect must be in 40..100');
       ap.window_5h_protect_percent = n;
+    }
+    if (opts.target !== undefined) {
+      const n = Number(opts.target);
+      if (!Number.isFinite(n) || n < 10 || n > 100) throw new Error('--target must be in 10..100');
+      ap.target_utilization = n;
+    }
+    if (opts['weekly-protect'] !== undefined) {
+      const n = Number(opts['weekly-protect']);
+      if (!Number.isFinite(n) || n < 60 || n > 100) throw new Error('--weekly-protect must be in 60..100');
+      ap.weekly_protect_used_percent = n;
     }
     current.agy_pacing = ap;
     const saved = saveRoutingPolicy(policyFile, current);
