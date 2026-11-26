@@ -841,7 +841,10 @@ class Broker {
       const prevAgyProbeMs = Date.parse(agyProbedAt || '');
       const anyBucketExpired = Boolean(
         prev?.agy_external?.buckets
-        && Object.values(prev.agy_external.buckets).some(b => b?.resets_at && Date.parse(b.resets_at) <= nowMs)
+        && Object.values(prev.agy_external.buckets).some(b => {
+          const ms = b?.resets_at ? Date.parse(b.resets_at) : NaN;
+          return Number.isFinite(ms) && ms > 0 && ms <= nowMs;
+        })
       );
       if (!isRefresh && !anyBucketExpired && Number.isFinite(prevAgyProbeMs) && (nowMs - prevAgyProbeMs < 10 * 60 * 1000) && prev?.agy_external !== undefined) {
         agyExternal = prev.agy_external;

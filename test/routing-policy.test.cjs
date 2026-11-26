@@ -681,7 +681,8 @@ test('official agy /usage 5-bucket JSON parser, incremental transcript index, cr
   } = require('../src/routing-policy.cjs');
   const { startQuotaSyncLoop } = require('../src/notifier.cjs');
 
-  const now = Date.parse('2026-11-25T16:00:00Z');
+  // Real clock: the Sidecar section calls Broker.quota() with Date.now(), so bucket reset times must stay in the future.
+  const now = Math.floor(Date.now() / 1000) * 1000;
   const reset5h = new Date(now + 3 * 3600000).toISOString();
   const reset7d = new Date(now + 84 * 3600000).toISOString(); // 50% of 7d elapsed
 
@@ -1099,4 +1100,44 @@ test('6h automatic buffer unlock, 100% exhaustion cross-engine handover, strict 
   );
   assert.equal(dualDeadAgy.decision, 'deny');
   assert.match(dualDeadAgy.reason, /\[DUAL_QUOTA_EXHAUSTED\]/);
+});
+
+test('epoch-zero agy bucket reset_time means inactive window, and legacy cache without exhausted still triggers handover', () => {
+  const { parseAgyProbePayload, codexIsExhausted } = require('../src/routing-policy.cjs');
+  const now = Date.parse('2026-11-26T04:30:00Z');
+  const parsed = parseAgyProbePayload({
+    status: 'SUCCESS',
+    command: { data: { groups: [
+      { buckets: [
+        { id: 'gemini-weekly', remaining_fraction: 0.78, reset_time: '2026-11-30T20:22:14Z' },
+        { id: 'gemini-5h', remaining_fraction: 0.97, reset_time: '2026-11-26T09:04:52Z' }
+      ] },
+      { buckets: [
+        { id: '3p-weekly', remaining_fraction: 1, reset_time: '1970-01-01T00:00:00Z' },
+        { id: '3p-5h', remaining_fraction: 1, reset_time: '1970-01-01T00:00:00Z' }
+      ] }
+    ] } }
+  });
+  assert.equal(parsed.buckets['3p-weekly'].resets_at, null);
+  assert.equal(parsed.buckets['3p-weekly'].used_percent, 0);
+
+  const policy = resolveProjectPolicy({
+    ...defaultPolicy(),
+    agy_model_pools: { thirdparty: { match: 'thirdparty', weekly_protect_used_percent: 90, window_5h_protect_percent: 88, bucket_5h: '3p-5h', bucket_7d: '3p-weekly', window_7d_tokens: 1000 } }
+  }, { project: 'P:/x', review_category: 'general' });
+  const route = decideRoute({
+    projectPolicy: policy,
+    codexPacing: { available: true, used_percent: 100, hard_limited: false, band: 'codex_protected', hours_until_reset: 59, pacing_delta: 9, elapsed_percent: 90 },
+    agyUsage: { available: true, window_5h: { total_tokens: 0, by_model: {} }, window_7d: { total_tokens: 900, by_model: { 'thirdparty-x': { total_tokens: 900 } } }, quota_errors_5h: 0, auto_degraded: false },
+    agyExternal: parsed,
+    nowMs: now
+  });
+  // Official 0% wins over stale local token estimate (90%); inactive window is not treated as expired.
+  assert.equal(route.agy_model_pools.thirdparty.source, 'agy_cli_usage');
+  assert.equal(route.agy_model_pools.thirdparty.weekly_used_percent, 0);
+  assert.equal(route.agy_model_pools.thirdparty.stopped, false);
+  // Legacy cache entry without `exhausted` but used=100% still triggers cross-engine handover.
+  assert.equal(codexIsExhausted({ available: true, used_percent: 100 }), true);
+  assert.equal(route.codex_exhausted, true);
+  assert.equal(route.reason, 'codex_exhausted_handover_agy');
 });

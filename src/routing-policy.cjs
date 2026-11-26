@@ -1181,8 +1181,9 @@ function parseAgyProbePayload(parsed) {
         const rem = clamp(remRaw, 0, 1);
         const used = round2((1 - rem) * 100);
         const resetRaw = b?.reset_time ?? b?.resetTime;
-        const resetsAt = typeof resetRaw === 'string' && Number.isFinite(Date.parse(resetRaw))
-          ? new Date(Date.parse(resetRaw)).toISOString() : null;
+        const resetMs = typeof resetRaw === 'string' ? Date.parse(resetRaw) : NaN;
+        // agy reports epoch-zero reset_time for inactive windows; treat as "no active window", not expired.
+        const resetsAt = Number.isFinite(resetMs) && resetMs > 0 ? new Date(resetMs).toISOString() : null;
         buckets[id] = {
           id,
           window: typeof b.window === 'string' ? b.window : null,
@@ -1350,6 +1351,13 @@ function cooldownActive(cooldown, nowMs = Date.now()) {
   return Number.isFinite(ts) && ts > nowMs;
 }
 
+function codexIsExhausted(p) {
+  if (!p?.available) return false;
+  if (typeof p.exhausted === 'boolean') return p.exhausted;
+  // Older cache writers omit `exhausted`; derive it so handover never silently disables.
+  return p.hard_limited === true || (typeof p.used_percent === 'number' && p.used_percent >= 100);
+}
+
 function decideRoute(input = {}) {
   const nowMs = input.nowMs ?? Date.now();
   const policy = input.projectPolicy || resolveProjectPolicy(input.policy || defaultPolicy(), input.projectScope);
@@ -1367,7 +1375,7 @@ function decideRoute(input = {}) {
   const agy7dProtected = agyPacing.window_7d.band === 'agy_protected';
   const agyConstrained = agy5hLimited || agy7dProtected;
   const agyExhausted = Boolean(agyPacing.exhausted);
-  const codexExhausted = Boolean(codexPacing.available && codexPacing.exhausted);
+  const codexExhausted = codexIsExhausted(codexPacing);
   const codexHardBlocked = codexCooling || codexPacing.hard_limited === true || codexPacing.band === 'codex_protected';
   const dualMargin = policy.agy_pacing?.dual_compare_margin ?? DEFAULT_AGY_PACING.dual_compare_margin;
 
@@ -1825,7 +1833,7 @@ function evaluateCodexConcurrencyGate({ args = {}, projectPolicy, codexPacing, a
   const text = `${args.topic || ''}\n${args.prompt || ''}`;
 
   // Hard 100% exhaustion: unstick continuations, review_only, and native subagent tasks so they don't hit 429 or silently burn paid credits!
-  if (codexPacing.exhausted) {
+  if (codexIsExhausted(codexPacing)) {
     if (ALLOW_EXTRA_CREDITS_RE.test(text)) return { blocked: false };
     if (agyPacing?.exhausted) {
       const resetHint = [codexPacing.hours_until_reset, agyPacing.window_5h?.hours_until_reset, agyPacing.window_7d?.hours_until_reset]
@@ -1896,8 +1904,8 @@ function evaluateAgyQuotaGate({ toolName = '', args = {}, projectPolicy, codexPa
   const subType = String(args.TypeName || args.typeName || args.type_name || 'self').trim().toLowerCase();
   const isReadOnlyResearch = isInvokeSubagent && subType === 'research';
   const codexCooling = cooldownActive(projectPolicy.cooldowns?.codex, nowMs);
-  const codexHasRoom = Boolean(codexPacing?.available && !codexPacing.exhausted && !codexCooling);
-  const codexDead = Boolean(codexPacing?.available && codexPacing.exhausted);
+  const codexDead = codexIsExhausted(codexPacing);
+  const codexHasRoom = Boolean(codexPacing?.available && !codexDead && !codexCooling);
 
   // 1. Both engines 100% exhausted => stop all LLM subagents/workflows/writes and return actionable recovery options
   if (codexDead && agyPacing?.exhausted) {
@@ -2036,6 +2044,7 @@ module.exports = {
   evaluateAgyModelPools,
   evaluateCodexConcurrencyGate,
   evaluateAgyQuotaGate,
+  codexIsExhausted,
   scanAgyTranscriptUsage,
   resolveRealAgyBin,
   parseAgyProbePayload,

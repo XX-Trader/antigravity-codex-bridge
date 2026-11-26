@@ -9,6 +9,7 @@ const {
   evaluateAgyPacing,
   evaluateCodexConcurrencyGate,
   evaluateAgyQuotaGate,
+  codexIsExhausted,
   evaluateSubagentCall,
   activeCodexTasks,
   decideRoute,
@@ -85,7 +86,7 @@ function bindOrigin(payload, projects, options = {}) {
     const gate = checkAgyExecutionGate(payload, selected.scope, effPolicy, {
       policyPath,
       guardStateFile: guardFile,
-      codexExhausted: Boolean(codexPacing?.available && codexPacing.exhausted),
+      codexExhausted: codexIsExhausted(codexPacing),
       nowMs: options.nowMs
     });
     if (gate.blocked) return { decision: 'deny', reason: gate.reason };
