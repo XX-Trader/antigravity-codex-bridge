@@ -1965,7 +1965,7 @@ function decideRoute(input = {}) {
 
 const QUANT_THINKING_RE = /量化策略|策略研究|策略设计|因子逻辑|因子设计|归因分析|多因子架构|quant(?:itative)?\s*(?:strategy|research|design|alpha)|alpha\s*research/i;
 const MECHANICAL_SUBTASK_RE = /清洗|下载|批量扫描|日志核查|跑单测|单元测试|格式检查|lint|format|refactor\s*rename/i;
-const EXPLICIT_UPGRADE_RE = /\b(?:expert|complex|pro)\b|最强思考|极难|深度推理/i;
+const EXPLICIT_UPGRADE_RE = /\b(?:expert|complex|pro|audit|review|verify|analyze|investigate|architect)\b|最强思考|极难|深度推理|审核|审查|复核|终审|对抗|求证|根因|排障|架构|逆推|实证/i;
 
 function matchesConfiguredThinkingModel(text, thinkingModel) {
   if (!thinkingModel || typeof text !== 'string') return false;
@@ -2052,7 +2052,11 @@ function evaluateSubagentCall(args = {}, projectPolicy, currentHostModelName = '
 
   if (typeName === 'research') {
     const target = projectPolicy.subagent_research_model || 'flash_lite';
-    if (!currentModel || (projectPolicy.enforce_subagent_low_cost && currentModel === 'inherit' && !isQuantThinking)) {
+    const isHighReasoningReview = isQuantThinking || (!MECHANICAL_SUBTASK_RE.test(args.Role || args.role || '') && EXPLICIT_UPGRADE_RE.test(roleAndPrompt));
+    if (isHighReasoningReview && currentModel === 'inherit') {
+      return { overwrite: null, note: ['深度审查/根因分析子任务保留 Model="inherit" 继承主窗口顶配模型，不降档。', crossFamilyNote].filter(Boolean).join(' ') };
+    }
+    if (!currentModel || (projectPolicy.enforce_subagent_low_cost && currentModel === 'inherit' && !isHighReasoningReview)) {
       return { overwrite: { [modelKey]: target }, note: [`只读 research 子代理默认路由至低成本 ${target}。`, crossFamilyNote].filter(Boolean).join(' ') };
     }
     return { overwrite: null, note: crossFamilyNote };

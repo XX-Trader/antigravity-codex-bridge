@@ -191,8 +191,9 @@ test('subagent low-cost routing overwrites default/unspecified calls while prese
   assert.equal(evaluateSubagentCall({ TypeName: 'self', Model: 'pro', Role: 'Complex Debug', Prompt: 'deep debug' }, generalPolicy).overwrite, null);
   assert.deepEqual(evaluateSubagentCall({ TypeName: 'browser', Role: 'Inspect UI', Prompt: 'open page' }, generalPolicy).overwrite, { Model: 'flash' });
 
-  // Quant core strategy thinking keeps inherit without downgrade, while mechanical quant tasks still use low-cost
+  // Quant core strategy thinking and explicit architecture/root-cause review keep inherit without downgrade, while mechanical tasks still use low-cost
   assert.equal(evaluateSubagentCall({ TypeName: 'self', Model: 'inherit', Role: '量化策略研究架构师', Prompt: '设计新的多因子量化策略与归因分析' }, quantPolicy).overwrite, null);
+  assert.equal(evaluateSubagentCall({ TypeName: 'research', Model: 'inherit', Role: '架构审查员', Prompt: '严格复核方案边界与根因证据' }, generalPolicy).overwrite, null);
   assert.deepEqual(evaluateSubagentCall({ TypeName: 'self', Model: 'inherit', Role: '日志核查', Prompt: '检查量化脚本运行日志' }, quantPolicy).overwrite, { Model: 'flash' });
 });
 
