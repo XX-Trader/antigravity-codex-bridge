@@ -1294,6 +1294,7 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
   // 5. Local independent model pool direct invocation (`pool-run`), quota-stop protection, subagent `inherit` preservation, and external CLI misuse block:
   const mockPoolCli = path.join(f.root, 'mock-pool-agy.cjs');
   fs.writeFileSync(mockPoolCli, [
+    'if (process.env.AGY_CLI_DISABLE_AUTO_UPDATE !== "true" || process.env.AGY_CLI_NONINTERACTIVE_HEADLESS !== "true") { process.exit(3); }',
     'const args = process.argv.slice(2);',
     'const mIdx = args.indexOf("--model");',
     'const modeIdx = args.indexOf("--mode");',
@@ -1372,6 +1373,7 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
   assert.equal(okPoolRun.ok, true);
   assert.equal(okPoolRun.model, 'thirdparty-opus-high');
   assert.match(okPoolRun.response, /LOCAL_POOL_REVIEW_OK:thirdparty-opus-high:plan:check edge cases/);
+  assert.equal(fs.existsSync(path.join(f.root, 'probe-home', 'antigravity-cli', 'last_check.timestamp')), true);
 
   await runModeCli([
     'pool', '--name', 'thirdparty', '--weekly-used', '92', '--weekly-reset', relIso(now, 48 * HOUR_MS), '--policy', f.policyPath

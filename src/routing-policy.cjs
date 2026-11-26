@@ -1263,6 +1263,10 @@ function cleanOfficialAgyEnv(baseEnv = process.env) {
       env.HTTPS_PROXY = sysProxy;
     }
   }
+  // Prevent `agy.exe`'s detached `auto_updater_windows.go` from spawning `agy.exe --version` without CREATE_NO_WINDOW
+  // (which flashes a visible ConsoleWindowClass window on Windows when launched from consoleless GUI/Sidecar processes!).
+  if (env.AGY_CLI_DISABLE_AUTO_UPDATE === undefined) env.AGY_CLI_DISABLE_AUTO_UPDATE = 'true';
+  if (env.AGY_CLI_NONINTERACTIVE_HEADLESS === undefined) env.AGY_CLI_NONINTERACTIVE_HEADLESS = 'true';
   return env;
 }
 
@@ -1427,6 +1431,20 @@ function defaultAgyProbeHome() {
   return candidates.find(p => /^[\x20-\x7e]+$/.test(p)) || candidates[0];
 }
 
+function prepareSilentAgyProbeHome(probeHome, nowMs = Date.now()) {
+  if (!probeHome) return;
+  try {
+    const cliDir = path.join(probeHome, 'antigravity-cli');
+    fs.mkdirSync(cliDir, { recursive: true });
+    // Belt-and-suspenders guard alongside AGY_CLI_DISABLE_AUTO_UPDATE="true":
+    // keep `last_check.timestamp` fresh so `auto_updater.go` never spawns a detached updater process.
+    const tsFile = path.join(cliDir, 'last_check.timestamp');
+    const nowDate = new Date(nowMs);
+    if (!fs.existsSync(tsFile)) fs.writeFileSync(tsFile, '', 'utf8');
+    else fs.utimesSync(tsFile, nowDate, nowDate);
+  } catch {}
+}
+
 async function probeAgyQuotaAsync(projectPolicy, options = {}) {
   if (Array.isArray(projectPolicy?.agy_quota_command) && projectPolicy.agy_quota_command.length > 0) {
     return runExternalAgyProbeAsync(projectPolicy.agy_quota_command, options);
@@ -1434,7 +1452,7 @@ async function probeAgyQuotaAsync(projectPolicy, options = {}) {
   const agyBin = resolveRealAgyBin(options);
   if (!agyBin) return null;
   const probeHome = options.probeHomeDir || defaultAgyProbeHome();
-  try { fs.mkdirSync(probeHome, { recursive: true }); } catch {}
+  prepareSilentAgyProbeHome(probeHome, options.nowMs);
   return runExternalAgyProbeAsync(
     [agyBin, `--gemini_dir=${probeHome}`, '--print', '/usage', '--output-format', 'json'],
     { timeoutMs: 65000, ...options }
@@ -1519,7 +1537,7 @@ function runAgyPoolTaskAsync(options = {}) {
   }
 
   const probeHome = options.probeHomeDir || defaultAgyProbeHome();
-  try { fs.mkdirSync(probeHome, { recursive: true }); } catch {}
+  prepareSilentAgyProbeHome(probeHome, nowMs);
   const cliArgs = [
     `--gemini_dir=${probeHome}`,
     '--model', targetModel,
