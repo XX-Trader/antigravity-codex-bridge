@@ -23,6 +23,14 @@ const { Broker, dispatch, save } = require('../src/server.cjs');
 const { run: runModeCli } = require('../scripts/mode.cjs');
 const { loadGuardState, readGuardQuotaCooldown } = require('../src/agy-guard.cjs');
 
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 3600 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+const EPOCH_ZERO_ISO = new Date(0).toISOString(); // Upstream sentinel for unactivated window
+const anchorNowMs = () => Math.floor(Date.now() / 1000) * 1000;
+const relIso = (baseMs, offsetMs = 0) => new Date(baseMs + offsetMs).toISOString();
+const relSec = (baseMs, offsetMs = 0) => Math.floor((baseMs + offsetMs) / 1000);
+
 function fixture(t) {
   const base = fs.realpathSync(process.env.CODEX_EXECUTOR_TEST_ROOT);
   const root = fs.mkdtempSync(path.join(base, 'routing-'));
@@ -44,18 +52,18 @@ test('mode normalization accepts auto/hybrid/balanced, agy/AGY/Agy/antigravity a
 });
 
 test('Codex 5-day proportional pacing (over 7-day API window) classifies all five bands accurately without faking missing data', () => {
-  const now = Date.parse('2026-11-25T07:00:00Z');
+  const now = anchorNowMs();
   const windowMins = 10080; // 7 days = 168h API reset window; default plan_days = 5 days (120h)
   const makeReply = (usedPercent, hoursRemaining, extra = {}) => ({
     ordinaryUsageAllowed: extra.ordinaryUsageAllowed ?? true,
     rateLimits: {
       planType: 'pro',
-      primary: { usedPercent, windowDurationMins: windowMins, resetsAt: Math.floor((now + hoursRemaining * 3600000) / 1000) },
+      primary: { usedPercent, windowDurationMins: windowMins, resetsAt: relSec(now, hoursRemaining * HOUR_MS) },
       credits: { hasCredits: true, unlimited: false, balance: '100' },
       spendControlReached: extra.spendControlReached ?? false,
       rateLimitReachedType: extra.rateLimitReachedType ?? null
     },
-    rateLimitResetCredits: { availableCount: 1, credits: [{ expiresAt: Math.floor((now + 10 * 86400000) / 1000) }] }
+    rateLimitResetCredits: { availableCount: 1, credits: [{ expiresAt: relSec(now, 10 * DAY_MS) }] }
   });
 
   // 108h remaining of 168h => elapsed 60h => 50% of the 5-day (120h) plan window
@@ -106,12 +114,12 @@ test('local AGY transcript scanner aggregates 5h/7d token usage and separates 42
   const brainDir = path.join(f.root, 'brain');
   const logDir = path.join(brainDir, 'conv-1', '.system_generated', 'logs');
   fs.mkdirSync(logDir, { recursive: true });
-  const now = Date.parse('2026-11-25T10:00:00Z');
+  const now = anchorNowMs();
   const rows = [
-    { created_at: new Date(now - 2 * 3600000).toISOString(), model: 'gemini-flash', input_tokens: 1000, cache_read_tokens: 400, output_tokens: 200 },
-    { created_at: new Date(now - 30 * 3600000).toISOString(), model: 'gemini-pro', input_tokens: 5000, cache_read_tokens: 0, output_tokens: 800 },
-    { created_at: new Date(now - 5 * 60000).toISOString(), model: 'gemini-flash', error: '401 Unauthenticated invalid api key' },
-    { created_at: new Date(now - 20 * 60000).toISOString(), model: 'gemini-flash', error: 'HTTP 429 RESOURCE_EXHAUSTED quota exceeded' }
+    { created_at: relIso(now, -2 * HOUR_MS), model: 'gemini-flash', input_tokens: 1000, cache_read_tokens: 400, output_tokens: 200 },
+    { created_at: relIso(now, -30 * HOUR_MS), model: 'gemini-pro', input_tokens: 5000, cache_read_tokens: 0, output_tokens: 800 },
+    { created_at: relIso(now, -5 * MINUTE_MS), model: 'gemini-flash', error: '401 Unauthenticated invalid api key' },
+    { created_at: relIso(now, -20 * MINUTE_MS), model: 'gemini-flash', error: 'HTTP 429 RESOURCE_EXHAUSTED quota exceeded' }
   ];
   fs.writeFileSync(path.join(logDir, 'transcript.jsonl'), rows.map(r => JSON.stringify(r)).join('\n') + '\n', 'utf8');
 
@@ -133,7 +141,7 @@ test('local AGY transcript scanner aggregates 5h/7d token usage and separates 42
 });
 
 test('decision engine prioritizes Codex below pace, routes AGY when ahead, falls back to Codex when AGY is constrained, and surfaces quant thinking model', () => {
-  const now = Date.parse('2026-11-25T10:00:00Z');
+  const now = anchorNowMs();
   const basePolicy = { ...defaultPolicy(), thinking_models: { general: null, quant: 'strong-quant-model' } };
   const quantScope = { project: 'P:/quant', review_category: 'quant' };
   const quantPolicy = resolveProjectPolicy(basePolicy, quantScope);
@@ -319,7 +327,8 @@ test('Mode CLI switches global/project modes with AGY aliases, quant thinking mo
   assert.equal(out6.cooldowns.agy, null);
   const out7 = JSON.parse(await runModeCli(['reset-project', '--project', f.project, '--policy', f.policyPath]));
   assert.deepEqual(out7.projects, {});
-  const out8 = JSON.parse(await runModeCli(['agy-quota', '--weekly-used', '32', '--weekly-reset', '2026-11-28T15:14:55Z', '--5h-used', '45', '--5h-reset', '2026-11-25T13:00:00Z', '--policy', f.policyPath]));
+  const cliNow = anchorNowMs();
+  const out8 = JSON.parse(await runModeCli(['agy-quota', '--weekly-used', '32', '--weekly-reset', relIso(cliNow, 72 * HOUR_MS), '--5h-used', '45', '--5h-reset', relIso(cliNow, 3 * HOUR_MS), '--policy', f.policyPath]));
   assert.equal(out8.agy_manual_snapshot.weekly_used_percent, 32);
   assert.equal(out8.agy_manual_snapshot.five_hour_used_percent, 45);
   const out9 = JSON.parse(await runModeCli(['agy-budget', '--tokens-5h', '10000000', '--tokens-7d', '100000000', '--target', '90', '--weekly-protect', '90', '--5h-caution', '70', '--5h-protect', '85', '--policy', f.policyPath]));
@@ -373,9 +382,16 @@ test('Mode CLI switches global/project modes with AGY aliases, quant thinking mo
   assert.equal(isAgyQuotaError('HTTP 503: No capacity available for model x on the server'), false);
   assert.equal(isAgyQuotaError('HTTP 429 RESOURCE_EXHAUSTED: quota exceeded'), true);
 
-  const sessDir = path.join(f.root, 'codex-sessions', '2026', '11', '25');
+  const utcNow = new Date();
+  const sessDir = path.join(
+    f.root,
+    'codex-sessions',
+    String(utcNow.getUTCFullYear()),
+    String(utcNow.getUTCMonth() + 1).padStart(2, '0'),
+    String(utcNow.getUTCDate()).padStart(2, '0')
+  );
   fs.mkdirSync(sessDir, { recursive: true });
-  const futureResetSec = Math.floor((Date.now() + 72 * 3600000) / 1000);
+  const futureResetSec = Math.floor((Date.now() + 72 * HOUR_MS) / 1000);
   fs.writeFileSync(path.join(sessDir, 'rollout-test.jsonl'), JSON.stringify({
     timestamp: new Date().toISOString(),
     type: 'event_msg',
@@ -429,9 +445,9 @@ test('Mode CLI switches global/project modes with AGY aliases, quant thinking mo
 });
 
 test('dual 7-day 100% proportional pacing + AGY 5-hour limit guard + Codex fallback', () => {
-  const now = Date.parse('2026-11-25T10:00:00Z');
-  const reset7d = new Date(now + 84 * 3600000).toISOString(); // 50% elapsed of 7d window
-  const reset5h = new Date(now + 3 * 3600000).toISOString();
+  const now = anchorNowMs();
+  const reset7d = relIso(now, 84 * HOUR_MS); // 50% elapsed of 7d window
+  const reset5h = relIso(now, 3 * HOUR_MS);
   const base = defaultPolicy();
   const scope = { project: 'P:/dual', review_category: 'general' };
 
@@ -586,13 +602,14 @@ test('AGY smart loop guard allows distinct errors to self-heal, trips only on 3 
   assert.equal(loadGuardState(guardFile).conversations[convId].consecutive_failures, 0);
 
   // 3. Three IDENTICAL normalized errors (even with changing timestamps/line numbers) trip the loop guard
+  const errBaseMs = anchorNowMs();
   for (const line of [10, 14, 22]) {
     postToolHook({
       conversationId: convId,
       workspacePaths: [f.project],
       lastUserInput: 'fix bugs',
       toolCall: { name: 'run_command', args: { CommandLine: 'pytest tests/test_alpha.py' } },
-      error: `2026-11-25T10:00:${line}Z AssertionError: mismatch at test_alpha.py:${line} (120ms)`
+      error: `${relIso(errBaseMs, line * 1000)} AssertionError: mismatch at test_alpha.py:${line} (120ms)`
     }, projects, opts);
   }
   const tripped = bindOrigin({ conversationId: convId, workspacePaths: [f.project], lastUserInput: 'fix bugs', toolCall: { name: 'edit_file', args: { Path: 'src/a.py' } } }, projects, opts);
@@ -884,7 +901,7 @@ test('official agy /usage 5-bucket JSON parser, incremental transcript index, cr
 test('6h automatic buffer unlock, 100% exhaustion cross-engine handover, strict gate unlock, symmetric AGY guard, and dual-exhaustion matrix', t => {
   const f = fixture(t);
   const { writeQuotaCache, defaultQuotaCachePath, evaluateCodexPacing } = require('../src/routing-policy.cjs');
-  const now = Date.parse('2026-11-26T00:00:00Z');
+  const now = anchorNowMs();
   const cachePath = defaultQuotaCachePath(f.policyPath, { data: f.quantData });
   const projects = [{ project: f.quantProject, data: f.quantData, review_category: 'quant' }];
   const convId = '77777777-7777-7777-7777-777777777777';
@@ -1102,42 +1119,175 @@ test('6h automatic buffer unlock, 100% exhaustion cross-engine handover, strict 
   assert.match(dualDeadAgy.reason, /\[DUAL_QUOTA_EXHAUSTED\]/);
 });
 
-test('epoch-zero agy bucket reset_time means inactive window, and legacy cache without exhausted still triggers handover', () => {
-  const { parseAgyProbePayload, codexIsExhausted } = require('../src/routing-policy.cjs');
-  const now = Date.parse('2026-11-26T04:30:00Z');
+test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset isolation, and cycle-reset / account-switch 100%->0% recovery', t => {
+  const f = fixture(t);
+  const {
+    parseAgyProbePayload,
+    codexIsExhausted,
+    evaluateCodexPacing,
+    evaluateAgyPacing,
+    evaluateAgyModelPools,
+    readLatestCodexRolloutRateLimits,
+    resolveSharedQuotaSnapshot,
+    writeQuotaCache,
+    defaultQuotaCachePath
+  } = require('../src/routing-policy.cjs');
+  const now = anchorNowMs();
+
+  // 1. Official agy /usage with inactive 3p buckets (epoch-zero) AND Codex only 3h away from weekly reset:
+  //    3p-weekly MUST NOT borrow Codex's 3h reset timestamp or falsely unlock its 10% buffer!
   const parsed = parseAgyProbePayload({
     status: 'SUCCESS',
     command: { data: { groups: [
       { buckets: [
-        { id: 'gemini-weekly', remaining_fraction: 0.78, reset_time: '2026-11-30T20:22:14Z' },
-        { id: 'gemini-5h', remaining_fraction: 0.97, reset_time: '2026-11-26T09:04:52Z' }
+        { id: 'gemini-weekly', remaining_fraction: 0.78, reset_time: relIso(now, 112 * HOUR_MS) },
+        { id: 'gemini-5h', remaining_fraction: 0.97, reset_time: relIso(now, 4.5 * HOUR_MS) }
       ] },
       { buckets: [
-        { id: '3p-weekly', remaining_fraction: 1, reset_time: '1970-01-01T00:00:00Z' },
-        { id: '3p-5h', remaining_fraction: 1, reset_time: '1970-01-01T00:00:00Z' }
+        { id: '3p-weekly', remaining_fraction: 1, reset_time: EPOCH_ZERO_ISO },
+        { id: '3p-5h', remaining_fraction: 1, reset_time: EPOCH_ZERO_ISO }
       ] }
     ] } }
   });
   assert.equal(parsed.buckets['3p-weekly'].resets_at, null);
+  assert.equal(parsed.buckets['3p-weekly'].window_active, false);
   assert.equal(parsed.buckets['3p-weekly'].used_percent, 0);
 
   const policy = resolveProjectPolicy({
     ...defaultPolicy(),
     agy_model_pools: { thirdparty: { match: 'thirdparty', weekly_protect_used_percent: 90, window_5h_protect_percent: 88, bucket_5h: '3p-5h', bucket_7d: '3p-weekly', window_7d_tokens: 1000 } }
   }, { project: 'P:/x', review_category: 'general' });
+
+  const codexNearReset = {
+    available: true,
+    window_active: true,
+    used_percent: 100,
+    hard_limited: false,
+    band: 'codex_protected',
+    resets_at: relIso(now, 3 * HOUR_MS),
+    hours_until_reset: 3,
+    pacing_delta: 0,
+    elapsed_percent: 100
+  };
   const route = decideRoute({
     projectPolicy: policy,
-    codexPacing: { available: true, used_percent: 100, hard_limited: false, band: 'codex_protected', hours_until_reset: 59, pacing_delta: 9, elapsed_percent: 90 },
+    codexPacing: codexNearReset,
     agyUsage: { available: true, window_5h: { total_tokens: 0, by_model: {} }, window_7d: { total_tokens: 900, by_model: { 'thirdparty-x': { total_tokens: 900 } } }, quota_errors_5h: 0, auto_degraded: false },
     agyExternal: parsed,
     nowMs: now
   });
-  // Official 0% wins over stale local token estimate (90%); inactive window is not treated as expired.
   assert.equal(route.agy_model_pools.thirdparty.source, 'agy_cli_usage');
+  assert.equal(route.agy_model_pools.thirdparty.window_active, false);
   assert.equal(route.agy_model_pools.thirdparty.weekly_used_percent, 0);
+  assert.equal(route.agy_model_pools.thirdparty.hours_until_reset, null, 'Unactivated 3p pool must never borrow Codex reset time');
+  assert.equal(route.agy_model_pools.thirdparty.buffer_unlocked, false, 'Unactivated 3p pool must never falsely unlock 10% buffer');
+  assert.equal(route.agy_model_pools.thirdparty.elapsed_percent, 0);
+  assert.equal(route.agy_model_pools.thirdparty.target_used_percent, 0);
   assert.equal(route.agy_model_pools.thirdparty.stopped, false);
-  // Legacy cache entry without `exhausted` but used=100% still triggers cross-engine handover.
   assert.equal(codexIsExhausted({ available: true, used_percent: 100 }), true);
   assert.equal(route.codex_exhausted, true);
   assert.equal(route.reason, 'codex_exhausted_handover_agy');
+
+  // 2. Completely unused AGY main pool (`gemini-weekly` & `gemini-5h` at 0% with epoch-zero reset_time):
+  //    Must evaluate as `available: true, window_active: false` (never falling into `uncalibrated` and never borrowing Codex's 3h reset)!
+  const allUnusedAgy = parseAgyProbePayload({
+    status: 'SUCCESS',
+    command: { data: { groups: [
+      { buckets: [
+        { id: 'gemini-weekly', remaining_fraction: 1, reset_time: EPOCH_ZERO_ISO },
+        { id: 'gemini-5h', remaining_fraction: 1, reset_time: EPOCH_ZERO_ISO }
+      ] }
+    ] } }
+  });
+  const apUnused = evaluateAgyPacing({
+    agyUsage: { available: false },
+    agyExternal: allUnusedAgy,
+    projectPolicy: policy,
+    codexPacing: codexNearReset,
+    nowMs: now
+  });
+  assert.equal(apUnused.window_7d.available, true);
+  assert.equal(apUnused.window_7d.window_active, false);
+  assert.equal(apUnused.window_7d.used_percent, 0);
+  assert.equal(apUnused.window_7d.usable_remaining_percent, 90);
+  assert.equal(apUnused.window_7d.hours_until_reset, null);
+  assert.equal(apUnused.window_7d.buffer_unlocked, false);
+  assert.equal(apUnused.window_7d.band, 'agy_priority');
+  assert.equal(apUnused.window_5h.window_active, false);
+  assert.equal(apUnused.window_5h.used_percent, 0);
+
+  const routeWithUnusedAgy = decideRoute({
+    projectPolicy: policy,
+    codexPacing: { available: true, window_active: true, band: 'balanced', elapsed_percent: 50, used_percent: 50, pacing_delta: 0, resets_at: relIso(now, 84 * HOUR_MS), hours_until_reset: 84 },
+    agyExternal: allUnusedAgy,
+    nowMs: now
+  });
+  assert.doesNotMatch(routeWithUnusedAgy.summary_line, /nullh|undefined/);
+  assert.match(routeWithUnusedAgy.summary_line, /待激活 \/ 已用 0%/);
+
+  // 3. Unused Codex states (`resetsAt: null`, `resetsAt: 0`, and past-reset cycle rollover):
+  const codexUnusedNull = evaluateCodexPacing({
+    ordinaryUsageAllowed: true,
+    rateLimits: { planType: 'pro', primary: { usedPercent: 0, windowDurationMins: null, resetsAt: null } }
+  }, undefined, now);
+  assert.equal(codexUnusedNull.available, true);
+  assert.equal(codexUnusedNull.window_active, false);
+  assert.equal(codexUnusedNull.used_percent, 0);
+  assert.equal(codexUnusedNull.remaining_percent, 100);
+  assert.equal(codexUnusedNull.elapsed_percent, 0);
+  assert.equal(codexUnusedNull.pacing_delta, 0);
+  assert.equal(codexUnusedNull.resets_at, null);
+  assert.equal(codexUnusedNull.hours_until_reset, null);
+  assert.equal(codexUnusedNull.band, 'codex_priority');
+  assert.equal(codexUnusedNull.exhausted, false);
+
+  const codexRolledOver = evaluateCodexPacing({
+    ordinaryUsageAllowed: true,
+    rateLimits: { planType: 'pro', primary: { usedPercent: 100, windowDurationMins: 10080, resetsAt: relSec(now, -5 * MINUTE_MS) } }
+  }, undefined, now);
+  assert.equal(codexRolledOver.available, true);
+  assert.equal(codexRolledOver.window_active, false);
+  assert.equal(codexRolledOver.used_percent, 0, 'Past reset timestamp with ordinaryUsageAllowed=true rolls over to 0% unused');
+  assert.equal(codexRolledOver.exhausted, false);
+
+  // Missing reset on a 100% exhausted response still preserves exhaustion protection without printing nullh!
+  const codexDeadNoReset = evaluateCodexPacing({
+    ordinaryUsageAllowed: false,
+    rateLimits: { planType: 'pro', primary: { usedPercent: 100, windowDurationMins: 10080, resetsAt: null } }
+  }, undefined, now);
+  assert.equal(codexDeadNoReset.available, true);
+  assert.equal(codexDeadNoReset.exhausted, true);
+  assert.equal(codexDeadNoReset.band, 'codex_protected');
+  const deadRoute = decideRoute({ projectPolicy: policy, codexPacing: codexDeadNoReset, agyExternal: allUnusedAgy, nowMs: now });
+  assert.doesNotMatch(deadRoute.summary_line, /nullh|null%/);
+
+  // 4. Cycle reset / CC Switch account switch from 100% -> 0% in rollout logs MUST override stale 100% cache!
+  const sessDir = path.join(f.root, 'switch-sessions');
+  fs.mkdirSync(sessDir, { recursive: true });
+  fs.writeFileSync(path.join(sessDir, 'rollout-fresh-account.jsonl'), JSON.stringify({
+    timestamp: relIso(now, -10 * 1000),
+    type: 'event_msg',
+    payload: { rate_limits: { plan_type: 'pro', primary: { used_percent: 0, window_minutes: 10080, resets_at: 0 } } }
+  }) + '\n', 'utf8');
+  const rollZero = readLatestCodexRolloutRateLimits({ codexSessionsDir: sessDir, nowMs: now });
+  assert.ok(rollZero, 'Rollout reader must accept 0% unused pending window');
+  assert.equal(rollZero.rateLimits.primary.used_percent, 0);
+
+  const cachePath = defaultQuotaCachePath(f.policyPath, { data: f.data });
+  writeQuotaCache(cachePath, {
+    codex_pacing: { ...codexNearReset, used_percent: 100, exhausted: true },
+    codex_probed_at: relIso(now, -20 * MINUTE_MS),
+    agy_usage: { available: true, window_5h: { total_tokens: 0 }, window_7d: { total_tokens: 0 }, quota_errors_5h: 0, auto_degraded: false },
+    agy_external: allUnusedAgy,
+    fetched_at: relIso(now, -20 * MINUTE_MS) // Older than 15m shared window so resolveSharedQuotaSnapshot refreshes from rollout
+  });
+  const refreshedSnap = resolveSharedQuotaSnapshot({ data: f.data }, policy, {
+    policyPath: f.policyPath,
+    cachePath,
+    codexSessionsDir: sessDir,
+    brainDir: f.root,
+    nowMs: now
+  });
+  assert.equal(refreshedSnap.codexPacing.used_percent, 0, 'Newer 0% rollout after account switch or reset must override stale 100% cache');
+  assert.equal(refreshedSnap.codexPacing.exhausted, false);
 });

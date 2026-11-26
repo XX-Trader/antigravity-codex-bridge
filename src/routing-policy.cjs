@@ -101,18 +101,27 @@ function normalizeSubagentModel(value, fallback) {
   return value.trim();
 }
 
+function normalizeOptionalResetIso(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value !== 'string') return null;
+  const ms = Date.parse(value);
+  // Upstream quota APIs (e.g. `agy /usage`) emit epoch-zero (`ms === 0`) when a bucket
+  // has 0% usage and its rolling/weekly window has not activated yet.
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  return new Date(ms).toISOString();
+}
+
 function parseManualAgySnapshot(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const recordedAt = Date.parse(raw.recorded_at);
-  if (!Number.isFinite(recordedAt)) return null;
+  if (!Number.isFinite(recordedAt) || recordedAt <= 0) return null;
   const parsePct = v => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100 ? round2(v) : null;
-  const parseIso = v => typeof v === 'string' && Number.isFinite(Date.parse(v)) ? new Date(Date.parse(v)).toISOString() : null;
   return {
     recorded_at: new Date(recordedAt).toISOString(),
     weekly_used_percent: parsePct(raw.weekly_used_percent),
-    weekly_resets_at: parseIso(raw.weekly_resets_at),
+    weekly_resets_at: normalizeOptionalResetIso(raw.weekly_resets_at),
     five_hour_used_percent: parsePct(raw.five_hour_used_percent),
-    five_hour_resets_at: parseIso(raw.five_hour_resets_at)
+    five_hour_resets_at: normalizeOptionalResetIso(raw.five_hour_resets_at)
   };
 }
 
@@ -226,8 +235,8 @@ function parsePolicy(raw) {
       else if (typeof raw.agy_pacing[k] === 'number' && Number.isFinite(raw.agy_pacing[k]) && raw.agy_pacing[k] > 0) ap[k] = Math.floor(raw.agy_pacing[k]);
     }
     if (raw.agy_pacing.weekly_resets_at === null) ap.weekly_resets_at = null;
-    else if (typeof raw.agy_pacing.weekly_resets_at === 'string' && Number.isFinite(Date.parse(raw.agy_pacing.weekly_resets_at))) {
-      ap.weekly_resets_at = new Date(Date.parse(raw.agy_pacing.weekly_resets_at)).toISOString();
+    else if (typeof raw.agy_pacing.weekly_resets_at === 'string') {
+      ap.weekly_resets_at = normalizeOptionalResetIso(raw.agy_pacing.weekly_resets_at);
     }
     policy.agy_pacing = ap;
   }
@@ -469,9 +478,16 @@ function evaluateCodexPacing(rateLimitReply, pacingCfg = DEFAULT_PACING, nowMs =
   const usedRaw = rawPrimary?.usedPercent ?? rawPrimary?.used_percent;
   const winMinsRaw = rawPrimary?.windowDurationMins ?? rawPrimary?.window_minutes;
   const resetsAtRaw = rawPrimary?.resetsAt ?? rawPrimary?.resets_at;
-  if (!rawPrimary || typeof usedRaw !== 'number' || typeof winMinsRaw !== 'number' || winMinsRaw <= 0 || typeof resetsAtRaw !== 'number') {
+  if (!rawPrimary || typeof usedRaw !== 'number' || !Number.isFinite(usedRaw)) {
     return { available: false, reason: 'Codex rate-limit primary window unavailable' };
   }
+  const hasValidWinMins = typeof winMinsRaw === 'number' && Number.isFinite(winMinsRaw) && winMinsRaw > 0;
+  if (!hasValidWinMins && usedRaw > 0) {
+    return { available: false, reason: 'Codex rate-limit primary window duration unavailable' };
+  }
+  const winMins = hasValidWinMins ? winMinsRaw : 10080;
+  const hasPositiveReset = typeof resetsAtRaw === 'number' && Number.isFinite(resetsAtRaw) && resetsAtRaw > 0;
+
   const limits = {
     planType: rawLimits.planType ?? rawLimits.plan_type ?? null,
     rateLimitReachedType: rawLimits.rateLimitReachedType ?? rawLimits.rate_limit_reached_type ?? null,
@@ -482,44 +498,68 @@ function evaluateCodexPacing(rateLimitReply, pacingCfg = DEFAULT_PACING, nowMs =
       balance: rawLimits.credits.balance ?? null
     } : null
   };
-  const primary = { usedPercent: usedRaw, windowDurationMins: winMinsRaw, resetsAt: resetsAtRaw };
-  const windowMs = primary.windowDurationMins * 60 * 1000;
-  const resetsAtMs = primary.resetsAt * 1000;
-  const remainingMs = Math.max(0, resetsAtMs - nowMs);
-  const elapsedMs = clamp(windowMs - remainingMs, 0, windowMs);
-  const hoursUntilReset = round2(remainingMs / 3600000);
-  const windowElapsedPercent = round2((elapsedMs / windowMs) * 100);
-  const planDays = typeof cfg.plan_days === 'number' && cfg.plan_days > 0 ? cfg.plan_days : null;
-  const planWindowMs = planDays ? Math.min(windowMs, planDays * 24 * 3600 * 1000) : windowMs;
-  const effectivePlanDays = round2(planWindowMs / (24 * 3600 * 1000));
-  const elapsedRatio = clamp(elapsedMs / planWindowMs, 0, 1);
-  const elapsedPercent = round2(elapsedRatio * 100);
-  const targetUsedPercent = round2(elapsedRatio * cfg.target_utilization);
-  const usedPercent = round2(clamp(primary.usedPercent, 0, 100));
-  const remainingPercent = round2(Math.max(0, 100 - usedPercent));
-  const pacingDelta = round2(usedPercent - targetUsedPercent);
   const hardLimited = rateLimitReply?.ordinaryUsageAllowed === false
     || Boolean(limits?.rateLimitReachedType)
     || limits?.spendControlReached === true;
 
+  const windowMs = winMins * 60 * 1000;
+  const planDays = typeof cfg.plan_days === 'number' && cfg.plan_days > 0 ? cfg.plan_days : null;
+  const planWindowMs = planDays ? Math.min(windowMs, planDays * 24 * 3600 * 1000) : windowMs;
+  const effectivePlanDays = round2(planWindowMs / (24 * 3600 * 1000));
+
+  const rawResetMs = hasPositiveReset ? resetsAtRaw * 1000 : null;
+  // Special case 1: Previous cycle's reset timestamp already passed while ordinary usage is allowed => cycle rolled over to 0% unused.
+  const resetAlreadyPassed = rawResetMs !== null && rawResetMs <= nowMs && !hardLimited;
+  // Special case 2: Brand-new / unused cycle with null or 0 reset timestamp.
+  const windowActive = Boolean(rawResetMs !== null && !resetAlreadyPassed);
+
+  const usedPercent = resetAlreadyPassed ? 0 : round2(clamp(usedRaw, 0, 100));
+  const remainingPercent = round2(Math.max(0, 100 - usedPercent));
+  const exhausted = hardLimited || usedPercent >= 100;
+
+  let hoursUntilReset = null;
+  let windowElapsedPercent = 0;
+  let elapsedPercent = 0;
+  let targetUsedPercent = 0;
+  let pacingDelta = round2(usedPercent);
+  let resetsAtIso = null;
+
+  if (windowActive) {
+    const remainingMs = Math.max(0, rawResetMs - nowMs);
+    const elapsedMs = clamp(windowMs - remainingMs, 0, windowMs);
+    hoursUntilReset = round2(remainingMs / 3600000);
+    windowElapsedPercent = round2((elapsedMs / windowMs) * 100);
+    const elapsedRatio = clamp(elapsedMs / planWindowMs, 0, 1);
+    elapsedPercent = round2(elapsedRatio * 100);
+    targetUsedPercent = round2(elapsedRatio * cfg.target_utilization);
+    pacingDelta = round2(usedPercent - targetUsedPercent);
+    resetsAtIso = new Date(rawResetMs).toISOString();
+  } else if (usedPercent > 0) {
+    // Missing reset timestamp on a partially/fully used window: never invent elapsed progress, still enforce usage caps.
+    windowElapsedPercent = null;
+    elapsedPercent = null;
+    targetUsedPercent = null;
+    pacingDelta = null;
+  }
+
   let band;
   if (hardLimited || usedPercent >= cfg.codex_protect_used_percent) band = 'codex_protected';
-  else if (hoursUntilReset > 0 && hoursUntilReset <= cfg.drain_window_hours && remainingPercent >= cfg.drain_min_remaining_percent) band = 'codex_drain';
-  else if (usedPercent >= cfg.agy_priority_used_percent || pacingDelta > cfg.balanced_upper_margin) band = 'agy_priority';
-  else if (pacingDelta > cfg.codex_priority_margin) band = 'balanced';
+  else if (windowActive && hoursUntilReset > 0 && hoursUntilReset <= cfg.drain_window_hours && remainingPercent >= cfg.drain_min_remaining_percent) band = 'codex_drain';
+  else if (usedPercent >= cfg.agy_priority_used_percent || (pacingDelta !== null && pacingDelta > cfg.balanced_upper_margin)) band = 'agy_priority';
+  else if (pacingDelta === null || pacingDelta > cfg.codex_priority_margin) band = windowActive || usedPercent > 0 ? 'balanced' : 'codex_priority';
   else band = 'codex_priority';
 
   const resetCredits = rateLimitReply?.rateLimitResetCredits;
   const resetCreditsCount = Number(resetCredits?.availableCount || 0);
   const nextCreditExpiry = Array.isArray(resetCredits?.credits)
-    ? resetCredits.credits.map(c => Number(c?.expiresAt)).filter(Number.isFinite).sort((a, b) => a - b)[0] || null
+    ? resetCredits.credits.map(c => Number(c?.expiresAt)).filter(v => Number.isFinite(v) && v > 0).sort((a, b) => a - b)[0] || null
     : null;
-  const exhausted = hardLimited || usedPercent >= 100;
   const numericBalance = limits.credits?.balance !== null && limits.credits?.balance !== undefined ? Number(limits.credits.balance) : 0;
   const hasExtraCredits = Boolean(limits.credits && (limits.credits.unlimited || (limits.credits.hasCredits && Number.isFinite(numericBalance) && numericBalance > 0)));
 
   return {
     available: true,
+    window_active: windowActive,
     plan_type: limits.planType || null,
     ordinary_usage_allowed: rateLimitReply?.ordinaryUsageAllowed ?? null,
     hard_limited: hardLimited,
@@ -527,7 +567,7 @@ function evaluateCodexPacing(rateLimitReply, pacingCfg = DEFAULT_PACING, nowMs =
     has_extra_credits: hasExtraCredits,
     has_reset_credits: resetCreditsCount > 0,
     rate_limit_reached_type: limits.rateLimitReachedType || null,
-    window_minutes: primary.windowDurationMins,
+    window_minutes: winMins,
     plan_days: effectivePlanDays,
     window_elapsed_percent: windowElapsedPercent,
     used_percent: usedPercent,
@@ -535,7 +575,7 @@ function evaluateCodexPacing(rateLimitReply, pacingCfg = DEFAULT_PACING, nowMs =
     elapsed_percent: elapsedPercent,
     target_used_percent: targetUsedPercent,
     pacing_delta: pacingDelta,
-    resets_at: new Date(resetsAtMs).toISOString(),
+    resets_at: resetsAtIso,
     hours_until_reset: hoursUntilReset,
     band,
     credits: limits.credits ? {
@@ -543,7 +583,7 @@ function evaluateCodexPacing(rateLimitReply, pacingCfg = DEFAULT_PACING, nowMs =
       unlimited: Boolean(limits.credits.unlimited),
       balance: limits.credits.balance ?? null
     } : null,
-    reset_credits_available: Number(resetCredits?.availableCount || 0),
+    reset_credits_available: resetCreditsCount,
     reset_credit_earliest_expiry: nextCreditExpiry ? new Date(nextCreditExpiry * 1000).toISOString() : null
   };
 }
@@ -572,12 +612,13 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
   let fiveHourResetsAt = null;
   let fiveHourHoursLeft = null;
 
-  const ext5hResetMs = agyExternal?.five_hour_resets_at ? Date.parse(agyExternal.five_hour_resets_at) : NaN;
+  const ext5hResetIso = normalizeOptionalResetIso(agyExternal?.five_hour_resets_at);
+  const ext5hResetMs = ext5hResetIso ? Date.parse(ext5hResetIso) : NaN;
   const ext5hExpired = Number.isFinite(ext5hResetMs) && ext5hResetMs <= nowMs;
   if (agyExternal?.available && agyExternal.five_hour_used_percent !== null && agyExternal.five_hour_used_percent !== undefined) {
     fiveHourUsed = ext5hExpired ? 0 : round2(clamp(agyExternal.five_hour_used_percent, 0, 100));
     fiveHourSource = agyExternal.source || 'external_probe';
-    fiveHourResetsAt = ext5hExpired ? null : (agyExternal.five_hour_resets_at || null);
+    fiveHourResetsAt = ext5hExpired ? null : ext5hResetIso;
   } else if (valid5hSnapshot) {
     fiveHourUsed = round2(clamp(snapshot.five_hour_used_percent, 0, 100));
     fiveHourSource = 'manual_snapshot';
@@ -605,6 +646,7 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
 
   const window5h = {
     source: fiveHourSource,
+    window_active: fiveHourResetsAt !== null,
     window_minutes: cfg.window_5h_minutes,
     used_percent: fiveHourUsed,
     remaining_percent: fiveHourUsed !== null ? round2(Math.max(0, 100 - fiveHourUsed)) : null,
@@ -620,31 +662,40 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
     reason: reason5h
   };
 
-  // 2. Evaluate AGY 7-day 100% proportional pacing (symmetric to Codex)
+  // 2. Evaluate AGY 7-day proportional pacing (preserving unactivated 0% windows without borrowing foreign reset anchors!)
   let weeklyUsed = null;
   let weeklySource = 'uncalibrated';
   let weeklyResetsAtMs = null;
+  let weeklyWindowUnactivated = false;
 
-  const ext7dResetMs = agyExternal?.weekly_resets_at ? Date.parse(agyExternal.weekly_resets_at) : NaN;
-  const ext7dValid = !Number.isFinite(ext7dResetMs) || ext7dResetMs > nowMs;
-  if (agyExternal?.available && agyExternal.weekly_used_percent !== null && agyExternal.weekly_used_percent !== undefined && ext7dValid) {
-    weeklyUsed = round2(clamp(agyExternal.weekly_used_percent, 0, 100));
+  const ext7dResetIso = normalizeOptionalResetIso(agyExternal?.weekly_resets_at);
+  const ext7dResetMs = ext7dResetIso ? Date.parse(ext7dResetIso) : NaN;
+  const ext7dExpired = Number.isFinite(ext7dResetMs) && ext7dResetMs <= nowMs;
+  if (agyExternal?.available && agyExternal.weekly_used_percent !== null && agyExternal.weekly_used_percent !== undefined) {
+    weeklyUsed = ext7dExpired ? 0 : round2(clamp(agyExternal.weekly_used_percent, 0, 100));
     weeklySource = agyExternal.source || 'external_probe';
-    if (Number.isFinite(ext7dResetMs)) weeklyResetsAtMs = ext7dResetMs;
+    if (!ext7dExpired && Number.isFinite(ext7dResetMs)) {
+      weeklyResetsAtMs = ext7dResetMs;
+    } else {
+      // Official probe explicitly reported no active weekly reset window (or previous window just expired to 0%).
+      // Never borrow Codex's reset timestamp onto an unactivated AGY weekly bucket!
+      weeklyWindowUnactivated = true;
+    }
   } else if (valid7dSnapshot) {
     weeklyUsed = round2(clamp(snapshot.weekly_used_percent, 0, 100));
     weeklySource = 'manual_snapshot';
     if (snapshot.weekly_resets_at) weeklyResetsAtMs = Date.parse(snapshot.weekly_resets_at);
+    else if (weeklyUsed === 0) weeklyWindowUnactivated = true;
   } else if (cfg.window_7d_tokens && agyUsage?.available && typeof agyUsage.window_7d?.total_tokens === 'number') {
     weeklyUsed = round2(clamp((agyUsage.window_7d.total_tokens / cfg.window_7d_tokens) * 100, 0, 100));
     weeklySource = 'local_token_budget';
   }
 
   const window7dMs = cfg.window_minutes * 60 * 1000;
-  if (!weeklyResetsAtMs && cfg.weekly_resets_at) {
+  if (!weeklyWindowUnactivated && !weeklyResetsAtMs && cfg.weekly_resets_at) {
     weeklyResetsAtMs = advanceResetAnchor(Date.parse(cfg.weekly_resets_at), window7dMs, nowMs);
   }
-  if (!weeklyResetsAtMs && codexPacing?.available && codexPacing.resets_at) {
+  if (!weeklyWindowUnactivated && weeklySource === 'local_token_budget' && !weeklyResetsAtMs && codexPacing?.available && codexPacing.resets_at) {
     weeklyResetsAtMs = Date.parse(codexPacing.resets_at);
   }
 
@@ -674,6 +725,7 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
 
     window7d = {
       available: true,
+      window_active: true,
       source: weeklySource,
       window_minutes: cfg.window_minutes,
       target_utilization: effectiveTarget,
@@ -695,9 +747,46 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
       budget_tokens_7d: cfg.window_7d_tokens,
       band
     };
+  } else if (weeklyUsed !== null) {
+    // Unactivated / unused weekly bucket (e.g. 0% used with null/epoch-zero reset_time):
+    // available with full configured quota, 0% elapsed, and buffer locked until real window starts.
+    const effectiveTarget = cfg.target_utilization;
+    const effectiveProtect = cfg.weekly_protect_used_percent;
+    const remainingPercent = round2(Math.max(0, 100 - weeklyUsed));
+    const bufferPercent = round2(Math.max(0, 100 - effectiveProtect));
+    const usableRemainingPercent = round2(Math.max(0, Math.min(effectiveTarget, effectiveProtect) - weeklyUsed));
+    const isZeroUnused = weeklyUsed === 0;
+    const band = weeklyUsed >= effectiveProtect
+      ? 'agy_protected'
+      : (isZeroUnused ? 'agy_priority' : 'balanced');
+    window7d = {
+      available: true,
+      window_active: false,
+      source: weeklySource,
+      window_minutes: cfg.window_minutes,
+      target_utilization: effectiveTarget,
+      configured_target_utilization: cfg.target_utilization,
+      protect_used_percent: effectiveProtect,
+      configured_protect_used_percent: cfg.weekly_protect_used_percent,
+      buffer_unlock_window_hours: unlockHours,
+      buffer_unlocked: false,
+      buffer_percent: bufferPercent,
+      used_percent: weeklyUsed,
+      remaining_percent: remainingPercent,
+      usable_remaining_percent: usableRemainingPercent,
+      elapsed_percent: isZeroUnused ? 0 : null,
+      target_used_percent: isZeroUnused ? 0 : null,
+      pacing_delta: isZeroUnused ? 0 : null,
+      resets_at: null,
+      hours_until_reset: null,
+      tokens_7d: agyUsage?.available ? (agyUsage.window_7d?.total_tokens ?? null) : null,
+      budget_tokens_7d: cfg.window_7d_tokens,
+      band
+    };
   } else {
     window7d = {
       available: false,
+      window_active: false,
       source: 'uncalibrated',
       window_minutes: cfg.window_minutes,
       target_utilization: cfg.target_utilization,
@@ -741,12 +830,17 @@ function evaluateAgyModelPools({ agyUsage, agyExternal, projectPolicy, codexPaci
 
     const bucket5hKey = cfg.bucket_5h || (!token.includes('gemini') ? '3p-5h' : null);
     const bucket7dKey = cfg.bucket_7d || (!token.includes('gemini') ? '3p-weekly' : null);
-    const ext5h = bucket5hKey && extBuckets?.[bucket5hKey] && typeof extBuckets[bucket5hKey].used_percent === 'number'
-      && (!extBuckets[bucket5hKey].resets_at || Date.parse(extBuckets[bucket5hKey].resets_at) > nowMs)
+    const rawExt5h = bucket5hKey && extBuckets?.[bucket5hKey] && typeof extBuckets[bucket5hKey].used_percent === 'number'
       ? extBuckets[bucket5hKey] : null;
-    const ext7d = bucket7dKey && extBuckets?.[bucket7dKey] && typeof extBuckets[bucket7dKey].used_percent === 'number'
-      && (!extBuckets[bucket7dKey].resets_at || Date.parse(extBuckets[bucket7dKey].resets_at) > nowMs)
+    const ext5hResetIso = normalizeOptionalResetIso(rawExt5h?.resets_at);
+    const ext5hExpired = Boolean(ext5hResetIso && Date.parse(ext5hResetIso) <= nowMs);
+    const ext5h = rawExt5h ? { ...rawExt5h, used_percent: ext5hExpired ? 0 : rawExt5h.used_percent, resets_at: ext5hExpired ? null : ext5hResetIso } : null;
+
+    const rawExt7d = bucket7dKey && extBuckets?.[bucket7dKey] && typeof extBuckets[bucket7dKey].used_percent === 'number'
       ? extBuckets[bucket7dKey] : null;
+    const ext7dResetIso = normalizeOptionalResetIso(rawExt7d?.resets_at);
+    const ext7dExpired = Boolean(ext7dResetIso && Date.parse(ext7dResetIso) <= nowMs);
+    const ext7d = rawExt7d ? { ...rawExt7d, used_percent: ext7dExpired ? 0 : rawExt7d.used_percent, resets_at: ext7dExpired ? null : ext7dResetIso } : null;
 
     const snap = cfg.manual_snapshot || null;
     const snapAgeMs = snap ? nowMs - Date.parse(snap.recorded_at) : Infinity;
@@ -766,24 +860,24 @@ function evaluateAgyModelPools({ agyUsage, agyExternal, projectPolicy, codexPaci
     const source = ext7d || ext5h ? (agyExternal.source || 'agy_cli_usage')
       : (valid7d || valid5h ? 'manual_snapshot' : (used7d !== null || used5h !== null ? 'local_token_budget' : 'uncalibrated'));
 
+    // Never borrow Codex or main Gemini reset anchors onto an independent pool whose official bucket is unactivated (0% / null reset_time)!
+    const poolWindowUnactivated = Boolean((ext7d && !ext7d.resets_at) || (!ext7d && valid7d && !snap.weekly_resets_at && used7d === 0));
     let weeklyResetsAtMs = ext7d?.resets_at && Number.isFinite(Date.parse(ext7d.resets_at))
       ? Date.parse(ext7d.resets_at)
-      : (valid7d && snap.weekly_resets_at && Number.isFinite(Date.parse(snap.weekly_resets_at))
+      : (!ext7d && valid7d && snap.weekly_resets_at && Number.isFinite(Date.parse(snap.weekly_resets_at))
         ? Date.parse(snap.weekly_resets_at) : null);
-    if (!weeklyResetsAtMs && projectPolicy?.agy_pacing?.weekly_resets_at) {
+    if (!poolWindowUnactivated && source === 'local_token_budget' && !weeklyResetsAtMs && projectPolicy?.agy_pacing?.weekly_resets_at) {
       weeklyResetsAtMs = advanceResetAnchor(Date.parse(projectPolicy.agy_pacing.weekly_resets_at), window7dMs, nowMs);
     }
-    if (!weeklyResetsAtMs && codexPacing?.available && codexPacing.resets_at) {
-      weeklyResetsAtMs = Date.parse(codexPacing.resets_at);
-    }
 
+    const windowActive = Number.isFinite(weeklyResetsAtMs);
     const unlockHours = cfg.buffer_unlock_window_hours ?? projectPolicy?.agy_pacing?.buffer_unlock_window_hours ?? DEFAULT_AGY_PACING.buffer_unlock_window_hours;
-    const hoursUntilReset = Number.isFinite(weeklyResetsAtMs) ? round2(Math.max(0, (weeklyResetsAtMs - nowMs) / 3600000)) : null;
+    const hoursUntilReset = windowActive ? round2(Math.max(0, (weeklyResetsAtMs - nowMs) / 3600000)) : null;
     const bufferUnlocked = hoursUntilReset !== null && unlockHours > 0 && hoursUntilReset > 0 && hoursUntilReset <= unlockHours && cfg.weekly_protect_used_percent < 100;
     const effectiveProtect = bufferUnlocked ? 100 : cfg.weekly_protect_used_percent;
 
     let elapsedPercent = null, targetUsedPercent = null, pacingDelta = null, band = 'uncalibrated';
-    if (used7d !== null && Number.isFinite(weeklyResetsAtMs)) {
+    if (used7d !== null && windowActive) {
       const remainingMs = Math.max(0, weeklyResetsAtMs - nowMs);
       const elapsedRatio = clamp(1 - remainingMs / window7dMs, 0, 1);
       elapsedPercent = round2(elapsedRatio * 100);
@@ -794,8 +888,17 @@ function evaluateAgyModelPools({ agyUsage, agyExternal, projectPolicy, codexPaci
       else if (pacingDelta > 5) band = 'ahead_of_pace';
       else if (pacingDelta >= -3) band = 'on_pace';
       else band = 'below_pace';
-    } else if (used7d !== null && used7d >= effectiveProtect) {
-      band = 'hard_stop';
+    } else if (used7d !== null) {
+      if (used7d >= effectiveProtect) {
+        band = 'hard_stop';
+      } else if (used7d === 0) {
+        elapsedPercent = 0;
+        targetUsedPercent = 0;
+        pacingDelta = 0;
+        band = 'below_pace';
+      } else {
+        band = 'on_pace';
+      }
     }
 
     const cooling = cooldownActive(cfg.cooldown, nowMs);
@@ -811,6 +914,7 @@ function evaluateAgyModelPools({ agyUsage, agyExternal, projectPolicy, codexPaci
     result[name] = {
       match: token,
       source,
+      window_active: windowActive,
       weekly_protect_used_percent: effectiveProtect,
       configured_protect_used_percent: cfg.weekly_protect_used_percent,
       buffer_unlock_window_hours: unlockHours,
@@ -1176,17 +1280,22 @@ function parseAgyProbePayload(parsed) {
       if (!Array.isArray(group?.buckets)) continue;
       for (const b of group.buckets) {
         const id = typeof (b?.id ?? b?.bucketId) === 'string' ? (b.id ?? b.bucketId).trim() : '';
+        if (!id) continue;
         const remRaw = b?.remaining_fraction ?? b?.remainingFraction;
-        if (!id || typeof remRaw !== 'number' || !Number.isFinite(remRaw)) continue;
-        const rem = clamp(remRaw, 0, 1);
-        const used = round2((1 - rem) * 100);
-        const resetRaw = b?.reset_time ?? b?.resetTime;
-        const resetMs = typeof resetRaw === 'string' ? Date.parse(resetRaw) : NaN;
-        // agy reports epoch-zero reset_time for inactive windows; treat as "no active window", not expired.
-        const resetsAt = Number.isFinite(resetMs) && resetMs > 0 ? new Date(resetMs).toISOString() : null;
+        const usedRaw = b?.used_percent ?? b?.usedPercent;
+        let used = null;
+        if (typeof remRaw === 'number' && Number.isFinite(remRaw)) {
+          used = round2((1 - clamp(remRaw, 0, 1)) * 100);
+        } else if (typeof usedRaw === 'number' && Number.isFinite(usedRaw)) {
+          used = round2(clamp(usedRaw, 0, 100));
+        } else {
+          continue;
+        }
+        const resetsAt = normalizeOptionalResetIso(b?.reset_time ?? b?.resetTime ?? b?.resets_at ?? null);
         buckets[id] = {
           id,
           window: typeof b.window === 'string' ? b.window : null,
+          window_active: resetsAt !== null,
           used_percent: used,
           remaining_percent: round2(100 - used),
           resets_at: resetsAt
@@ -1223,15 +1332,27 @@ function parseAgyProbePayload(parsed) {
   if (fiveHourUsed === null && weeklyUsed === null) {
     return { available: false, error: 'Probe output missing numeric quota percent fields (remaining_percent / five_hour_used_percent / weekly_used_percent)' };
   }
+  const flat5hReset = normalizeOptionalResetIso(parsed.five_hour_resets_at) ?? normalizeOptionalResetIso(parsed.reset_at);
+  const flat7dReset = normalizeOptionalResetIso(parsed.weekly_resets_at);
+  const flatResetAt = normalizeOptionalResetIso(parsed.reset_at) ?? flat5hReset ?? flat7dReset;
+  let normalizedBuckets = null;
+  if (parsed.buckets && typeof parsed.buckets === 'object' && !Array.isArray(parsed.buckets)) {
+    normalizedBuckets = {};
+    for (const [k, v] of Object.entries(parsed.buckets)) {
+      if (!v || typeof v !== 'object') continue;
+      const rIso = normalizeOptionalResetIso(v.resets_at ?? v.reset_time ?? null);
+      normalizedBuckets[k] = { ...v, resets_at: rIso, window_active: rIso !== null };
+    }
+  }
   return {
     available: true,
     remaining_percent: legacyRemaining ?? (fiveHourUsed !== null ? round2(100 - fiveHourUsed) : round2(100 - weeklyUsed)),
     five_hour_used_percent: fiveHourUsed,
-    five_hour_resets_at: typeof parsed.five_hour_resets_at === 'string' ? parsed.five_hour_resets_at : (typeof parsed.reset_at === 'string' ? parsed.reset_at : null),
+    five_hour_resets_at: flat5hReset,
     weekly_used_percent: weeklyUsed,
-    weekly_resets_at: typeof parsed.weekly_resets_at === 'string' ? parsed.weekly_resets_at : null,
-    reset_at: typeof parsed.reset_at === 'string' ? parsed.reset_at : null,
-    buckets: parsed.buckets && typeof parsed.buckets === 'object' ? parsed.buckets : null,
+    weekly_resets_at: flat7dReset,
+    reset_at: flatResetAt,
+    buckets: normalizedBuckets,
     model_group: typeof parsed.model_group === 'string' ? parsed.model_group : null,
     source: typeof parsed.source === 'string' ? parsed.source : 'external_probe'
   };
@@ -1470,8 +1591,8 @@ function decideRoute(input = {}) {
       preferredEngine = 'codex';
       fallbackEngine = 'codex';
       reason = 'codex_end_of_window_drain';
-    } else if (agyPacing.window_7d.available) {
-      // Both sides have calibrated 7-day 100% proportional pacing:
+    } else if (agyPacing.window_7d.available && codexPacing.pacing_delta !== null && codexPacing.pacing_delta !== undefined && agyPacing.window_7d.pacing_delta !== null && agyPacing.window_7d.pacing_delta !== undefined) {
+      // Both sides have calibrated 7-day proportional pacing (including 0% unactivated windows):
       // route to whichever side is further behind its 7-day pace, while respecting AGY's 5h caution guard.
       if (agyPacing.window_7d.band === 'agy_drain' && !agy5hCaution) {
         preferredEngine = 'agy';
@@ -1480,7 +1601,7 @@ function decideRoute(input = {}) {
       } else {
         const diff = round2(codexPacing.pacing_delta - agyPacing.window_7d.pacing_delta);
         if (diff > dualMargin) {
-          // Codex is ahead of AGY relative to 7-day 100% pace => prefer AGY unless AGY 5h is in caution
+          // Codex is ahead of AGY relative to 7-day pace => prefer AGY unless AGY 5h is in caution
           if (agy5hCaution) {
             preferredEngine = 'balanced';
             fallbackEngine = 'codex';
@@ -1551,12 +1672,17 @@ function decideRoute(input = {}) {
   const effectivePlanDays = codexPacing.plan_days ?? policy.pacing?.plan_days ?? null;
   const codexPlanLabel = effectivePlanDays ? `${effectivePlanDays}天` : '7天';
   const codexSourceTag = codexPacing.stale ? '，缓存回退' : (codexPacing.fallback_after_timeout ? '，会话日志回退' : '');
+  const codexResetLabel = typeof codexPacing.hours_until_reset === 'number' ? `距重置 ${codexPacing.hours_until_reset}h` : '窗口待激活';
+  const codexDeltaLabel = typeof codexPacing.pacing_delta === 'number'
+    ? `偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%，`
+    : '';
+  const codexProgressLabel = typeof codexPacing.elapsed_percent === 'number' ? `进度 ${codexPacing.elapsed_percent}% / ` : '';
   const codexText = codexPacing.available
-    ? `Codex ${codexPlanLabel}进度 ${codexPacing.elapsed_percent}% / 已用 ${codexPacing.used_percent}%（偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%，距重置 ${codexPacing.hours_until_reset}h${codexSourceTag}）`
+    ? `Codex ${codexPlanLabel}${codexProgressLabel}已用 ${codexPacing.used_percent}%（${codexDeltaLabel}${codexResetLabel}${codexSourceTag}）`
     : ((activeTasks?.count || 0) >= 2 ? `Codex 实时配额超时（在途${activeTasks.count}个，暂分流AGY）` : 'Codex 实时配额暂未读取（默认优先 Codex）');
 
   const agy5hText = agyPacing.window_5h.used_percent !== null
-    ? `AGY 5h已用 ${agyPacing.window_5h.used_percent}%（${agyPacing.window_5h.status}）`
+    ? `AGY 5h已用 ${agyPacing.window_5h.used_percent}%（${agyPacing.window_5h.status}${agyPacing.window_5h.window_active === false ? '/待激活' : ''}）`
     : agyUsage.available && agyUsage.window_5h
       ? `AGY 近5h消耗 ${agyUsage.window_5h.total_tokens} tokens（状态=${agyPacing.window_5h.status}，限流错 ${agyUsage.quota_errors_5h ?? 0}）`
       : `AGY 5h状态=${agyPacing.window_5h.status}`;
@@ -1564,7 +1690,9 @@ function decideRoute(input = {}) {
   const agyBufferPct = agyPacing.window_7d.buffer_percent ?? round2(Math.max(0, 100 - (policy.agy_pacing?.weekly_protect_used_percent ?? DEFAULT_AGY_PACING.weekly_protect_used_percent)));
   const unlockTag = agyPacing.window_7d.buffer_unlocked ? `，≤${agyPacing.window_7d.buffer_unlock_window_hours}h已解锁10%缓冲` : '';
   const agy7dText = agyPacing.window_7d.available
-    ? `AGY 7天目标(${agyTargetPct}%上限/留${agyBufferPct}%缓冲${unlockTag}) 进度 ${agyPacing.window_7d.target_used_percent}% / 已用 ${agyPacing.window_7d.used_percent}%（偏差 ${agyPacing.window_7d.pacing_delta >= 0 ? '+' : ''}${agyPacing.window_7d.pacing_delta}%）`
+    ? (agyPacing.window_7d.window_active === false
+      ? `AGY 7天目标(${agyTargetPct}%上限/留${agyBufferPct}%缓冲) 待激活 / 已用 ${agyPacing.window_7d.used_percent}%`
+      : `AGY 7天目标(${agyTargetPct}%上限/留${agyBufferPct}%缓冲${unlockTag}) 进度 ${agyPacing.window_7d.target_used_percent}% / 已用 ${agyPacing.window_7d.used_percent}%（偏差 ${agyPacing.window_7d.pacing_delta >= 0 ? '+' : ''}${agyPacing.window_7d.pacing_delta}%）`)
     : `AGY 7天未标定（上限${agyTargetPct}%/留${agyBufferPct}%缓冲，按本地5h+Codex${codexPlanLabel}均衡）`;
 
   const engineLabel = preferredEngine === 'paused'
@@ -1732,7 +1860,8 @@ function readStaleQuotaCache(cachePath, nowMs = Date.now(), maxStaleSeconds = 43
     const doc = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
     const fetchedAt = Date.parse(doc.fetched_at);
     if (!Number.isFinite(fetchedAt) || nowMs - fetchedAt > maxStaleSeconds * 1000) return null;
-    const resetsAtMs = Date.parse(doc?.codex_pacing?.resets_at);
+    const resetIso = normalizeOptionalResetIso(doc?.codex_pacing?.resets_at);
+    const resetsAtMs = resetIso ? Date.parse(resetIso) : NaN;
     if (doc?.codex_pacing?.available && Number.isFinite(resetsAtMs) && resetsAtMs <= nowMs) return null;
     return doc;
   } catch { return null; }
@@ -1807,7 +1936,10 @@ function readLatestCodexRolloutRateLimits(options = {}) {
       const primary = rl?.primary || null;
       const resetsAt = primary?.resets_at ?? primary?.resetsAt;
       const usedPct = primary?.used_percent ?? primary?.usedPercent;
-      if (typeof usedPct !== 'number' || typeof resetsAt !== 'number' || resetsAt * 1000 <= nowMs) continue;
+      if (typeof usedPct !== 'number' || !Number.isFinite(usedPct)) continue;
+      const isUnusedPendingWindow = usedPct === 0 && (resetsAt === null || resetsAt === undefined || resetsAt === 0);
+      const isActiveFutureWindow = typeof resetsAt === 'number' && Number.isFinite(resetsAt) && resetsAt * 1000 > nowMs;
+      if (!isUnusedPendingWindow && !isActiveFutureWindow) continue;
       const tsMs = Date.parse(parsed.timestamp) || item.st.mtimeMs;
       if (nowMs - tsMs > maxAgeMs) continue;
       if (!best || tsMs > best.tsMs) {
@@ -1848,10 +1980,11 @@ function evaluateCodexConcurrencyGate({ args = {}, projectPolicy, codexPacing, a
     const creditHint = (codexPacing.has_extra_credits || codexPacing.has_reset_credits)
       ? '（检测到账号有额外 Credits 或重置券，未经用户明确授权禁止静默消耗；如用户明确批准动用，可在 prompt 写入 CODEX_ALLOW_EXTRA_CREDITS）'
       : '';
+    const resetLabel = typeof codexPacing.hours_until_reset === 'number' ? `距重置 ${codexPacing.hours_until_reset}h` : '重置时间待定';
     return {
       blocked: true,
       kind: 'codex_exhausted_handover',
-      reason: `[CODEX_EXHAUSTED_HANDOVER] Codex 当前周额度已 100% 耗尽（已用 ${used}%，距重置 ${codexPacing.hours_until_reset}h），已自动解除原事项粘性锁定并触发跨端交接：请勿继续调用 codex_run（含续接、review_only 审核与原生子代理），改为先只读读取原任务 codex_result / job.json 与当前 Git 工作区差异，在 AGY 侧无缝接力完成剩余步骤（原审核改用 AGY research 只读子代理，批量扇出改用 flash_lite + run_workflow）。${creditHint}`
+      reason: `[CODEX_EXHAUSTED_HANDOVER] Codex 当前周额度已 100% 耗尽（已用 ${used}%，${resetLabel}），已自动解除原事项粘性锁定并触发跨端交接：请勿继续调用 codex_run（含续接、review_only 审核与原生子代理），改为先只读读取原任务 codex_result / job.json 与当前 Git 工作区差异，在 AGY 侧无缝接力完成剩余步骤（原审核改用 AGY research 只读子代理，批量扇出改用 flash_lite + run_workflow）。${creditHint}`
     };
   }
 
@@ -1885,10 +2018,13 @@ function evaluateCodexConcurrencyGate({ args = {}, projectPolicy, codexPacing, a
   }
 
   if ((codexPacing.band === 'agy_priority' || used >= 85) && cfg.ahead_max_concurrent !== null && totalActiveCodexTasks >= cfg.ahead_max_concurrent) {
+    const deltaPart = typeof codexPacing.pacing_delta === 'number'
+      ? `，相对线性目标偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%`
+      : '';
     return {
       blocked: true,
       kind: 'codex_ahead_concurrency',
-      reason: `[CODEX_CONCURRENCY_THROTTLED] Codex 消耗超前（已用 ${used}%，相对线性目标偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%），全局在途 Codex 任务 ${totalActiveCodexTasks} 个已达超前并发上限 ${cfg.ahead_max_concurrent}；请等在途任务收口后再续派，或将通用任务交由 AGY 执行。`
+      reason: `[CODEX_CONCURRENCY_THROTTLED] Codex 消耗超前（已用 ${used}%${deltaPart}），全局在途 Codex 任务 ${totalActiveCodexTasks} 个已达超前并发上限 ${cfg.ahead_max_concurrent}；请等在途任务收口后再续派，或将通用任务交由 AGY 执行。`
     };
   }
 
@@ -1922,8 +2058,11 @@ function evaluateAgyQuotaGate({ toolName = '', args = {}, projectPolicy, codexPa
   // 2. AGY hit protection line (7d >= 90% when >6h before reset, or 5h >= 88%, or 429) while Codex still has quota => protect AGY's 10% main-chat buffer!
   if (agyPacing?.limited && codexHasRoom) {
     if (isReadOnlyResearch && !agyPacing.exhausted) return { blocked: false };
+    const agyResetNote = typeof agyPacing.window_7d?.hours_until_reset === 'number'
+      ? `距周重置 ${agyPacing.window_7d.hours_until_reset}h；剩余 ≤${agyPacing.window_7d.buffer_unlock_window_hours}h 时将自动解锁`
+      : `待周重置窗口激活且剩余 ≤${agyPacing.window_7d?.buffer_unlock_window_hours ?? 6}h 时自动解锁`;
     const agyDetail = agyPacing.window_7d?.band === 'agy_protected'
-      ? `7天已用 ${agyPacing.window_7d.used_percent}%（已达 ${agyPacing.window_7d.protect_used_percent}% 保护线，保留 ${agyPacing.window_7d.buffer_percent}% 主窗口救命缓冲，距周重置 ${agyPacing.window_7d.hours_until_reset}h；剩余 ≤${agyPacing.window_7d.buffer_unlock_window_hours}h 时将自动解锁）`
+      ? `7天已用 ${agyPacing.window_7d.used_percent}%（已达 ${agyPacing.window_7d.protect_used_percent}% 保护线，保留 ${agyPacing.window_7d.buffer_percent}% 主窗口救命缓冲，${agyResetNote}）`
       : `5h窗口受限（${agyPacing.window_5h?.reason || 'limited'}${agyPacing.window_5h?.used_percent !== null ? `，已用 ${agyPacing.window_5h.used_percent}%` : ''}）`;
     return {
       blocked: true,
@@ -1953,6 +2092,20 @@ function evaluateAgyQuotaGate({ toolName = '', args = {}, projectPolicy, codexPa
   }
 
   return { blocked: false };
+}
+
+function shouldPreferRolloutOverStale(fromRollout, rolloutTsMs, stalePacing, staleRefMs) {
+  if (!fromRollout?.available) return false;
+  if (!stalePacing?.available) return true;
+  // When a newer session rollout is observed (e.g. weekly reset rolled over to 0% or user switched account in CC Switch),
+  // prefer the fresh 0% reading instead of letting the old 100% cache stick!
+  if (Number.isFinite(rolloutTsMs) && Number.isFinite(staleRefMs) && rolloutTsMs > staleRefMs + 1000) {
+    return true;
+  }
+  if ((fromRollout.resets_at || null) !== (stalePacing.resets_at || null) && Number.isFinite(rolloutTsMs) && (!Number.isFinite(staleRefMs) || rolloutTsMs >= staleRefMs)) {
+    return true;
+  }
+  return fromRollout.used_percent >= stalePacing.used_percent;
 }
 
 function writeQuotaCache(cachePath, payload) {
@@ -1993,8 +2146,9 @@ function resolveSharedQuotaSnapshot(scope, projectPolicy, options = {}) {
     const sessionsDir = defaultCodexSessionsDir(scope, options);
     const rollout = sessionsDir ? readLatestCodexRolloutRateLimits({ codexSessionsDir: sessionsDir, nowMs }) : null;
     const fromRollout = rollout ? evaluateCodexPacing(rollout, projectPolicy?.pacing, nowMs) : null;
+    const staleRefMs = Date.parse(stale?.codex_probed_at || stale?.codex_pacing?.observed_at || stale?.fetched_at || '');
     let codexPacing;
-    if (fromRollout?.available && (!stale?.codex_pacing?.available || fromRollout.used_percent >= stale.codex_pacing.used_percent)) {
+    if (shouldPreferRolloutOverStale(fromRollout, rollout?.tsMs, stale?.codex_pacing, staleRefMs)) {
       codexPacing = { ...fromRollout, source: 'codex_rollout_log', observed_at: rollout.observed_at };
     } else if (stale?.codex_pacing?.available) {
       codexPacing = { ...stale.codex_pacing, source: stale.codex_pacing.source || 'shared_cache' };
@@ -2045,6 +2199,8 @@ module.exports = {
   evaluateCodexConcurrencyGate,
   evaluateAgyQuotaGate,
   codexIsExhausted,
+  normalizeOptionalResetIso,
+  shouldPreferRolloutOverStale,
   scanAgyTranscriptUsage,
   resolveRealAgyBin,
   parseAgyProbePayload,

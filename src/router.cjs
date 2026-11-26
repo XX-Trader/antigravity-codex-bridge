@@ -215,12 +215,14 @@ function contextHook(payload, projects, options = {}) {
   ].filter(Boolean);
   const poolLines = Object.entries(route.agy_model_pools || {}).map(([name, st]) => {
     const pctText = st.weekly_used_percent !== null
-      ? (st.target_used_percent !== null
-        ? `7天线性目标 ${st.target_used_percent}% / 已用 ${st.weekly_used_percent}%（偏差 ${st.pacing_delta >= 0 ? '+' : ''}${st.pacing_delta}%）`
-        : `7天已用 ${st.weekly_used_percent}%`)
+      ? (st.window_active === false
+        ? `7天待激活 / 已用 ${st.weekly_used_percent}%`
+        : (st.target_used_percent !== null
+          ? `7天线性目标 ${st.target_used_percent}% / 已用 ${st.weekly_used_percent}%（偏差 ${st.pacing_delta >= 0 ? '+' : ''}${st.pacing_delta}%）`
+          : `7天已用 ${st.weekly_used_percent}%`))
       : `7天线性(上限${st.weekly_protect_used_percent}%未标定)`;
     const h5Text = st.five_hour_used_percent !== null ? `5h已用 ${st.five_hour_used_percent}%` : (st.tokens_5h ? `5h=${st.tokens_5h} tokens` : '5h正常');
-    const stateLabel = st.stopped ? '已硬停' : st.caution ? '5h警戒' : st.band === 'ahead_of_pace' ? '超前建议控速' : '可用';
+    const stateLabel = st.stopped ? '已硬停' : st.caution ? '5h警戒' : st.band === 'ahead_of_pace' ? '超前建议控速' : (st.window_active === false ? '未激活可用' : '可用');
     return `${name}池(${pctText}，≥${st.weekly_protect_used_percent}%硬停留${st.buffer_percent}%缓冲，${h5Text}，状态=${stateLabel})`;
   });
   const agyTargetPct = projectPolicy.agy_pacing?.target_utilization ?? 90;
@@ -231,6 +233,7 @@ function contextHook(payload, projects, options = {}) {
     `AGY 低成本多子代理分层与保缓存：simple/research→${projectPolicy.agy_tiers.simple}，standard(默认)→${projectPolicy.agy_tiers.standard}，complex→${projectPolicy.agy_tiers.complex}，expert→${projectPolicy.agy_tiers.expert}；同模块内通过 send_message 长期复用同一个低成本子代理以维持高缓存命中率，避免高配主会话亲自跑长循环或每次小改冷启动新子代理；Codex 未达保护线时，极轻量机械任务优先 Codex simple；批量扇出用 run_workflow，并行写用 Workspace="share"，Git 串行收口。`,
     ...(hostMapParts.length ? [`AGY 本机主对话档位对照：${hostMapParts.join('，')}${projectPolicy.thinking_backups?.length ? `；顶配备用顺序：${projectPolicy.thinking_backups.join(' → ')}` : ''}（整段常规开发留 AGY 主对话执行时优先切 standard 档位）。`] : []),
     ...(poolLines.length ? [`AGY 独立模型池保护：${poolLines.join('；')}。`] : []),
+    `编码与主代理必审门禁：严禁无依据硬编码（尤其是日期时间与环境常量，统一注入时钟基准或用相对偏移）；关键信息（外部接口原始 payload、核心阈值/PIT 公式、跨模块契约与子代理测试 diff）必须由主代理亲自回读审核；显式处理未使用/未激活(0%/null/纪元零值)及重置归零等特殊边界态。`,
     `AGY 安全门禁：先审后做=${projectPolicy.agy_guard.review_gate}（重要/量化改动建议先 codex_run(review_only=true) 再交 AGY 实施）；防死循环=同一错误连错 ${projectPolicy.agy_guard.max_same_error_failures} 次或无进展连错 ${projectPolicy.agy_guard.max_consecutive_failures} 次自动熔断（不同错误允许自行修复，成功即清零）。`
   ];
   if (route.exhaustion_handover?.guidance) lines.push(`[额度耗尽与交接] ${route.exhaustion_handover.guidance}`);

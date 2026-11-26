@@ -28,6 +28,7 @@ const {
   readQuotaCache,
   readStaleQuotaCache,
   readLatestCodexRolloutRateLimits,
+  shouldPreferRolloutOverStale,
   writeQuotaCache
 } = require('./routing-policy.cjs');
 const { defaultGuardStatePath, readGuardQuotaCooldown } = require('./agy-guard.cjs');
@@ -805,7 +806,7 @@ class Broker {
         });
         if (recentRollout) {
           const evalRollout = evaluateCodexPacing(recentRollout, projectPolicy.pacing, nowMs);
-          if (evalRollout.available && (!prev?.codex_pacing?.available || !Number.isFinite(prevCodexMs) || recentRollout.tsMs >= prevCodexMs || evalRollout.used_percent >= prev.codex_pacing.used_percent)) {
+          if (shouldPreferRolloutOverStale(evalRollout, recentRollout.tsMs, prev?.codex_pacing, prevCodexMs)) {
             codexPacing = { ...evalRollout, source: 'codex_rollout_log', observed_at: recentRollout.observed_at };
           }
         }
@@ -825,7 +826,7 @@ class Broker {
           const rolloutFallback = sessionsDir ? readLatestCodexRolloutRateLimits({ codexSessionsDir: sessionsDir, nowMs }) : null;
           const fromRollout = rolloutFallback ? evaluateCodexPacing(rolloutFallback, projectPolicy.pacing, nowMs) : null;
           const stale = prev?.codex_pacing || null;
-          if (fromRollout?.available && (!stale?.available || fromRollout.used_percent >= stale.used_percent)) {
+          if (shouldPreferRolloutOverStale(fromRollout, rolloutFallback?.tsMs, stale, prevCodexMs)) {
             codexPacing = { ...fromRollout, source: 'codex_rollout_log', observed_at: rolloutFallback.observed_at, fallback_after_timeout: true };
           } else if (stale?.available) {
             codexPacing = { ...stale, stale: true, source: 'stale_cache', fallback_after_timeout: true };

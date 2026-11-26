@@ -327,7 +327,7 @@ pwsh -NoProfile -File scripts/Mode.ps1 quant-thinking --model 'YOUR_PRIMARY_TOP_
 pwsh -NoProfile -File scripts/Mode.ps1 agy-models --standard 'YOUR_FAST_EXEC_MODEL' --complex 'YOUR_COMPLEX_MODEL' --expert 'YOUR_PRIMARY_TOP_MODEL'
 pwsh -NoProfile -File scripts/Mode.ps1 pool --name 'top-pool' --match 'family-prefix' --bucket-5h '3p-5h' --bucket-7d '3p-weekly' --weekly-protect 90 --unlock-hours 6 --5h-caution 75 --5h-protect 88
 pwsh -NoProfile -File scripts/Mode.ps1 agy-hint --level normal
-pwsh -NoProfile -File scripts/Mode.ps1 agy-quota --weekly-used 35 --weekly-reset '2026-11-28T15:14:55Z' --5h-used 40 --5h-reset '2026-11-25T23:00:00Z'
+pwsh -NoProfile -File scripts/Mode.ps1 agy-quota --weekly-used 35 --weekly-reset (Get-Date).ToUniversalTime().AddDays(4).ToString('o') --5h-used 40 --5h-reset (Get-Date).ToUniversalTime().AddHours(3).ToString('o')
 pwsh -NoProfile -File scripts/Mode.ps1 agy-budget --target 90 --weekly-protect 90 --unlock-hours 6 --tokens-5h 8000000 --tokens-7d 80000000
 pwsh -NoProfile -File scripts/Mode.ps1 agy-review-gate --level strict --project 'C:/work/my-project'
 pwsh -NoProfile -File scripts/Mode.ps1 reset-agy-guard
