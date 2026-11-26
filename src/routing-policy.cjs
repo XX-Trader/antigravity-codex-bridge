@@ -1418,6 +1418,41 @@ function sleepMs(ms) {
   return ms > 0 ? new Promise(resolve => { const t = setTimeout(resolve, ms); t.unref?.(); }) : Promise.resolve();
 }
 
+function inspectAgyCliLog(logPath) {
+  if (!logPath || !fs.existsSync(logPath)) return null;
+  try {
+    const { text } = readTailUtf8(logPath, 65536);
+    const emailMatch = text.match(/applyAuthResult:\s*email=([^\s,]+)/);
+    const timedOut10s = /keyringAuth:\s*timed out after/i.test(text);
+    const loadedToken = /keyringAuth:\s*loaded token/i.test(text);
+    const explicitRevoked = /invalid_grant|token has been expired or revoked|refresh token[^\r\n]*invalid|unauthorized_client/i.test(text);
+    const silentAuthFailed = /Print mode:\s*silent auth failed|triggering interactive OAuth|You are not logged into Antigravity/i.test(text);
+    const definiteAuthDrop = explicitRevoked || (silentAuthFailed && !timedOut10s && !loadedToken);
+    return {
+      account_email: emailMatch ? emailMatch[1].trim() : null,
+      timed_out_10s: timedOut10s,
+      loaded_token: loadedToken,
+      explicit_revoked: explicitRevoked,
+      definite_auth_drop: definiteAuthDrop
+    };
+  } catch {
+    return null;
+  }
+}
+
+function detectCcSwitchAccountsMtimeMs(options = {}) {
+  const explicit = options.ccSwitchAccountsFile;
+  if (explicit === null) return null;
+  if (!explicit && process.env.CODEX_EXECUTOR_TEST_ROOT) return null;
+  const target = explicit || path.join(os.homedir(), '.cc-switch', 'agy_accounts.json');
+  try {
+    const st = fs.statSync(target);
+    return st.isFile() ? Math.floor(st.mtimeMs) : null;
+  } catch {
+    return null;
+  }
+}
+
 function resolveAgyRetryPlan(options = {}) {
   if (options.retryOnSuppressedOAuth === false) return { maxAttempts: 1, delaysMs: [] };
   const delaysMs = Array.isArray(options.retryDelaysMs) ? options.retryDelaysMs : DEFAULT_AGY_OAUTH_RETRY_DELAYS_MS;
@@ -1427,8 +1462,11 @@ function resolveAgyRetryPlan(options = {}) {
   return { maxAttempts, delaysMs };
 }
 
-function isRetryableAgyProbeFailure(result) {
+function isRetryableAgyProbeFailure(result, attempt = 1) {
   if (!result || result.available) return false;
+  // If CLI log proved credentials are missing or explicitly revoked (`auth_required`), retry at most once
+  // (to rule out a momentary keyring lock) instead of spinning 4 full cycles.
+  if (result.failure_kind === 'auth_required') return attempt < 2;
   if (result.oauth_browser_suppressed) return true;
   return TRANSIENT_AGY_PROBE_ERR_RE.test(String(result.error || ''));
 }
@@ -1438,30 +1476,54 @@ function runExternalAgyProbeAsync(command, options = {}) {
   const timeout = options.timeoutMs ?? 15000;
   const explicitGraceMs = options.interceptGraceMs;
   const markerPath = options.interceptMarkerPath || null;
+  const logFilePath = options.logFilePath || null;
   if (markerPath) { try { fs.unlinkSync(markerPath); } catch {} }
+  if (logFilePath) { try { fs.unlinkSync(logFilePath); } catch {} }
 
   return new Promise(resolve => {
     let stdout = '', stderr = '', settled = false, interceptAbortTimer = null;
     const spawnedAtMs = Date.now();
-    const cleanupMarker = () => { if (markerPath) { try { fs.unlinkSync(markerPath); } catch {} } };
+    const cleanupFiles = () => {
+      if (markerPath) { try { fs.unlinkSync(markerPath); } catch {} }
+      if (logFilePath) { try { fs.unlinkSync(logFilePath); } catch {} }
+    };
     const finish = result => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearInterval(interceptPoll);
       if (interceptAbortTimer) clearTimeout(interceptAbortTimer);
-      cleanupMarker();
+      const logDiag = logFilePath ? inspectAgyCliLog(logFilePath) : null;
+      cleanupFiles();
+      if (result && typeof result === 'object') {
+        if (logDiag?.account_email && !result.account_email) result.account_email = logDiag.account_email;
+        if (!result.available && !result.failure_kind) {
+          if (logDiag?.definite_auth_drop) {
+            result.failure_kind = 'auth_required';
+            result.error = logDiag.explicit_revoked
+              ? 'AGY OAuth refresh_token 已失效或被吊销（需在 CC Switch 或 Mode.ps1 agy-login 重新登录）'
+              : '未检测到有效的 Antigravity CLI 登录凭据（需在 CC Switch 或 Mode.ps1 agy-login 登录）';
+          } else if (result.oauth_browser_suppressed || logDiag?.timed_out_10s) {
+            result.failure_kind = 'oauth_refresh_timeout';
+          } else {
+            result.failure_kind = 'probe_error';
+          }
+        }
+      }
       resolve(result);
     };
     let child;
     try {
+      const env = options.allowBrowser === true
+        ? cleanOfficialAgyEnv(options.env || process.env)
+        : withNoBrowserEnv(options.env || process.env, options.noBrowserBinDir, markerPath);
       child = spawn(command[0], command.slice(1), {
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: withNoBrowserEnv(options.env || process.env, options.noBrowserBinDir, markerPath)
+        env
       });
     } catch (error) {
-      finish({ available: false, error: error.message });
+      finish({ available: false, failure_kind: 'probe_error', error: error.message });
       return;
     }
     const timer = setTimeout(() => {
@@ -1472,7 +1534,7 @@ function runExternalAgyProbeAsync(command, options = {}) {
     // hourly access_token, `printmode.go:433` calls `rundll32 url.dll,FileProtocolHandler`.
     // Our `no-browser-bin/rundll32.cmd` blocks the browser popup and writes `markerPath`;
     // wait `graceMs` (6s if 10s refresh is in flight, 600ms if keyring failed immediately) so `keyringAuth` can save the new token.
-    const interceptPoll = markerPath ? setInterval(() => {
+    const interceptPoll = (!options.allowBrowser && markerPath) ? setInterval(() => {
       if (interceptAbortTimer || !fs.existsSync(markerPath)) return;
       const elapsedMs = Date.now() - spawnedAtMs;
       const graceMs = explicitGraceMs ?? (elapsedMs >= 8000 ? 6000 : 600);
@@ -1481,6 +1543,7 @@ function runExternalAgyProbeAsync(command, options = {}) {
         finish({
           available: false,
           oauth_browser_suppressed: true,
+          intercept_elapsed_ms: elapsedMs,
           error: 'AGY silent OAuth refresh exceeded 10s; interactive browser sign-in popup was suppressed'
         });
       }, graceMs);
@@ -1492,10 +1555,11 @@ function runExternalAgyProbeAsync(command, options = {}) {
     child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-4096); });
     child.once('error', error => finish({ available: false, error: error.message }));
     child.once('close', code => {
-      if (markerPath && fs.existsSync(markerPath) && code !== 0) {
+      if (!options.allowBrowser && markerPath && fs.existsSync(markerPath) && code !== 0) {
         finish({
           available: false,
           oauth_browser_suppressed: true,
+          intercept_elapsed_ms: Date.now() - spawnedAtMs,
           error: 'AGY silent OAuth refresh failed; interactive browser sign-in popup was suppressed'
         });
         return;
@@ -1574,7 +1638,7 @@ async function probeAgyQuotaAsync(projectPolicy, options = {}) {
       if (attempt > 1) await sleepMs(delaysMs[Math.min(attempt - 2, delaysMs.length - 1)] ?? 0);
       last = await runExternalAgyProbeAsync(projectPolicy.agy_quota_command, options);
       if (last && typeof last === 'object') last = { ...last, attempts: attempt };
-      if (!isRetryableAgyProbeFailure(last)) return last;
+      if (!isRetryableAgyProbeFailure(last, attempt)) return last;
     }
     return last;
   }
@@ -1583,11 +1647,13 @@ async function probeAgyQuotaAsync(projectPolicy, options = {}) {
   const probeHome = options.probeHomeDir || defaultAgyProbeHome();
   const { noBrowserBinDir } = prepareSilentAgyProbeHome(probeHome, options.nowMs);
   const runOnce = attempt => {
-    const marker = path.join(probeHome, `oauth-intercept-${process.pid}-${Date.now()}-${attempt}.flag`);
+    const stamp = `${process.pid}-${Date.now()}-${attempt}`;
+    const marker = path.join(probeHome, `oauth-intercept-${stamp}.flag`);
+    const logFile = path.join(probeHome, `probe-cli-${stamp}.log`);
     const cmdPrefix = Array.isArray(agyBin) ? agyBin : [agyBin];
     return runExternalAgyProbeAsync(
-      [...cmdPrefix, `--gemini_dir=${probeHome}`, '--print', '/usage', '--output-format', 'json'],
-      { timeoutMs: 65000, noBrowserBinDir, interceptMarkerPath: marker, ...options }
+      [...cmdPrefix, `--log-file=${logFile}`, `--gemini_dir=${probeHome}`, '--print', '/usage', '--output-format', 'json'],
+      { timeoutMs: 65000, noBrowserBinDir, interceptMarkerPath: marker, logFilePath: logFile, ...options }
     );
   };
   let last = null;
@@ -1596,10 +1662,119 @@ async function probeAgyQuotaAsync(projectPolicy, options = {}) {
     last = await runOnce(attempt);
     if (last && typeof last === 'object') last = { ...last, attempts: attempt };
     // Retry up to maxAttempts on slow >10s OAuth refreshes (whose background goroutine writes the new token to keyring)
-    // as well as transient proxy/TLS timeouts!
-    if (!isRetryableAgyProbeFailure(last)) return last;
+    // as well as transient proxy/TLS timeouts; stop after 2 attempts if CLI log proved credentials are missing/revoked!
+    if (!isRetryableAgyProbeFailure(last, attempt)) return last;
   }
   return last;
+}
+
+async function runAgyInteractiveLoginAsync(options = {}) {
+  const agyBin = resolveRealAgyBin(options);
+  if (!agyBin) {
+    return {
+      ok: false,
+      error: '未找到本机官方 agy CLI（%LOCALAPPDATA%\\agy\\bin\\agy.exe），也可直接在 CC Switch 中完成 Antigravity 账号授权。'
+    };
+  }
+  const probeHome = options.probeHomeDir || defaultAgyProbeHome();
+  prepareSilentAgyProbeHome(probeHome, options.nowMs);
+  const logFile = path.join(probeHome, `login-cli-${process.pid}-${Date.now()}.log`);
+  const cmdPrefix = Array.isArray(agyBin) ? agyBin : [agyBin];
+  const probed = await runExternalAgyProbeAsync(
+    [...cmdPrefix, `--log-file=${logFile}`, `--gemini_dir=${probeHome}`, '--print', '/usage', '--output-format', 'json'],
+    { timeoutMs: options.timeoutMs ?? 180000, allowBrowser: true, logFilePath: logFile, env: options.env }
+  );
+  if (!probed?.available) {
+    return {
+      ok: false,
+      error: probed?.error || 'Antigravity 登录或配额校验未完成',
+      probed
+    };
+  }
+  return {
+    ok: true,
+    account_email: probed.account_email || null,
+    agy_external: probed
+  };
+}
+
+function evaluateAgyProbeHealth({ probed, prevHealth, prevExternal, prevProbedAt, ccSwitchMtimeMs = null, nowMs = Date.now(), modeScriptPath = null }) {
+  const nowIso = new Date(nowMs).toISOString();
+  const loginCmd = modeScriptPath
+    ? `pwsh -NoProfile -File "${modeScriptPath.replace(/\\/g, '/')}" agy-login`
+    : 'pwsh -NoProfile -File scripts/Mode.ps1 agy-login';
+
+  if (probed === null) {
+    return {
+      status: 'cli_not_installed',
+      alert_needed: false,
+      consecutive_failures: 0,
+      account_email: null,
+      cc_switch_mtime_ms: ccSwitchMtimeMs,
+      last_success_at: prevHealth?.last_success_at || null,
+      since: null,
+      last_error: null,
+      recovery_command: null,
+      message: null
+    };
+  }
+
+  if (probed.available) {
+    return {
+      status: 'healthy',
+      alert_needed: false,
+      consecutive_failures: 0,
+      account_email: probed.account_email || prevHealth?.account_email || null,
+      cc_switch_mtime_ms: ccSwitchMtimeMs,
+      last_success_at: nowIso,
+      since: null,
+      last_error: null,
+      recovery_command: null,
+      message: null
+    };
+  }
+
+  const consecutive = (prevHealth?.consecutive_failures || 0) + 1;
+  const definiteAuthDrop = probed.failure_kind === 'auth_required';
+  const repeatedAuthTimeout = Boolean(probed.oauth_browser_suppressed && consecutive >= 2);
+  let status;
+  if (definiteAuthDrop || repeatedAuthTimeout) {
+    status = 'auth_required';
+  } else if (consecutive >= 2) {
+    status = 'quota_unreachable';
+  } else {
+    status = 'transient_retry';
+  }
+
+  const alertNeeded = status === 'auth_required' || status === 'quota_unreachable';
+  const prevSameAlert = alertNeeded && prevHealth?.status === status && prevHealth?.since;
+  const since = alertNeeded ? (prevSameAlert ? prevHealth.since : nowIso) : null;
+  const prevMs = Date.parse(prevProbedAt || '');
+  const canKeepRecentStale = status === 'transient_retry'
+    && Boolean(prevExternal?.available)
+    && Number.isFinite(prevMs)
+    && (nowMs - prevMs <= 30 * 60 * 1000);
+
+  const message = status === 'auth_required'
+    ? `检测到本机 Antigravity 账号授权已掉线或失效（后台已拦截自动打开浏览器，避免打断工作）。请在 CC Switch 中重新授权/切换账号，或执行一键登录恢复：${loginCmd}`
+    : status === 'quota_unreachable'
+      ? `Antigravity 官方五桶额度已连续 ${consecutive} 轮查询失败（最近原因：${probed.error || '未知错误'}；后台未打开浏览器）。请检查代理网络、CC Switch 账号状态，或执行 ${loginCmd} 验证登录。`
+      : null;
+
+  return {
+    status,
+    alert_needed: alertNeeded,
+    consecutive_failures: consecutive,
+    failure_kind: probed.failure_kind || 'probe_error',
+    account_email: prevHealth?.account_email || null,
+    cc_switch_mtime_ms: ccSwitchMtimeMs,
+    last_success_at: prevHealth?.last_success_at || null,
+    since,
+    last_error: probed.error || null,
+    recovery_command: alertNeeded ? loginCmd : null,
+    keep_recent_stale: canKeepRecentStale,
+    message
+  };
 }
 
 const VALID_AGY_EXEC_MODES = new Set(['plan', 'auto', 'accept-edits']);
@@ -1849,6 +2024,7 @@ function decideRoute(input = {}) {
   const codexPacing = input.codexPacing || { available: false };
   const agyUsage = input.agyUsage || { available: false };
   const agyExternal = input.agyExternal || null;
+  const agyHealth = input.agyHealth || null;
   const agyPacing = input.agyPacing || evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy: policy, codexPacing, nowMs });
   const activeTasks = input.activeCodexTasks || { count: 0, orphaned: 0, tasks: [] };
   const currentModelName = typeof input.modelName === 'string' ? input.modelName : '';
@@ -2070,7 +2246,12 @@ function decideRoute(input = {}) {
             ? 'AGY 全量接管（Codex 已100%耗尽，自动解粘性跨端交接）'
             : '优先 AGY 低成本多子代理（Codex 兜底）';
 
-  const summaryLine = `模式=${mode}｜路由=${engineLabel}｜${codexText}｜${agy7dText}｜${agy5hText}${activeTasks.count ? `｜在途Codex任务=${activeTasks.count}` : ''}`;
+  const agyHealthTag = agyHealth?.status === 'auth_required'
+    ? '｜告警=AGY登录已掉线(需重登)'
+    : agyHealth?.status === 'quota_unreachable'
+      ? `｜告警=AGY额度连续${agyHealth.consecutive_failures}次查询失败`
+      : '';
+  const summaryLine = `模式=${mode}｜路由=${engineLabel}｜${codexText}｜${agy7dText}｜${agy5hText}${agyHealthTag}${activeTasks.count ? `｜在途Codex任务=${activeTasks.count}` : ''}`;
 
   const handoverGuidance = preferredEngine === 'paused'
     ? `Codex 与 AGY 当前均已耗尽可用额度（最快重置倒计时：${earliestResetHours ?? '未知'}h）。已停止自动派发与空转重试；请向用户展示三个选项：① 等待最快窗口重置；② 在 CC Switch 切换到备用账号（自动共享生效）；③ 是否授权使用额外 Credits / 重置券。`
@@ -2095,6 +2276,7 @@ function decideRoute(input = {}) {
     agy_pacing: agyPacing,
     agy_usage: agyUsage,
     agy_external: agyExternal,
+    agy_health: agyHealth,
     agy_constrained: agyConstrained,
     agy_exhausted: agyExhausted,
     agy_5h_limited: agy5hLimited,
@@ -2550,6 +2732,7 @@ function resolveSharedQuotaSnapshot(scope, projectPolicy, options = {}) {
       codexPacing: fresh.codex_pacing || { available: false },
       agyUsage: fresh.agy_usage,
       agyExternal: fresh.agy_external || null,
+      agyHealth: fresh.agy_health || null,
       reused_shared_cache: true
     };
   }
@@ -2562,6 +2745,7 @@ function resolveSharedQuotaSnapshot(scope, projectPolicy, options = {}) {
       codexPacing: stale?.codex_pacing ? { ...stale.codex_pacing, ...(fresh ? {} : { stale: true }) } : { available: false },
       agyUsage: stale?.agy_usage || { available: false },
       agyExternal: stale?.agy_external || null,
+      agyHealth: stale?.agy_health || null,
       reused_shared_cache: true
     };
   }
@@ -2585,14 +2769,16 @@ function resolveSharedQuotaSnapshot(scope, projectPolicy, options = {}) {
       nowMs
     });
     const agyExternal = stale?.agy_external || null;
+    const agyHealth = stale?.agy_health || null;
     writeQuotaCache(cachePath, {
       ...(stale || {}),
       codex_pacing: codexPacing,
       agy_usage: agyUsage,
       agy_external: agyExternal,
+      agy_health: agyHealth,
       fetched_at: new Date(nowMs).toISOString()
     });
-    return { codexPacing, agyUsage, agyExternal, reused_shared_cache: false };
+    return { codexPacing, agyUsage, agyExternal, agyHealth, reused_shared_cache: false };
   } finally {
     release();
   }
@@ -2626,10 +2812,14 @@ module.exports = {
   shouldPreferRolloutOverStale,
   scanAgyTranscriptUsage,
   resolveRealAgyBin,
+  inspectAgyCliLog,
+  detectCcSwitchAccountsMtimeMs,
   parseAgyProbePayload,
   runExternalAgyProbe,
   runExternalAgyProbeAsync,
   probeAgyQuotaAsync,
+  runAgyInteractiveLoginAsync,
+  evaluateAgyProbeHealth,
   runAgyPoolTaskAsync,
   checkExternalPoolCliMisuse,
   resolveSharedQuotaSnapshot,

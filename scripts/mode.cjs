@@ -9,11 +9,17 @@ const {
   normalizeMode,
   normalizeSubagentModel,
   defaultPolicyPath,
+  defaultQuotaCachePath,
   loadRoutingPolicy,
   saveRoutingPolicy,
   resolveProjectPolicy,
   resolveSharedQuotaSnapshot,
+  detectCcSwitchAccountsMtimeMs,
+  evaluateAgyProbeHealth,
+  runAgyInteractiveLoginAsync,
   runAgyPoolTaskAsync,
+  readStaleQuotaCache,
+  writeQuotaCache,
   activeCodexTasks
 } = require('../src/routing-policy.cjs');
 const { defaultGuardStatePath, resetAgyGuard, readGuardQuotaCooldown } = require('../src/agy-guard.cjs');
@@ -24,6 +30,7 @@ function usage() {
     '',
     'Commands:',
     '  status [--refresh] [--project ABS_PATH] [--config MCP_JSON]',
+    '  agy-login [--timeout-ms N] [--config MCP_JSON] [--policy POLICY_JSON]',
     '  set --mode auto|agy|codex [--project ABS_PATH] [--config MCP_JSON] [--policy POLICY_JSON]',
     '      (aliases: agy/AGY/Agy/antigravity -> agy; auto/hybrid/balanced -> auto)',
     '  reset-project --project ABS_PATH [--config MCP_JSON] [--policy POLICY_JSON]',
@@ -102,6 +109,44 @@ async function run(argv) {
       };
     });
     return JSON.stringify({ ...report, projects }, null, 2);
+  }
+
+  if (opts.command === 'agy-login') {
+    const loginRes = await runAgyInteractiveLoginAsync({
+      agyBin: opts['agy-bin'],
+      timeoutMs: opts['timeout-ms'] ? Number(opts['timeout-ms']) : 180000
+    });
+    if (!loginRes.ok) {
+      process.exitCode = 1;
+      return JSON.stringify(loginRes, null, 2);
+    }
+    const scope = settings?.projects?.[0] || settings || null;
+    const cachePath = defaultQuotaCachePath(policyFile, scope);
+    if (cachePath) {
+      const nowMs = Date.now();
+      const prev = readStaleQuotaCache(cachePath, nowMs, 86400);
+      const ccSwitchMtimeMs = detectCcSwitchAccountsMtimeMs();
+      const agyHealth = evaluateAgyProbeHealth({
+        probed: loginRes.agy_external,
+        prevHealth: prev?.agy_health || null,
+        prevExternal: prev?.agy_external || null,
+        ccSwitchMtimeMs,
+        nowMs,
+        modeScriptPath: path.resolve(__dirname, 'Mode.ps1')
+      });
+      writeQuotaCache(cachePath, {
+        ...(prev || {}),
+        agy_external: loginRes.agy_external,
+        agy_health: agyHealth,
+        agy_probed_at: new Date(nowMs).toISOString(),
+        fetched_at: new Date(nowMs).toISOString()
+      });
+    }
+    return JSON.stringify({
+      state: 'authenticated',
+      account_email: loginRes.account_email,
+      agy_external: loginRes.agy_external
+    }, null, 2);
   }
 
   const current = loadRoutingPolicy(policyFile);

@@ -22,7 +22,9 @@ const {
   resolveProjectPolicy,
   evaluateCodexPacing,
   scanAgyTranscriptUsage,
+  detectCcSwitchAccountsMtimeMs,
   probeAgyQuotaAsync,
+  evaluateAgyProbeHealth,
   activeCodexTasks,
   decideRoute,
   readQuotaCache,
@@ -759,6 +761,7 @@ class Broker {
         codexPacing: cached.codex_pacing || { available: false },
         agyUsage: cached.agy_usage || { available: false },
         agyExternal: cached.agy_external ?? null,
+        agyHealth: cached.agy_health ?? null,
         activeCodexTasks: active,
         nowMs
       });
@@ -780,6 +783,7 @@ class Broker {
             codexPacing: shared.codex_pacing || { available: false },
             agyUsage: shared.agy_usage || { available: false },
             agyExternal: shared.agy_external ?? null,
+            agyHealth: shared.agy_health ?? null,
             activeCodexTasks: active,
             nowMs
           });
@@ -792,6 +796,7 @@ class Broker {
     let codexError = null;
     let agyUsage = null;
     let agyExternal = null;
+    let agyHealth = null;
     try {
       const prev = readStaleQuotaCache(cachePath, nowMs, 86400);
       const sessionsDir = defaultCodexSessionsDir(this.settings, { codexSessionsDir: input.codex_sessions_dir });
@@ -840,6 +845,11 @@ class Broker {
 
       let agyProbedAt = prev?.agy_probed_at || null;
       const prevAgyProbeMs = Date.parse(agyProbedAt || '');
+      const ccSwitchMtimeMs = detectCcSwitchAccountsMtimeMs({ ccSwitchAccountsFile: input.cc_switch_accounts_file });
+      const ccSwitchChanged = ccSwitchMtimeMs !== null
+        && prev?.agy_health?.cc_switch_mtime_ms !== undefined
+        && ccSwitchMtimeMs !== prev.agy_health.cc_switch_mtime_ms;
+      const probeIntervalMs = prev?.agy_health?.status === 'auth_required' ? 30 * 60 * 1000 : 10 * 60 * 1000;
       const anyBucketExpired = Boolean(
         prev?.agy_external?.buckets
         && Object.values(prev.agy_external.buckets).some(b => {
@@ -847,12 +857,35 @@ class Broker {
           return Number.isFinite(ms) && ms > 0 && ms <= nowMs;
         })
       );
-      if (!isRefresh && !anyBucketExpired && Number.isFinite(prevAgyProbeMs) && (nowMs - prevAgyProbeMs < 10 * 60 * 1000) && prev?.agy_external !== undefined) {
+      if (!isRefresh && !ccSwitchChanged && !anyBucketExpired && Number.isFinite(prevAgyProbeMs) && (nowMs - prevAgyProbeMs < probeIntervalMs) && prev?.agy_external !== undefined) {
         agyExternal = prev.agy_external;
+        agyHealth = prev.agy_health || null;
       } else {
-        const probed = await probeAgyQuotaAsync(projectPolicy, { agyBin: input.agy_bin, cachePath });
+        const probed = await probeAgyQuotaAsync(projectPolicy, {
+          agyBin: input.agy_bin,
+          probeHomeDir: input.probe_home_dir,
+          retryDelaysMs: input.retry_delays_ms,
+          interceptGraceMs: input.intercept_grace_ms,
+          cachePath,
+          nowMs
+        });
+        agyHealth = evaluateAgyProbeHealth({
+          probed,
+          prevHealth: prev?.agy_health || null,
+          prevExternal: prev?.agy_external || null,
+          prevProbedAt: prev?.agy_probed_at || prev?.fetched_at || null,
+          ccSwitchMtimeMs,
+          nowMs,
+          modeScriptPath: path.resolve(__dirname, '..', 'scripts', 'Mode.ps1')
+        });
         if (probed !== null) {
-          agyExternal = probed.available ? probed : (prev?.agy_external?.available ? prev.agy_external : probed);
+          if (probed.available) {
+            agyExternal = probed;
+          } else if (agyHealth.keep_recent_stale) {
+            agyExternal = { ...prev.agy_external, stale: true, last_probe_error: probed.error || null };
+          } else {
+            agyExternal = { ...probed, available: false };
+          }
           agyProbedAt = new Date(nowMs).toISOString();
         } else {
           agyExternal = null;
@@ -864,6 +897,7 @@ class Broker {
         codex_pacing: persistCodex,
         agy_usage: agyUsage,
         agy_external: agyExternal,
+        agy_health: agyHealth,
         codex_probed_at: codexProbedAt,
         agy_probed_at: agyProbedAt,
         fetched_at: new Date(nowMs).toISOString()
@@ -880,6 +914,7 @@ class Broker {
       codexPacing,
       agyUsage,
       agyExternal,
+      agyHealth,
       activeCodexTasks: active,
       nowMs
     });

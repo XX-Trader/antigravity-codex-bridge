@@ -170,7 +170,7 @@ function contextHook(payload, projects, options = {}) {
   const guardFile = options.guardStateFile || defaultGuardStatePath(policyPath, selected.scope);
   const guardCooldown = readGuardQuotaCooldown(guardFile, options.nowMs);
   const projectPolicy = { ...selected.policy, ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
-  const { codexPacing, agyUsage, agyExternal } = resolveSharedQuotaSnapshot(selected.scope, projectPolicy, {
+  const { codexPacing, agyUsage, agyExternal, agyHealth } = resolveSharedQuotaSnapshot(selected.scope, projectPolicy, {
     ...options,
     policyPath,
     transcriptPath: payload?.transcriptPath
@@ -183,6 +183,7 @@ function contextHook(payload, projects, options = {}) {
     codexPacing,
     agyUsage,
     agyExternal,
+    agyHealth,
     activeCodexTasks: active,
     modelName: payload?.modelName || '',
     nowMs: options.nowMs
@@ -196,7 +197,8 @@ function contextHook(payload, projects, options = {}) {
     reason: route.reason,
     updated_at: rawPolicy.updated_at || null,
     quant_reminder: route.thinking_guidance?.matches_required === false ? route.thinking_guidance.required_thinking_model : null,
-    pool_stopped: Boolean(route.thinking_guidance?.current_model_pool_stopped)
+    pool_stopped: Boolean(route.thinking_guidance?.current_model_pool_stopped),
+    agy_alert: route.agy_health?.alert_needed ? `${route.agy_health.status}:${route.agy_health.since || ''}` : null
   });
   const markerFile = options.markerFile || (policyPath ? path.join(path.dirname(policyPath), 'context-hook-state.json') : null);
   if (eventName === 'PreInvocation' && conversationId && markerFile) {
@@ -248,6 +250,9 @@ function contextHook(payload, projects, options = {}) {
     `编码与主代理必审门禁：严禁无依据硬编码（尤其是日期时间与环境常量，统一注入时钟基准或用相对偏移）；关键信息（外部接口原始 payload、核心阈值/PIT 公式、跨模块契约与子代理测试 diff）必须由主代理亲自回读审核；显式处理未使用/未激活(0%/null/纪元零值)及重置归零等特殊边界态。`,
     `AGY 安全门禁：先审后做=${projectPolicy.agy_guard.review_gate}（重要/量化改动建议先 codex_run(review_only=true) 再交 AGY 实施）；防死循环=同一错误连错 ${projectPolicy.agy_guard.max_same_error_failures} 次或无进展连错 ${projectPolicy.agy_guard.max_consecutive_failures} 次自动熔断（不同错误允许自行修复，成功即清零）。`
   ];
+  if (route.agy_health?.alert_needed && route.agy_health.message) {
+    lines.push(`[AGY 账号与额度告警] ${route.agy_health.message}（请在回复开头向用户简要提示一次该状态及恢复方式，禁止未经用户同意自行打开浏览器）。`);
+  }
   if (route.exhaustion_handover?.guidance) lines.push(`[额度耗尽与交接] ${route.exhaustion_handover.guidance}`);
   if (route.thinking_guidance?.reminder) lines.push(`${route.thinking_guidance.current_model_pool_stopped ? '[模型池硬停告警]' : '[思考模型提示]'} ${route.thinking_guidance.reminder}`);
   if (active.count > 0) lines.push(`[并发防撞] 当前项目有 ${active.count} 个活跃 Codex 任务；AGY 写操作请避开重叠文件或使用 Workspace="share"。`);

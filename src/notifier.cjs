@@ -407,6 +407,73 @@ function watch(broker, send, options = {}) {
   interval = setInterval(reconcile, health.interval_ms);
   heartbeat(); void drain(); return { close, reconcile };
 }
+function sendDesktopBalloonAlert(title, body, options = {}) {
+  if (typeof options.desktopNotify === 'function') {
+    options.desktopNotify({ title, body });
+    return true;
+  }
+  if (process.platform !== 'win32' || process.env.CODEX_EXECUTOR_TEST_ROOT) return false;
+  try {
+    const pwsh = options.pwsh || process.env.CODEX_EXECUTOR_PWSH || 'pwsh.exe';
+    const script = [
+      'Add-Type -AssemblyName System.Windows.Forms',
+      'Add-Type -AssemblyName System.Drawing',
+      '$ni = [System.Windows.Forms.NotifyIcon]::new()',
+      '$ni.Icon = [System.Drawing.SystemIcons]::Warning',
+      '$ni.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning',
+      '$ni.BalloonTipTitle = $env:AGY_ALERT_TITLE',
+      '$ni.BalloonTipText = $env:AGY_ALERT_BODY',
+      '$ni.Visible = $true',
+      '$ni.ShowBalloonTip(8000)',
+      'Start-Sleep -Seconds 9',
+      '$ni.Dispose()'
+    ].join('; ');
+    const child = spawn(pwsh, ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', script], {
+      windowsHide: true,
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, AGY_ALERT_TITLE: String(title || '').slice(0, 60), AGY_ALERT_BODY: String(body || '').slice(0, 240) }
+    });
+    child.unref?.();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function notifyAgyHealthIfNeeded(broker, report, options = {}) {
+  if (!broker?.jobs || !report?.agy_health) return false;
+  const alertFile = path.join(path.dirname(broker.jobs), 'agy-auth-alert.json');
+  const nowIso = new Date(options.now ?? Date.now()).toISOString();
+  const prev = fs.existsSync(alertFile) ? read(alertFile) : null;
+  const health = report.agy_health;
+
+  if (health.alert_needed) {
+    const incidentId = `${health.status}:${health.since || 'active'}`;
+    if (prev?.notified && prev.incident_id === incidentId) return false;
+    const title = health.status === 'auth_required'
+      ? 'Antigravity 账号已掉线（需重新登录）'
+      : 'Antigravity 额度查询异常';
+    const body = health.status === 'auth_required'
+      ? '检测到 Antigravity CLI 授权失效（已拦截自动弹浏览器）。请打开 CC Switch 检查账号，或运行 Mode.ps1 agy-login 登录恢复。'
+      : `Antigravity 五桶额度已连续 ${health.consecutive_failures} 次查询失败（${String(health.last_error || '网络/认证异常').slice(0, 90)}）。请检查代理或 CC Switch。`;
+    sendDesktopBalloonAlert(title, body, options);
+    save(alertFile, {
+      notified: true,
+      incident_id: incidentId,
+      status: health.status,
+      last_error: health.last_error || null,
+      notified_at: nowIso
+    });
+    return true;
+  }
+
+  if (health.status === 'healthy' && prev?.notified) {
+    save(alertFile, { ...prev, notified: false, resolved_at: nowIso });
+  }
+  return false;
+}
+
 function startQuotaSyncLoop(broker, options = {}) {
   const intervalMs = options.intervalMs ?? 120000;
   const initialDelayMs = options.initialDelayMs ?? 1500;
@@ -424,7 +491,9 @@ function startQuotaSyncLoop(broker, options = {}) {
     if (options.owns && !options.owns()) { close(); return null; }
     running = true;
     try {
-      return await broker.quota({ background: true });
+      const report = await broker.quota({ background: true });
+      try { notifyAgyHealthIfNeeded(broker, report, options); } catch {}
+      return report;
     } catch (error) {
       process.stderr.write(`Shared quota sync: ${error.message}\n`);
       return null;
@@ -438,7 +507,7 @@ function startQuotaSyncLoop(broker, options = {}) {
   timer.unref?.();
   return { close, tick };
 }
-module.exports = { originHook, contextHook, postToolHook, deliver, watch, startQuotaSyncLoop, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
+module.exports = { originHook, contextHook, postToolHook, deliver, watch, startQuotaSyncLoop, notifyAgyHealthIfNeeded, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
 if (require.main === module) {
   if (['--origin-hook', '--context-hook', '--post-tool-hook'].includes(process.argv[2])) {
     const mode = process.argv[2];

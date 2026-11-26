@@ -1461,5 +1461,127 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
     assert.equal(recoveredPoolRun.ok, true);
     assert.equal(recoveredPoolRun.attempts, 3, 'runAgyPoolTaskAsync must automatically retry OAuth refresh timeouts without failing on attempt 1');
     assert.equal(recoveredPoolRun.response, 'RECOVERED_ON_ATTEMPT_3');
+
+    // (e) Real account drop (`invalid_grant` / missing keyring credential) vs transient network failure,
+    //     non-popup alert deduplication, contextHook alert injection, CC Switch mtime recovery, and `agy-login`:
+    const { evaluateAgyProbeHealth, runAgyInteractiveLoginAsync } = require('../src/routing-policy.cjs');
+    const { notifyAgyHealthIfNeeded } = require('../src/notifier.cjs');
+    const mockRevokedCli = path.join(f.root, 'mock-revoked-oauth.cjs');
+    fs.writeFileSync(mockRevokedCli, [
+      'const fs = require("node:fs");',
+      'const { spawnSync } = require("node:child_process");',
+      'const logArg = process.argv.find(a => a.startsWith("--log-file="));',
+      'if (logArg) {',
+      '  fs.writeFileSync(logArg.slice("--log-file=".length), [',
+      '    "printmode.go:410] Print mode: not authenticated, trying silent auth",',
+      '    "browser.go:260] oauth2: cannot fetch token: 400 Bad Request Response: {\\"error\\":\\"invalid_grant\\",\\"error_description\\":\\"Token has been expired or revoked.\\"}",',
+      '    "printmode.go:416] Print mode: silent auth failed",',
+      '    "printmode.go:433] Print mode: triggering interactive OAuth"',
+      '  ].join("\\n"), "utf8");',
+      '}',
+      'spawnSync("cmd.exe", ["/c", "rundll32", "url.dll,FileProtocolHandler", "https://accounts.google.com/o/oauth2/v2/auth"], { env: process.env, windowsHide: true });',
+      'setTimeout(() => {}, 30000);'
+    ].join('\n'), 'utf8');
+
+    const droppedProbe = await probeAgyQuotaAsync(resolveProjectPolicy(defaultPolicy(), { project: f.project }), {
+      agyBin: [process.execPath, mockRevokedCli],
+      probeHomeDir: path.join(f.root, 'oauth-probe-home'),
+      interceptGraceMs: 50,
+      retryDelaysMs: [10, 20, 30],
+      nowMs: now
+    });
+    assert.equal(droppedProbe.available, false);
+    assert.equal(droppedProbe.oauth_browser_suppressed, true);
+    assert.equal(droppedProbe.failure_kind, 'auth_required', 'Explicit invalid_grant in CLI log must classify as auth_required');
+    assert.equal(droppedProbe.attempts, 2, 'Definite auth drop stops after 2 quick checks instead of spinning all 4 slow attempts');
+
+    // Even when a previous quota snapshot existed, a real `auth_required` drop MUST NOT be masked by old cached quota!
+    const dropHealth = evaluateAgyProbeHealth({
+      probed: droppedProbe,
+      prevHealth: { status: 'healthy', consecutive_failures: 0, account_email: 'user@example.com' },
+      prevExternal: recoveredQuota,
+      prevProbedAt: relIso(now, -5 * MINUTE_MS),
+      nowMs: now
+    });
+    assert.equal(dropHealth.status, 'auth_required');
+    assert.equal(dropHealth.alert_needed, true);
+    assert.equal(dropHealth.keep_recent_stale, false, 'Must not hide a real auth drop behind stale cached quota');
+
+    // Transient 1st network error keeps recent stale quota without false-alarming; 2nd consecutive error alerts `quota_unreachable`!
+    const transient1 = evaluateAgyProbeHealth({
+      probed: { available: false, failure_kind: 'probe_error', error: 'context deadline exceeded' },
+      prevHealth: { status: 'healthy', consecutive_failures: 0 },
+      prevExternal: recoveredQuota,
+      prevProbedAt: relIso(now, -5 * MINUTE_MS),
+      nowMs: now
+    });
+    assert.equal(transient1.status, 'transient_retry');
+    assert.equal(transient1.alert_needed, false);
+    assert.equal(transient1.keep_recent_stale, true);
+
+    const unreachable2 = evaluateAgyProbeHealth({
+      probed: { available: false, failure_kind: 'probe_error', error: 'context deadline exceeded' },
+      prevHealth: transient1,
+      prevExternal: recoveredQuota,
+      prevProbedAt: relIso(now, -15 * MINUTE_MS),
+      nowMs: now + 10 * MINUTE_MS
+    });
+    assert.equal(unreachable2.status, 'quota_unreachable');
+    assert.equal(unreachable2.alert_needed, true);
+    assert.equal(unreachable2.keep_recent_stale, false);
+
+    // Deduplicated desktop tray notification + recovery reset:
+    const alerts = [];
+    const mockBroker = { jobs: path.join(f.data, 'jobs') };
+    fs.mkdirSync(mockBroker.jobs, { recursive: true });
+    assert.equal(notifyAgyHealthIfNeeded(mockBroker, { agy_health: dropHealth }, { now: now, desktopNotify: p => alerts.push(p) }), true);
+    assert.equal(alerts.length, 1);
+    assert.match(alerts[0].title, /账号已掉线/);
+    assert.equal(notifyAgyHealthIfNeeded(mockBroker, { agy_health: dropHealth }, { now: now + MINUTE_MS, desktopNotify: p => alerts.push(p) }), false, 'Same incident must never spam duplicate desktop notifications');
+    assert.equal(alerts.length, 1);
+
+    // `contextHook` injects `[AGY 账号与额度告警]` immediately when `quota-cache.json` records `auth_required`:
+    writeQuotaCache(cachePath, {
+      codex_pacing: { available: true, window_active: true, band: 'balanced', elapsed_percent: 50, used_percent: 45, pacing_delta: -5, resets_at: relIso(now, 60 * HOUR_MS), hours_until_reset: 60 },
+      agy_usage: { available: true, window_5h: { total_tokens: 0 }, window_7d: { total_tokens: 0 }, quota_errors_5h: 0, auto_degraded: false },
+      agy_external: { available: false, failure_kind: 'auth_required', error: droppedProbe.error },
+      agy_health: dropHealth,
+      fetched_at: relIso(now, 0)
+    });
+    const ctxAlert = contextHook(
+      { hookEventName: 'PreInvocation', conversationId: '99999999-9999-9999-9999-999999999999', workspacePaths: [f.project] },
+      [{ project: f.project, data: f.data }],
+      { policyPath: f.policyPath, cachePath, nowMs: now }
+    );
+    assert.match(ctxAlert.injectSteps[0].systemMessage.systemMessage, /\[AGY 账号与额度告警\]/);
+    assert.match(ctxAlert.injectSteps[0].systemMessage.systemMessage, /agy-login/);
+
+    // Explicit `runAgyInteractiveLoginAsync` allows interactive login, extracts account email, and resets alert state so future drops notify again!
+    const mockInteractiveLoginCli = path.join(f.root, 'mock-interactive-login.cjs');
+    fs.writeFileSync(mockInteractiveLoginCli, [
+      'const fs = require("node:fs");',
+      'if (process.env.AGY_BROWSER_INTERCEPT_MARKER) { process.exit(9); }',
+      'const logArg = process.argv.find(a => a.startsWith("--log-file="));',
+      'if (logArg) fs.writeFileSync(logArg.slice("--log-file=".length), "server_oauth.go:221] applyAuthResult: email=recovered@example.com, authMethod=consumer\\n", "utf8");',
+      `console.log(JSON.stringify({ status: "SUCCESS", command: { data: { groups: [{ buckets: [{ id: "gemini-weekly", remaining_fraction: 0.92, reset_time: ${JSON.stringify(relIso(now, 90 * HOUR_MS))} }, { id: "gemini-5h", remaining_fraction: 0.95, reset_time: ${JSON.stringify(relIso(now, 4 * HOUR_MS))} }] }] } } }));`
+    ].join('\n'), 'utf8');
+    const loginResult = await runAgyInteractiveLoginAsync({
+      agyBin: [process.execPath, mockInteractiveLoginCli],
+      probeHomeDir: path.join(f.root, 'oauth-probe-home'),
+      nowMs: now + 2 * MINUTE_MS
+    });
+    assert.equal(loginResult.ok, true);
+    assert.equal(loginResult.account_email, 'recovered@example.com');
+    const recoveredHealth = evaluateAgyProbeHealth({
+      probed: loginResult.agy_external,
+      prevHealth: dropHealth,
+      nowMs: now + 2 * MINUTE_MS
+    });
+    assert.equal(recoveredHealth.status, 'healthy');
+    assert.equal(recoveredHealth.alert_needed, false);
+    notifyAgyHealthIfNeeded(mockBroker, { agy_health: recoveredHealth }, { now: now + 2 * MINUTE_MS, desktopNotify: p => alerts.push(p) });
+    const secondDrop = evaluateAgyProbeHealth({ probed: droppedProbe, prevHealth: recoveredHealth, nowMs: now + 30 * MINUTE_MS });
+    assert.equal(notifyAgyHealthIfNeeded(mockBroker, { agy_health: secondDrop }, { now: now + 30 * MINUTE_MS, desktopNotify: p => alerts.push(p) }), true, 'New drop after recovery must alert cleanly again');
+    assert.equal(alerts.length, 2);
   }
 });

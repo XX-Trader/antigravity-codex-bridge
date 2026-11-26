@@ -296,8 +296,9 @@ Antigravity 切换回读：两个 MCP 入口均引用当前 main 所在的同一
   - `agy_priority`（$\Delta > +5\%$ 或 $U \ge 92\%$）：优先 AGY 低成本多子代理，保留 Codex 撑满周期；
   - `codex_protected`（$97\% \le U < 100\%$）：保护 Codex，拦截普通新事项改走 AGY，仅允许单路在途收尾；
   - `codex_drain`（距重置 $\le 12\text{h}$ 且剩余 $\ge 10\%$）：末期冲刺优先 Codex，减少过期浪费。
-- **AGY 官方 `agy /usage` 五桶探测 + 7 天 90% 上限（最后 6 小时自动解锁 10% 缓冲）+ 5 小时守卫**：
-  - **官方 CLI 五桶自动接入（与 CC Switch 共用系统钥匙串登录）**：当本机安装官方 Antigravity CLI（`%LOCALAPPDATA%\agy\bin\agy.exe` 或 `PATH` 中的 `agy`）后，后台每 10 分钟（或任一桶到达 `reset_time` 时）在纯 ASCII 隔离目录自动执行一次 `agy --print /usage --output-format json`（自动剥离 `GEMINI_API_KEY`/`GOOGLE_GEMINI_BASE_URL` 并在 Windows 下按需继承系统代理注册表，直接复用系统凭据管理器 `gemini:antigravity` 登录，不读私密令牌文件、不调未公开内部 RPC），原生解析 `gemini-5h`、`gemini-weekly`、`gemini-argon-wtu-weekly`、`3p-5h`、`3p-weekly` 五个官方额度桶与精确重置时间；未安装 CLI 时零报错回退至增量本地预算或手动快照（也可在 `routing-policy.json` 配置自定义 `agy_quota_command`）。
+- **AGY 官方 `agy /usage` 五桶探测 + 零浏览器弹窗防打扰 + 真实掉线告警 + 7 天 90% 上限（最后 6 小时自动解锁 10% 缓冲）+ 5 小时守卫**：
+  - **官方 CLI 五桶自动接入（与 CC Switch 共用系统钥匙串登录、后台零弹窗）**：当本机安装官方 Antigravity CLI（`%LOCALAPPDATA%\agy\bin\agy.exe` 或 `PATH` 中的 `agy`）后，后台每 10 分钟（或任一桶到达 `reset_time`、或检测到 CC Switch `agy_accounts.json` 更新时间戳变化时）在纯 ASCII 隔离目录自动执行一次 `agy --print /usage --output-format json`（自动剥离 `GEMINI_API_KEY`/`GOOGLE_GEMINI_BASE_URL`、禁用自动更新控制台弹窗、挂载私有 `no-browser-bin` 物理拦截浏览器自动弹出，并在遇到 10 秒令牌刷新慢响应时自动执行最多 3 次阶梯退避静默重试）。原生解析 `gemini-5h`、`gemini-weekly`、`gemini-argon-wtu-weekly`、`3p-5h`、`3p-weekly` 五个官方额度桶与精确重置时间；未安装 CLI 时零报错回退至增量本地预算或手动快照。
+  - **真实掉线与额度失联主动提醒（不强弹浏览器）**：通过 `--log-file` 区分“偶发代理抖动”与“真实授权失效（`invalid_grant` / 凭据缺失）”或“连续多轮额度查询失败（`quota_unreachable`）”。一旦确认真实掉线或连续查不到额度，立即淘汰过期旧快照，通过后台 Sidecar 发送单次去重的 Windows 托盘气泡告警并在对话上下文注入 `[AGY 账号与额度告警]` 提示用户在 CC Switch 重新授权/切号，或手动运行 `pwsh -NoProfile -File scripts/Mode.ps1 agy-login` 显式完成一次浏览器登录。
   - **5 小时滚动限制守卫**：结合官方 `gemini-5h` 桶与本地近 5 小时 429 限流检测（严格排除 401/403 认证错误及 `HTTP 503 No capacity available` 服务端瞬时容量抖动）。进入警戒区（默认 `75%`）时限速为混合均衡；达到保护线（默认 `88%`）、近期出现 429、标记 `agy_quota_hint=low` 或手动冷却且 Codex 仍有余量时，**`PreToolUse` 硬拦截 AGY 执行子代理/写操作（`[AGY_QUOTA_PROTECTED]`）并立刻交由 Codex 兜底**。
   - **7 天 90% 上限与最后 6 小时自动解锁 10% 缓冲**：默认 `target_utilization = 90`、`weekly_protect_used_percent = 90`、`buffer_unlock_window_hours = 6`（可通过 `Mode.ps1 agy-budget --target 90 --weekly-protect 90 --unlock-hours 6` 调整）。距周重置 $> 6\text{h}$ 时严格保留 10% 主窗口救命缓冲，触及 90% 即硬停 AGY 执行交由 Codex 接管；**当距周重置剩余 $\le 6\text{h}$ 时，自动解锁剩余 10% 缓冲升至 100% 上限并切入 `agy_drain` 清仓消耗**，避免重置前浪费剩余额度。
 - **单边 100% 硬归零跨端交接与双端受限分级兜底**：
@@ -319,6 +320,7 @@ Antigravity 切换回读：两个 MCP 入口均引用当前 main 所在的同一
 
 ```pwsh
 pwsh -NoProfile -File scripts/Mode.ps1 status --refresh
+pwsh -NoProfile -File scripts/Mode.ps1 agy-login
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode auto
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode agy --project 'C:/work/my-project'
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode codex --project 'C:/work/my-project'
