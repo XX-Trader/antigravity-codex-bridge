@@ -1267,6 +1267,33 @@ function cleanOfficialAgyEnv(baseEnv = process.env) {
   // (which flashes a visible ConsoleWindowClass window on Windows when launched from consoleless GUI/Sidecar processes!).
   if (env.AGY_CLI_DISABLE_AUTO_UPDATE === undefined) env.AGY_CLI_DISABLE_AUTO_UPDATE = 'true';
   if (env.AGY_CLI_NONINTERACTIVE_HEADLESS === undefined) env.AGY_CLI_NONINTERACTIVE_HEADLESS = 'true';
+  if (env.AGY_CLI_INTERACTIVE_HEADLESS === undefined) env.AGY_CLI_INTERACTIVE_HEADLESS = 'true';
+  return env;
+}
+
+function killChildTree(child) {
+  if (!child) return;
+  if (process.platform === 'win32' && child.pid) {
+    try {
+      spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', timeout: 4000 });
+    } catch {}
+  }
+  try { child.kill(); } catch {}
+}
+
+function withNoBrowserEnv(baseEnv, noBrowserBinDir, markerPath) {
+  const env = cleanOfficialAgyEnv(baseEnv);
+  if (noBrowserBinDir) {
+    const pathKey = Object.keys(env).find(k => k.toUpperCase() === 'PATH') || 'PATH';
+    const existingPath = env[pathKey] || '';
+    env[pathKey] = existingPath ? `${noBrowserBinDir}${path.delimiter}${existingPath}` : noBrowserBinDir;
+  }
+  if (markerPath) {
+    env.AGY_BROWSER_INTERCEPT_MARKER = markerPath;
+  }
+  if (process.platform !== 'win32' && env.BROWSER === undefined) {
+    env.BROWSER = 'false';
+  }
   return env;
 }
 
@@ -1387,28 +1414,67 @@ function runExternalAgyProbe(command, options = {}) {
 function runExternalAgyProbeAsync(command, options = {}) {
   if (!Array.isArray(command) || !command.length) return Promise.resolve(null);
   const timeout = options.timeoutMs ?? 15000;
+  const interceptGraceMs = options.interceptGraceMs ?? 5000;
+  const markerPath = options.interceptMarkerPath || null;
+  if (markerPath) { try { fs.unlinkSync(markerPath); } catch {} }
+
   return new Promise(resolve => {
-    let stdout = '', stderr = '', settled = false;
-    const finish = result => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); };
+    let stdout = '', stderr = '', settled = false, interceptAbortTimer = null;
+    const cleanupMarker = () => { if (markerPath) { try { fs.unlinkSync(markerPath); } catch {} } };
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(interceptPoll);
+      if (interceptAbortTimer) clearTimeout(interceptAbortTimer);
+      cleanupMarker();
+      resolve(result);
+    };
     let child;
     try {
       child = spawn(command[0], command.slice(1), {
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: cleanOfficialAgyEnv(options.env || process.env)
+        env: withNoBrowserEnv(options.env || process.env, options.noBrowserBinDir, markerPath)
       });
     } catch (error) {
       finish({ available: false, error: error.message });
       return;
     }
     const timer = setTimeout(() => {
-      try { child.kill(); } catch {}
+      killChildTree(child);
       finish({ available: false, error: `AGY quota probe timed out after ${timeout}ms` });
     }, timeout);
+    // When `agy.exe`'s 10s `keyringAuth` check times out on an expired hourly access_token,
+    // `printmode.go` triggers interactive OAuth via `rundll32 url.dll,FileProtocolHandler`.
+    // Our `no-browser-bin/rundll32.cmd` blocks the browser popup and writes `markerPath`;
+    // wait `interceptGraceMs` so `keyringAuth`'s in-flight token refresh can finish saving to keyring, then terminate cleanly.
+    const interceptPoll = markerPath ? setInterval(() => {
+      if (interceptAbortTimer || !fs.existsSync(markerPath)) return;
+      interceptAbortTimer = setTimeout(() => {
+        killChildTree(child);
+        finish({
+          available: false,
+          oauth_browser_suppressed: true,
+          error: 'AGY silent OAuth refresh exceeded 10s; interactive browser sign-in popup was suppressed'
+        });
+      }, interceptGraceMs);
+      interceptAbortTimer.unref?.();
+    }, 300) : null;
+    interceptPoll?.unref?.();
+
     child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(-262144); });
     child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-4096); });
     child.once('error', error => finish({ available: false, error: error.message }));
     child.once('close', code => {
+      if (markerPath && fs.existsSync(markerPath) && code !== 0) {
+        finish({
+          available: false,
+          oauth_browser_suppressed: true,
+          error: 'AGY silent OAuth refresh failed; interactive browser sign-in popup was suppressed'
+        });
+        return;
+      }
       if (code !== 0) {
         finish({ available: false, error: (stderr || stdout || `exit ${code}`).trim().slice(0, 400) });
         return;
@@ -1432,17 +1498,47 @@ function defaultAgyProbeHome() {
 }
 
 function prepareSilentAgyProbeHome(probeHome, nowMs = Date.now()) {
-  if (!probeHome) return;
+  if (!probeHome) return { noBrowserBinDir: null };
+  let noBrowserBinDir = null;
   try {
     const cliDir = path.join(probeHome, 'antigravity-cli');
     fs.mkdirSync(cliDir, { recursive: true });
-    // Belt-and-suspenders guard alongside AGY_CLI_DISABLE_AUTO_UPDATE="true":
-    // keep `last_check.timestamp` fresh so `auto_updater.go` never spawns a detached updater process.
+    // 1. Keep `last_check.timestamp` fresh so `auto_updater.go` never spawns a detached updater console window.
     const tsFile = path.join(cliDir, 'last_check.timestamp');
     const nowDate = new Date(nowMs);
     if (!fs.existsSync(tsFile)) fs.writeFileSync(tsFile, '', 'utf8');
     else fs.utimesSync(tsFile, nowDate, nowDate);
+
+    // 2. Install private PATH shim to block `agy.exe` (`printmode.go:433` -> `rundll32 url.dll,FileProtocolHandler`)
+    //    from ever opening the user's web browser when hourly token refresh takes >10s!
+    noBrowserBinDir = path.join(probeHome, 'no-browser-bin');
+    fs.mkdirSync(noBrowserBinDir, { recursive: true });
+    if (process.platform === 'win32') {
+      const shimPath = path.join(noBrowserBinDir, 'rundll32.cmd');
+      const shimBody = [
+        '@echo off',
+        'echo.%* | findstr /I "FileProtocolHandler" >nul',
+        'if %ERRORLEVEL% EQU 0 (',
+        '  if defined AGY_BROWSER_INTERCEPT_MARKER echo INTERCEPTED>"%AGY_BROWSER_INTERCEPT_MARKER%"',
+        '  exit /b 1',
+        ')',
+        '"%SystemRoot%\\System32\\rundll32.exe" %*',
+        ''
+      ].join('\r\n');
+      if (!fs.existsSync(shimPath) || fs.readFileSync(shimPath, 'utf8') !== shimBody) {
+        fs.writeFileSync(shimPath, shimBody, 'utf8');
+      }
+    } else {
+      for (const opener of ['xdg-open', 'open']) {
+        const shimPath = path.join(noBrowserBinDir, opener);
+        const shimBody = '#!/bin/sh\n[ -n "$AGY_BROWSER_INTERCEPT_MARKER" ] && echo INTERCEPTED > "$AGY_BROWSER_INTERCEPT_MARKER"\nexit 1\n';
+        if (!fs.existsSync(shimPath)) {
+          fs.writeFileSync(shimPath, shimBody, { encoding: 'utf8', mode: 0o755 });
+        }
+      }
+    }
   } catch {}
+  return { noBrowserBinDir };
 }
 
 async function probeAgyQuotaAsync(projectPolicy, options = {}) {
@@ -1452,11 +1548,22 @@ async function probeAgyQuotaAsync(projectPolicy, options = {}) {
   const agyBin = resolveRealAgyBin(options);
   if (!agyBin) return null;
   const probeHome = options.probeHomeDir || defaultAgyProbeHome();
-  prepareSilentAgyProbeHome(probeHome, options.nowMs);
-  return runExternalAgyProbeAsync(
-    [agyBin, `--gemini_dir=${probeHome}`, '--print', '/usage', '--output-format', 'json'],
-    { timeoutMs: 65000, ...options }
-  );
+  const { noBrowserBinDir } = prepareSilentAgyProbeHome(probeHome, options.nowMs);
+  const runOnce = attempt => {
+    const marker = path.join(probeHome, `oauth-intercept-${process.pid}-${Date.now()}-${attempt}.flag`);
+    const cmdPrefix = Array.isArray(agyBin) ? agyBin : [agyBin];
+    return runExternalAgyProbeAsync(
+      [...cmdPrefix, `--gemini_dir=${probeHome}`, '--print', '/usage', '--output-format', 'json'],
+      { timeoutMs: 65000, noBrowserBinDir, interceptMarkerPath: marker, ...options }
+    );
+  };
+  const first = await runOnce(1);
+  // If `keyringAuth` exceeded 10s on an expired hourly token, its background refresh goroutine often
+  // finishes writing the refreshed token within the 5s grace window; retry once silently to pick it up!
+  if (first && !first.available && first.oauth_browser_suppressed && options.retryOnSuppressedOAuth !== false) {
+    return runOnce(2);
+  }
+  return first;
 }
 
 const VALID_AGY_EXEC_MODES = new Set(['plan', 'auto', 'accept-edits']);
@@ -1537,7 +1644,9 @@ function runAgyPoolTaskAsync(options = {}) {
   }
 
   const probeHome = options.probeHomeDir || defaultAgyProbeHome();
-  prepareSilentAgyProbeHome(probeHome, nowMs);
+  const { noBrowserBinDir } = prepareSilentAgyProbeHome(probeHome, nowMs);
+  const markerPath = path.join(probeHome, `pool-oauth-intercept-${process.pid}-${Date.now()}.flag`);
+  try { fs.unlinkSync(markerPath); } catch {}
   const cliArgs = [
     `--gemini_dir=${probeHome}`,
     '--model', targetModel,
@@ -1549,10 +1658,19 @@ function runAgyPoolTaskAsync(options = {}) {
     '--output-format', 'json'
   ];
   const timeout = options.timeoutMs ?? 600000;
+  const interceptGraceMs = options.interceptGraceMs ?? 5000;
 
   return new Promise(resolve => {
-    let stdout = '', stderr = '', settled = false;
-    const finish = payload => { if (settled) return; settled = true; clearTimeout(timer); resolve(payload); };
+    let stdout = '', stderr = '', settled = false, interceptAbortTimer = null;
+    const finish = payload => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(interceptPoll);
+      if (interceptAbortTimer) clearTimeout(interceptAbortTimer);
+      try { fs.unlinkSync(markerPath); } catch {}
+      resolve(payload);
+    };
     let child;
     try {
       const cmd = Array.isArray(agyBin) ? agyBin[0] : agyBin;
@@ -1561,16 +1679,32 @@ function runAgyPoolTaskAsync(options = {}) {
         cwd: options.cwd ? path.resolve(options.cwd) : undefined,
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: cleanOfficialAgyEnv(options.env || process.env)
+        env: withNoBrowserEnv(options.env || process.env, noBrowserBinDir, markerPath)
       });
     } catch (error) {
       finish({ ok: false, blocked: false, kind: 'spawn_error', pool: poolKey, model: targetModel, error: error.message });
       return;
     }
     const timer = setTimeout(() => {
-      try { child.kill(); } catch {}
+      killChildTree(child);
       finish({ ok: false, blocked: false, kind: 'timeout', pool: poolKey, model: targetModel, error: `本地 ${poolKey} 模型池调用超时（>${timeout}ms）` });
     }, timeout);
+    const interceptPoll = setInterval(() => {
+      if (interceptAbortTimer || !fs.existsSync(markerPath)) return;
+      interceptAbortTimer = setTimeout(() => {
+        killChildTree(child);
+        finish({
+          ok: false,
+          blocked: false,
+          kind: 'oauth_browser_suppressed',
+          pool: poolKey,
+          model: targetModel,
+          error: '本机 Antigravity OAuth 静默令牌刷新超过 10s，已自动拦截浏览器登录弹窗；请稍后重试一次（后台通常已完成令牌续期）或在 Antigravity IDE 检查登录状态。'
+        });
+      }, interceptGraceMs);
+      interceptAbortTimer.unref?.();
+    }, 300);
+    interceptPoll.unref?.();
     child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(-1048576); });
     child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-16384); });
     child.once('error', error => finish({ ok: false, blocked: false, kind: 'spawn_error', pool: poolKey, model: targetModel, error: error.message }));

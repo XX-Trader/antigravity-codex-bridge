@@ -1392,4 +1392,25 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
   assert.equal(blockedPoolRun.ok, false);
   assert.equal(blockedPoolRun.blocked, true);
   assert.equal(blockedPoolRun.kind, 'pool_quota_protected');
+
+  // (d) Interactive OAuth browser popup suppression: if headless `agy` attempts `rundll32 url.dll,FileProtocolHandler`,
+  //     `no-browser-bin/rundll32.cmd` blocks the browser launch, writes the marker, and aborts cleanly!
+  if (process.platform === 'win32') {
+    const { probeAgyQuotaAsync } = require('../src/routing-policy.cjs');
+    const mockHungOAuthCli = path.join(f.root, 'mock-hung-oauth.cjs');
+    fs.writeFileSync(mockHungOAuthCli, [
+      'const { spawnSync } = require("node:child_process");',
+      'spawnSync("cmd.exe", ["/c", "rundll32", "url.dll,FileProtocolHandler", "https://accounts.google.com/o/oauth2/v2/auth"], { env: process.env, windowsHide: true });',
+      'setTimeout(() => {}, 30000);'
+    ].join('\n'), 'utf8');
+    const suppressed = await probeAgyQuotaAsync(resolveProjectPolicy(defaultPolicy(), { project: f.project }), {
+      agyBin: [process.execPath, mockHungOAuthCli],
+      probeHomeDir: path.join(f.root, 'oauth-probe-home'),
+      interceptGraceMs: 150,
+      retryOnSuppressedOAuth: false,
+      nowMs: now
+    });
+    assert.equal(suppressed.available, false);
+    assert.equal(suppressed.oauth_browser_suppressed, true);
+  }
 });
