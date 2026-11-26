@@ -1411,15 +1411,38 @@ function runExternalAgyProbe(command, options = {}) {
   }
 }
 
+const DEFAULT_AGY_OAUTH_RETRY_DELAYS_MS = [1500, 3000, 5000];
+const TRANSIENT_AGY_PROBE_ERR_RE = /timed out|deadline exceeded|connection reset|econnreset|etimedout|eai_again|socket hang up|\beof\b|\b(?:502|503|504)\b/i;
+
+function sleepMs(ms) {
+  return ms > 0 ? new Promise(resolve => { const t = setTimeout(resolve, ms); t.unref?.(); }) : Promise.resolve();
+}
+
+function resolveAgyRetryPlan(options = {}) {
+  if (options.retryOnSuppressedOAuth === false) return { maxAttempts: 1, delaysMs: [] };
+  const delaysMs = Array.isArray(options.retryDelaysMs) ? options.retryDelaysMs : DEFAULT_AGY_OAUTH_RETRY_DELAYS_MS;
+  const maxAttempts = Number.isInteger(options.maxAttempts) && options.maxAttempts >= 1
+    ? options.maxAttempts
+    : 1 + delaysMs.length;
+  return { maxAttempts, delaysMs };
+}
+
+function isRetryableAgyProbeFailure(result) {
+  if (!result || result.available) return false;
+  if (result.oauth_browser_suppressed) return true;
+  return TRANSIENT_AGY_PROBE_ERR_RE.test(String(result.error || ''));
+}
+
 function runExternalAgyProbeAsync(command, options = {}) {
   if (!Array.isArray(command) || !command.length) return Promise.resolve(null);
   const timeout = options.timeoutMs ?? 15000;
-  const interceptGraceMs = options.interceptGraceMs ?? 5000;
+  const explicitGraceMs = options.interceptGraceMs;
   const markerPath = options.interceptMarkerPath || null;
   if (markerPath) { try { fs.unlinkSync(markerPath); } catch {} }
 
   return new Promise(resolve => {
     let stdout = '', stderr = '', settled = false, interceptAbortTimer = null;
+    const spawnedAtMs = Date.now();
     const cleanupMarker = () => { if (markerPath) { try { fs.unlinkSync(markerPath); } catch {} } };
     const finish = result => {
       if (settled) return;
@@ -1445,12 +1468,14 @@ function runExternalAgyProbeAsync(command, options = {}) {
       killChildTree(child);
       finish({ available: false, error: `AGY quota probe timed out after ${timeout}ms` });
     }, timeout);
-    // When `agy.exe`'s 10s `keyringAuth` check times out on an expired hourly access_token,
-    // `printmode.go` triggers interactive OAuth via `rundll32 url.dll,FileProtocolHandler`.
+    // When Google's closed-source `agy.exe` (`keyring.go:111`) hits its hardcoded 10s timeout refreshing an expired
+    // hourly access_token, `printmode.go:433` calls `rundll32 url.dll,FileProtocolHandler`.
     // Our `no-browser-bin/rundll32.cmd` blocks the browser popup and writes `markerPath`;
-    // wait `interceptGraceMs` so `keyringAuth`'s in-flight token refresh can finish saving to keyring, then terminate cleanly.
+    // wait `graceMs` (6s if 10s refresh is in flight, 600ms if keyring failed immediately) so `keyringAuth` can save the new token.
     const interceptPoll = markerPath ? setInterval(() => {
       if (interceptAbortTimer || !fs.existsSync(markerPath)) return;
+      const elapsedMs = Date.now() - spawnedAtMs;
+      const graceMs = explicitGraceMs ?? (elapsedMs >= 8000 ? 6000 : 600);
       interceptAbortTimer = setTimeout(() => {
         killChildTree(child);
         finish({
@@ -1458,9 +1483,9 @@ function runExternalAgyProbeAsync(command, options = {}) {
           oauth_browser_suppressed: true,
           error: 'AGY silent OAuth refresh exceeded 10s; interactive browser sign-in popup was suppressed'
         });
-      }, interceptGraceMs);
+      }, graceMs);
       interceptAbortTimer.unref?.();
-    }, 300) : null;
+    }, 250) : null;
     interceptPoll?.unref?.();
 
     child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(-262144); });
@@ -1542,8 +1567,16 @@ function prepareSilentAgyProbeHome(probeHome, nowMs = Date.now()) {
 }
 
 async function probeAgyQuotaAsync(projectPolicy, options = {}) {
+  const { maxAttempts, delaysMs } = resolveAgyRetryPlan(options);
   if (Array.isArray(projectPolicy?.agy_quota_command) && projectPolicy.agy_quota_command.length > 0) {
-    return runExternalAgyProbeAsync(projectPolicy.agy_quota_command, options);
+    let last = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (attempt > 1) await sleepMs(delaysMs[Math.min(attempt - 2, delaysMs.length - 1)] ?? 0);
+      last = await runExternalAgyProbeAsync(projectPolicy.agy_quota_command, options);
+      if (last && typeof last === 'object') last = { ...last, attempts: attempt };
+      if (!isRetryableAgyProbeFailure(last)) return last;
+    }
+    return last;
   }
   const agyBin = resolveRealAgyBin(options);
   if (!agyBin) return null;
@@ -1557,40 +1590,43 @@ async function probeAgyQuotaAsync(projectPolicy, options = {}) {
       { timeoutMs: 65000, noBrowserBinDir, interceptMarkerPath: marker, ...options }
     );
   };
-  const first = await runOnce(1);
-  // If `keyringAuth` exceeded 10s on an expired hourly token, its background refresh goroutine often
-  // finishes writing the refreshed token within the 5s grace window; retry once silently to pick it up!
-  if (first && !first.available && first.oauth_browser_suppressed && options.retryOnSuppressedOAuth !== false) {
-    return runOnce(2);
+  let last = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt > 1) await sleepMs(delaysMs[Math.min(attempt - 2, delaysMs.length - 1)] ?? 0);
+    last = await runOnce(attempt);
+    if (last && typeof last === 'object') last = { ...last, attempts: attempt };
+    // Retry up to maxAttempts on slow >10s OAuth refreshes (whose background goroutine writes the new token to keyring)
+    // as well as transient proxy/TLS timeouts!
+    if (!isRetryableAgyProbeFailure(last)) return last;
   }
-  return first;
+  return last;
 }
 
 const VALID_AGY_EXEC_MODES = new Set(['plan', 'auto', 'accept-edits']);
 
-function runAgyPoolTaskAsync(options = {}) {
+async function runAgyPoolTaskAsync(options = {}) {
   const nowMs = options.nowMs ?? Date.now();
   const projectPolicy = options.projectPolicy || resolveProjectPolicy(defaultPolicy());
   const poolsCfg = projectPolicy.agy_model_pools || {};
   const poolKey = String(options.poolName || '').trim().toLowerCase();
   if (!poolKey || !poolsCfg[poolKey]) {
     const known = Object.keys(poolsCfg);
-    return Promise.resolve({
+    return {
       ok: false,
       blocked: false,
       kind: 'unknown_pool',
       error: `未找到独立模型池 "${poolKey || ''}"${known.length ? `（已配置池：${known.join(', ')}）` : '（尚未在 routing-policy.json 配置 agy_model_pools）'}。`
-    });
+    };
   }
   const poolCfg = poolsCfg[poolKey];
   const execMode = String(options.execMode || 'plan').trim().toLowerCase();
   if (!VALID_AGY_EXEC_MODES.has(execMode)) {
-    return Promise.resolve({
+    return {
       ok: false,
       blocked: false,
       kind: 'invalid_exec_mode',
       error: `不支持的 --exec-mode "${options.execMode}"；仅支持 plan（默认只读审查）、auto 或 accept-edits。`
-    });
+    };
   }
 
   const poolsState = evaluateAgyModelPools({
@@ -1604,14 +1640,14 @@ function runAgyPoolTaskAsync(options = {}) {
   if (poolState?.stopped && options.force !== true) {
     const backups = Array.isArray(projectPolicy.thinking_backups) ? projectPolicy.thinking_backups : [];
     const safeBackups = backups.filter(m => !String(m).toLowerCase().includes(poolState.match));
-    return Promise.resolve({
+    return {
       ok: false,
       blocked: true,
       kind: 'pool_quota_protected',
       pool: poolKey,
       pool_state: poolState,
       error: `[POOL_QUOTA_PROTECTED] 本地 ${poolKey} 模型池已触及保护线（原因：${poolState.reason || 'stopped'}，7天已用 ${poolState.weekly_used_percent ?? '?'}% / 上限 ${poolState.weekly_protect_used_percent}%，5h已用 ${poolState.five_hour_used_percent ?? '?'}%），已停止调用以保留应急缓冲${safeBackups.length ? `；请改用备用模型：${safeBackups.join(' → ')}` : ''}。`
-    });
+    };
   }
 
   const explicitModel = typeof options.model === 'string' && options.model.trim() ? options.model.trim() : null;
@@ -1619,34 +1655,32 @@ function runAgyPoolTaskAsync(options = {}) {
     ? (poolCfg.review_model || poolCfg.default_model)
     : (poolCfg.default_model || poolCfg.review_model));
   if (!targetModel) {
-    return Promise.resolve({
+    return {
       ok: false,
       blocked: false,
       kind: 'missing_pool_model',
       pool: poolKey,
       error: `模型池 "${poolKey}" 尚未登记默认模型 ID；请运行 scripts/Mode.ps1 pool --name ${poolKey} --review-model <MODEL_ID> --default-model <MODEL_ID>（可通过 agy models 查看本机官方模型 ID）。`
-    });
+    };
   }
 
   const promptText = typeof options.prompt === 'string' ? options.prompt.trim() : '';
   if (!promptText) {
-    return Promise.resolve({ ok: false, blocked: false, kind: 'empty_prompt', error: '缺少审查/执行提示词（--prompt 或 --prompt-file）。' });
+    return { ok: false, blocked: false, kind: 'empty_prompt', error: '缺少审查/执行提示词（--prompt 或 --prompt-file）。' };
   }
 
   const agyBin = resolveRealAgyBin(options);
   if (!agyBin) {
-    return Promise.resolve({
+    return {
       ok: false,
       blocked: false,
       kind: 'agy_cli_missing',
       error: '未找到本机官方 agy CLI 可执行文件（%LOCALAPPDATA%\\agy\\bin\\agy.exe），无法后台直调本地模型池；可在 Antigravity 聊天窗左上角手动切换至对应本地模型。'
-    });
+    };
   }
 
   const probeHome = options.probeHomeDir || defaultAgyProbeHome();
   const { noBrowserBinDir } = prepareSilentAgyProbeHome(probeHome, nowMs);
-  const markerPath = path.join(probeHome, `pool-oauth-intercept-${process.pid}-${Date.now()}.flag`);
-  try { fs.unlinkSync(markerPath); } catch {}
   const cliArgs = [
     `--gemini_dir=${probeHome}`,
     '--model', targetModel,
@@ -1658,10 +1692,14 @@ function runAgyPoolTaskAsync(options = {}) {
     '--output-format', 'json'
   ];
   const timeout = options.timeoutMs ?? 600000;
-  const interceptGraceMs = options.interceptGraceMs ?? 5000;
+  const explicitGraceMs = options.interceptGraceMs;
+  const { maxAttempts, delaysMs } = resolveAgyRetryPlan(options);
 
-  return new Promise(resolve => {
+  const runPoolOnce = attempt => new Promise(resolve => {
+    const markerPath = path.join(probeHome, `pool-oauth-intercept-${process.pid}-${Date.now()}-${attempt}.flag`);
+    try { fs.unlinkSync(markerPath); } catch {}
     let stdout = '', stderr = '', settled = false, interceptAbortTimer = null;
+    const spawnedAtMs = Date.now();
     const finish = payload => {
       if (settled) return;
       settled = true;
@@ -1669,7 +1707,7 @@ function runAgyPoolTaskAsync(options = {}) {
       clearInterval(interceptPoll);
       if (interceptAbortTimer) clearTimeout(interceptAbortTimer);
       try { fs.unlinkSync(markerPath); } catch {}
-      resolve(payload);
+      resolve({ ...payload, attempts: attempt });
     };
     let child;
     try {
@@ -1691,6 +1729,8 @@ function runAgyPoolTaskAsync(options = {}) {
     }, timeout);
     const interceptPoll = setInterval(() => {
       if (interceptAbortTimer || !fs.existsSync(markerPath)) return;
+      const elapsedMs = Date.now() - spawnedAtMs;
+      const graceMs = explicitGraceMs ?? (elapsedMs >= 8000 ? 6000 : 600);
       interceptAbortTimer = setTimeout(() => {
         killChildTree(child);
         finish({
@@ -1699,16 +1739,27 @@ function runAgyPoolTaskAsync(options = {}) {
           kind: 'oauth_browser_suppressed',
           pool: poolKey,
           model: targetModel,
-          error: '本机 Antigravity OAuth 静默令牌刷新超过 10s，已自动拦截浏览器登录弹窗；请稍后重试一次（后台通常已完成令牌续期）或在 Antigravity IDE 检查登录状态。'
+          error: `本机 Antigravity OAuth 静默令牌刷新连续 ${attempt} 次超过 10s，已自动拦截浏览器登录弹窗；请检查网络代理或在 Antigravity CLI 核查登录状态。`
         });
-      }, interceptGraceMs);
+      }, graceMs);
       interceptAbortTimer.unref?.();
-    }, 300);
+    }, 250);
     interceptPoll.unref?.();
     child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(-1048576); });
     child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-16384); });
     child.once('error', error => finish({ ok: false, blocked: false, kind: 'spawn_error', pool: poolKey, model: targetModel, error: error.message }));
     child.once('close', code => {
+      if (markerPath && fs.existsSync(markerPath) && code !== 0) {
+        finish({
+          ok: false,
+          blocked: false,
+          kind: 'oauth_browser_suppressed',
+          pool: poolKey,
+          model: targetModel,
+          error: `本机 Antigravity OAuth 静默令牌刷新失败（第 ${attempt} 次尝试），已自动拦截浏览器登录弹窗。`
+        });
+        return;
+      }
       if (code !== 0) {
         finish({ ok: false, blocked: false, kind: 'cli_exit_nonzero', pool: poolKey, model: targetModel, exit_code: code, error: (stderr || stdout || `exit ${code}`).trim().slice(0, 800) });
         return;
@@ -1737,6 +1788,16 @@ function runAgyPoolTaskAsync(options = {}) {
       }
     });
   });
+
+  // `oauth_browser_suppressed` occurs in `printmode.go:410->433` BEFORE any prompt/model turn starts,
+  // so multi-attempt stepped-backoff retries are 100% side-effect-free!
+  let last = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt > 1) await sleepMs(delaysMs[Math.min(attempt - 2, delaysMs.length - 1)] ?? 0);
+    last = await runPoolOnce(attempt);
+    if (last.ok || last.kind !== 'oauth_browser_suppressed') return last;
+  }
+  return last;
 }
 
 function activeCodexTasks(projectScope) {

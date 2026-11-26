@@ -1393,8 +1393,10 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
   assert.equal(blockedPoolRun.blocked, true);
   assert.equal(blockedPoolRun.kind, 'pool_quota_protected');
 
-  // (d) Interactive OAuth browser popup suppression: if headless `agy` attempts `rundll32 url.dll,FileProtocolHandler`,
-  //     `no-browser-bin/rundll32.cmd` blocks the browser launch, writes the marker, and aborts cleanly!
+  // (d) Interactive OAuth browser popup suppression + multi-attempt stepped-backoff retry:
+  //     1) When retries are disabled, `no-browser-bin/rundll32.cmd` blocks the browser launch and aborts cleanly.
+  //     2) Across both `probeAgyQuotaAsync` and `runAgyPoolTaskAsync`, slow OAuth refreshes / transient blips retry multiple times
+  //        with stepped backoff until the refreshed token lands in keyring!
   if (process.platform === 'win32') {
     const { probeAgyQuotaAsync } = require('../src/routing-policy.cjs');
     const mockHungOAuthCli = path.join(f.root, 'mock-hung-oauth.cjs');
@@ -1406,11 +1408,58 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
     const suppressed = await probeAgyQuotaAsync(resolveProjectPolicy(defaultPolicy(), { project: f.project }), {
       agyBin: [process.execPath, mockHungOAuthCli],
       probeHomeDir: path.join(f.root, 'oauth-probe-home'),
-      interceptGraceMs: 150,
+      interceptGraceMs: 80,
       retryOnSuppressedOAuth: false,
       nowMs: now
     });
     assert.equal(suppressed.available, false);
     assert.equal(suppressed.oauth_browser_suppressed, true);
+    assert.equal(suppressed.attempts, 1);
+
+    // Simulate 2 consecutive slow OAuth refresh timeouts (attempts 1 & 2 hit rundll32), succeeding on attempt 3!
+    const counterFile = path.join(f.root, 'oauth-retry-counter.txt');
+    const mockFlakyOAuthCli = path.join(f.root, 'mock-flaky-oauth.cjs');
+    fs.writeFileSync(mockFlakyOAuthCli, [
+      'const fs = require("node:fs");',
+      'const { spawnSync } = require("node:child_process");',
+      `const cFile = ${JSON.stringify(counterFile)};`,
+      'const n = (fs.existsSync(cFile) ? Number(fs.readFileSync(cFile, "utf8")) : 0) + 1;',
+      'fs.writeFileSync(cFile, String(n), "utf8");',
+      'if (n < 3) {',
+      '  spawnSync("cmd.exe", ["/c", "rundll32", "url.dll,FileProtocolHandler", "https://accounts.google.com/o/oauth2/v2/auth"], { env: process.env, windowsHide: true });',
+      '  setTimeout(() => {}, 30000);',
+      '} else if (process.argv.includes("/usage")) {',
+      `  console.log(JSON.stringify({ status: "SUCCESS", command: { data: { groups: [{ buckets: [{ id: "gemini-weekly", remaining_fraction: 0.9, reset_time: ${JSON.stringify(relIso(now, 72 * HOUR_MS))} }, { id: "gemini-5h", remaining_fraction: 0.85, reset_time: ${JSON.stringify(relIso(now, 3 * HOUR_MS))} }] }] } } }));`,
+      '} else {',
+      '  console.log(JSON.stringify({ conversation_id: "11111111-2222-3333-4444-555555555555", status: "SUCCESS", response: "RECOVERED_ON_ATTEMPT_" + n, duration_seconds: 0.8, num_turns: 1 }));',
+      '}'
+    ].join('\n'), 'utf8');
+
+    const recoveredQuota = await probeAgyQuotaAsync(resolveProjectPolicy(defaultPolicy(), { project: f.project }), {
+      agyBin: [process.execPath, mockFlakyOAuthCli],
+      probeHomeDir: path.join(f.root, 'oauth-probe-home'),
+      interceptGraceMs: 60,
+      retryDelaysMs: [10, 20, 30],
+      nowMs: now
+    });
+    assert.equal(recoveredQuota.available, true);
+    assert.equal(recoveredQuota.attempts, 3, 'probeAgyQuotaAsync must retry past attempt 2 and succeed on attempt 3');
+    assert.equal(recoveredQuota.weekly_used_percent, 10);
+
+    fs.unlinkSync(counterFile);
+    const recoveredPoolRun = await runAgyPoolTaskAsync({
+      poolName: 'thirdparty',
+      cwd: f.project,
+      prompt: 'verify multi-retry recovery',
+      projectPolicy: loadedWithPool,
+      agyBin: [process.execPath, mockFlakyOAuthCli],
+      probeHomeDir: path.join(f.root, 'oauth-probe-home'),
+      interceptGraceMs: 60,
+      retryDelaysMs: [10, 20, 30],
+      nowMs: now
+    });
+    assert.equal(recoveredPoolRun.ok, true);
+    assert.equal(recoveredPoolRun.attempts, 3, 'runAgyPoolTaskAsync must automatically retry OAuth refresh timeouts without failing on attempt 1');
+    assert.equal(recoveredPoolRun.response, 'RECOVERED_ON_ATTEMPT_3');
   }
 });
