@@ -721,7 +721,7 @@ test('official agy /usage 5-bucket JSON parser, incremental transcript index, cr
             ]
           },
           {
-            name: 'Claude and GPT models',
+            name: 'Third-Party Models',
             buckets: [
               { id: '3p-weekly', window: 'weekly', remaining_fraction: 0.08, reset_time: reset7d },
               { id: '3p-5h', window: '5h', remaining_fraction: 0.5, reset_time: reset5h }
@@ -1119,7 +1119,7 @@ test('6h automatic buffer unlock, 100% exhaustion cross-engine handover, strict 
   assert.match(dualDeadAgy.reason, /\[DUAL_QUOTA_EXHAUSTED\]/);
 });
 
-test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset isolation, and cycle-reset / account-switch 100%->0% recovery', t => {
+test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset isolation, and cycle-reset / account-switch 100%->0% recovery', async t => {
   const f = fixture(t);
   const {
     parseAgyProbePayload,
@@ -1290,4 +1290,103 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
   });
   assert.equal(refreshedSnap.codexPacing.used_percent, 0, 'Newer 0% rollout after account switch or reset must override stale 100% cache');
   assert.equal(refreshedSnap.codexPacing.exhausted, false);
+
+  // 5. Local independent model pool direct invocation (`pool-run`), quota-stop protection, subagent `inherit` preservation, and external CLI misuse block:
+  const mockPoolCli = path.join(f.root, 'mock-pool-agy.cjs');
+  fs.writeFileSync(mockPoolCli, [
+    'const args = process.argv.slice(2);',
+    'const mIdx = args.indexOf("--model");',
+    'const modeIdx = args.indexOf("--mode");',
+    'const pIdx = args.indexOf("--print");',
+    'console.log(JSON.stringify({',
+    '  conversation_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",',
+    '  status: "SUCCESS",',
+    '  response: `LOCAL_POOL_REVIEW_OK:${args[mIdx + 1]}:${args[modeIdx + 1]}:${args[pIdx + 1]}`,',
+    '  duration_seconds: 1.2,',
+    '  num_turns: 1,',
+    '  usage: { input_tokens: 1000, output_tokens: 50, cache_read_tokens: 800, total_tokens: 1050 }',
+    '}));'
+  ].join('\n'), 'utf8');
+
+  await runModeCli([
+    'pool', '--name', 'thirdparty', '--match', 'thirdparty',
+    '--review-model', 'thirdparty-opus-high', '--default-model', 'thirdparty-sonnet-high',
+    '--weekly-protect', '90', '--5h-protect', '88',
+    '--weekly-used', '12', '--weekly-reset', relIso(now, 96 * HOUR_MS),
+    '--5h-used', '15', '--5h-reset', relIso(now, 4 * HOUR_MS),
+    '--policy', f.policyPath
+  ]);
+
+  // (a) Misguided attempt to invoke external `<token>_mcp_server.py` or `<token> -p` is blocked by PreToolUse with exact local `pool-run` command!
+  const blockedExtScript = bindOrigin(
+    { conversationId: '88888888-8888-8888-8888-888888888888', workspacePaths: [f.project], toolCall: { name: 'run_command', args: { CommandLine: 'python thirdparty_mcp_server.py --invoke-once' } } },
+    [{ project: f.project, data: f.data }],
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(blockedExtScript.decision, 'deny');
+  assert.match(blockedExtScript.reason, /\[LOCAL_POOL_AVAILABLE\]/);
+  assert.match(blockedExtScript.reason, /pool-run --pool thirdparty/);
+
+  const blockedExtCli = bindOrigin(
+    { conversationId: '88888888-8888-8888-8888-888888888888', workspacePaths: [f.project], toolCall: { name: 'run_command', args: { CommandLine: 'thirdparty -p "review this"' } } },
+    [{ project: f.project, data: f.data }],
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(blockedExtCli.decision, 'deny');
+  assert.match(blockedExtCli.reason, /thirdparty-opus-high/);
+
+  // Legitimate `Mode.ps1 pool-run` command is allowed through PreToolUse!
+  const allowedPoolRunCmd = bindOrigin(
+    { conversationId: '88888888-8888-8888-8888-888888888888', workspacePaths: [f.project], toolCall: { name: 'run_command', args: { CommandLine: 'pwsh -NoProfile -File scripts/Mode.ps1 pool-run --pool thirdparty --prompt "review"' } } },
+    [{ project: f.project, data: f.data }],
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(allowedPoolRunCmd.decision, 'allow');
+
+  // (b) When host window is ALREADY on the thirdparty pool model, `invoke_subagent` naming that pool keeps `Model="inherit"` instead of downgrading to `flash_lite`!
+  const preservedInherit = bindOrigin(
+    {
+      conversationId: '88888888-8888-8888-8888-888888888888',
+      modelName: 'thirdparty-opus-high',
+      workspacePaths: [f.project],
+      toolCall: { name: 'invoke_subagent', args: { TypeName: 'research', Model: 'inherit', Role: 'thirdparty 架构审查', Prompt: '请用 thirdparty 审核方案' } }
+    },
+    [{ project: f.project, data: f.data }],
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(preservedInherit.decision, 'allow');
+  assert.equal(preservedInherit.overwrite, undefined, 'Must preserve Model=inherit when host is already on the requested pool');
+
+  // (c) `runAgyPoolTaskAsync` executes against local pool in `plan` mode when healthy, and blocks when pool hits 90% cap!
+  const { runAgyPoolTaskAsync } = require('../src/routing-policy.cjs');
+  const loadedWithPool = resolveProjectPolicy(loadRoutingPolicy(f.policyPath), { project: f.project });
+  const okPoolRun = await runAgyPoolTaskAsync({
+    poolName: 'thirdparty',
+    cwd: f.project,
+    prompt: 'check edge cases',
+    projectPolicy: loadedWithPool,
+    agyBin: [process.execPath, mockPoolCli],
+    probeHomeDir: path.join(f.root, 'probe-home'),
+    nowMs: now
+  });
+  assert.equal(okPoolRun.ok, true);
+  assert.equal(okPoolRun.model, 'thirdparty-opus-high');
+  assert.match(okPoolRun.response, /LOCAL_POOL_REVIEW_OK:thirdparty-opus-high:plan:check edge cases/);
+
+  await runModeCli([
+    'pool', '--name', 'thirdparty', '--weekly-used', '92', '--weekly-reset', relIso(now, 48 * HOUR_MS), '--policy', f.policyPath
+  ]);
+  const stoppedPolicy = resolveProjectPolicy(loadRoutingPolicy(f.policyPath), { project: f.project });
+  const blockedPoolRun = await runAgyPoolTaskAsync({
+    poolName: 'thirdparty',
+    cwd: f.project,
+    prompt: 'should be blocked by 90% buffer cap',
+    projectPolicy: stoppedPolicy,
+    agyBin: [process.execPath, mockPoolCli],
+    probeHomeDir: path.join(f.root, 'probe-home'),
+    nowMs: now
+  });
+  assert.equal(blockedPoolRun.ok, false);
+  assert.equal(blockedPoolRun.blocked, true);
+  assert.equal(blockedPoolRun.kind, 'pool_quota_protected');
 });

@@ -299,6 +299,8 @@ function parsePolicy(raw) {
         window_7d_tokens: typeof cfg.window_7d_tokens === 'number' && Number.isFinite(cfg.window_7d_tokens) && cfg.window_7d_tokens > 0 ? Math.floor(cfg.window_7d_tokens) : null,
         bucket_5h: typeof cfg.bucket_5h === 'string' && cfg.bucket_5h.trim() ? cfg.bucket_5h.trim().slice(0, 80) : null,
         bucket_7d: typeof cfg.bucket_7d === 'string' && cfg.bucket_7d.trim() ? cfg.bucket_7d.trim().slice(0, 80) : null,
+        default_model: typeof cfg.default_model === 'string' && cfg.default_model.trim() ? cfg.default_model.trim().slice(0, 120) : null,
+        review_model: typeof cfg.review_model === 'string' && cfg.review_model.trim() ? cfg.review_model.trim().slice(0, 120) : null,
         manual_snapshot: parseManualAgySnapshot(cfg.manual_snapshot),
         cooldown: parseCooldown(cfg.cooldown)
       };
@@ -914,6 +916,8 @@ function evaluateAgyModelPools({ agyUsage, agyExternal, projectPolicy, codexPaci
     result[name] = {
       match: token,
       source,
+      default_model: cfg.default_model || null,
+      review_model: cfg.review_model || cfg.default_model || null,
       window_active: windowActive,
       weekly_protect_used_percent: effectiveProtect,
       configured_protect_used_percent: cfg.weekly_protect_used_percent,
@@ -1437,6 +1441,152 @@ async function probeAgyQuotaAsync(projectPolicy, options = {}) {
   );
 }
 
+const VALID_AGY_EXEC_MODES = new Set(['plan', 'auto', 'accept-edits']);
+
+function runAgyPoolTaskAsync(options = {}) {
+  const nowMs = options.nowMs ?? Date.now();
+  const projectPolicy = options.projectPolicy || resolveProjectPolicy(defaultPolicy());
+  const poolsCfg = projectPolicy.agy_model_pools || {};
+  const poolKey = String(options.poolName || '').trim().toLowerCase();
+  if (!poolKey || !poolsCfg[poolKey]) {
+    const known = Object.keys(poolsCfg);
+    return Promise.resolve({
+      ok: false,
+      blocked: false,
+      kind: 'unknown_pool',
+      error: `未找到独立模型池 "${poolKey || ''}"${known.length ? `（已配置池：${known.join(', ')}）` : '（尚未在 routing-policy.json 配置 agy_model_pools）'}。`
+    });
+  }
+  const poolCfg = poolsCfg[poolKey];
+  const execMode = String(options.execMode || 'plan').trim().toLowerCase();
+  if (!VALID_AGY_EXEC_MODES.has(execMode)) {
+    return Promise.resolve({
+      ok: false,
+      blocked: false,
+      kind: 'invalid_exec_mode',
+      error: `不支持的 --exec-mode "${options.execMode}"；仅支持 plan（默认只读审查）、auto 或 accept-edits。`
+    });
+  }
+
+  const poolsState = evaluateAgyModelPools({
+    agyUsage: options.agyUsage || { available: false },
+    agyExternal: options.agyExternal || null,
+    projectPolicy,
+    codexPacing: options.codexPacing || { available: false },
+    nowMs
+  });
+  const poolState = poolsState[poolKey];
+  if (poolState?.stopped && options.force !== true) {
+    const backups = Array.isArray(projectPolicy.thinking_backups) ? projectPolicy.thinking_backups : [];
+    const safeBackups = backups.filter(m => !String(m).toLowerCase().includes(poolState.match));
+    return Promise.resolve({
+      ok: false,
+      blocked: true,
+      kind: 'pool_quota_protected',
+      pool: poolKey,
+      pool_state: poolState,
+      error: `[POOL_QUOTA_PROTECTED] 本地 ${poolKey} 模型池已触及保护线（原因：${poolState.reason || 'stopped'}，7天已用 ${poolState.weekly_used_percent ?? '?'}% / 上限 ${poolState.weekly_protect_used_percent}%，5h已用 ${poolState.five_hour_used_percent ?? '?'}%），已停止调用以保留应急缓冲${safeBackups.length ? `；请改用备用模型：${safeBackups.join(' → ')}` : ''}。`
+    });
+  }
+
+  const explicitModel = typeof options.model === 'string' && options.model.trim() ? options.model.trim() : null;
+  const targetModel = explicitModel || (execMode === 'plan'
+    ? (poolCfg.review_model || poolCfg.default_model)
+    : (poolCfg.default_model || poolCfg.review_model));
+  if (!targetModel) {
+    return Promise.resolve({
+      ok: false,
+      blocked: false,
+      kind: 'missing_pool_model',
+      pool: poolKey,
+      error: `模型池 "${poolKey}" 尚未登记默认模型 ID；请运行 scripts/Mode.ps1 pool --name ${poolKey} --review-model <MODEL_ID> --default-model <MODEL_ID>（可通过 agy models 查看本机官方模型 ID）。`
+    });
+  }
+
+  const promptText = typeof options.prompt === 'string' ? options.prompt.trim() : '';
+  if (!promptText) {
+    return Promise.resolve({ ok: false, blocked: false, kind: 'empty_prompt', error: '缺少审查/执行提示词（--prompt 或 --prompt-file）。' });
+  }
+
+  const agyBin = resolveRealAgyBin(options);
+  if (!agyBin) {
+    return Promise.resolve({
+      ok: false,
+      blocked: false,
+      kind: 'agy_cli_missing',
+      error: '未找到本机官方 agy CLI 可执行文件（%LOCALAPPDATA%\\agy\\bin\\agy.exe），无法后台直调本地模型池；可在 Antigravity 聊天窗左上角手动切换至对应本地模型。'
+    });
+  }
+
+  const probeHome = options.probeHomeDir || defaultAgyProbeHome();
+  try { fs.mkdirSync(probeHome, { recursive: true }); } catch {}
+  const cliArgs = [
+    `--gemini_dir=${probeHome}`,
+    '--model', targetModel,
+    '--mode', execMode,
+    '--dangerously-skip-permissions',
+    ...(options.cwd ? ['--add-dir', path.resolve(options.cwd)] : []),
+    ...(options.conversationId ? ['--conversation', String(options.conversationId).trim()] : []),
+    '--print', promptText,
+    '--output-format', 'json'
+  ];
+  const timeout = options.timeoutMs ?? 600000;
+
+  return new Promise(resolve => {
+    let stdout = '', stderr = '', settled = false;
+    const finish = payload => { if (settled) return; settled = true; clearTimeout(timer); resolve(payload); };
+    let child;
+    try {
+      const cmd = Array.isArray(agyBin) ? agyBin[0] : agyBin;
+      const fullArgs = Array.isArray(agyBin) ? [...agyBin.slice(1), ...cliArgs] : cliArgs;
+      child = spawn(cmd, fullArgs, {
+        cwd: options.cwd ? path.resolve(options.cwd) : undefined,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: cleanOfficialAgyEnv(options.env || process.env)
+      });
+    } catch (error) {
+      finish({ ok: false, blocked: false, kind: 'spawn_error', pool: poolKey, model: targetModel, error: error.message });
+      return;
+    }
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      finish({ ok: false, blocked: false, kind: 'timeout', pool: poolKey, model: targetModel, error: `本地 ${poolKey} 模型池调用超时（>${timeout}ms）` });
+    }, timeout);
+    child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(-1048576); });
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-16384); });
+    child.once('error', error => finish({ ok: false, blocked: false, kind: 'spawn_error', pool: poolKey, model: targetModel, error: error.message }));
+    child.once('close', code => {
+      if (code !== 0) {
+        finish({ ok: false, blocked: false, kind: 'cli_exit_nonzero', pool: poolKey, model: targetModel, exit_code: code, error: (stderr || stdout || `exit ${code}`).trim().slice(0, 800) });
+        return;
+      }
+      try {
+        const parsed = JSON.parse(stdout.trim());
+        const ok = String(parsed.status || '').toUpperCase() === 'SUCCESS' && !(Array.isArray(parsed.denied_actions) && parsed.denied_actions.length > 0 && !parsed.response);
+        finish({
+          ok,
+          blocked: false,
+          pool: poolKey,
+          model: targetModel,
+          mode: execMode,
+          conversation_id: parsed.conversation_id || null,
+          status: parsed.status || null,
+          response: typeof parsed.response === 'string' ? parsed.response : '',
+          usage: parsed.usage || null,
+          duration_seconds: parsed.duration_seconds ?? null,
+          num_turns: parsed.num_turns ?? null,
+          denied_actions: parsed.denied_actions || null,
+          pool_state: poolState,
+          ...(ok ? {} : { error: (stderr || `status=${parsed.status}`).trim().slice(0, 600) })
+        });
+      } catch (error) {
+        finish({ ok: false, blocked: false, kind: 'parse_error', pool: poolKey, model: targetModel, error: error.message, raw_stdout: stdout.slice(0, 600) });
+      }
+    });
+  });
+}
+
 function activeCodexTasks(projectScope) {
   const dataRoot = typeof projectScope === 'string' ? projectScope : projectScope?.data;
   if (!dataRoot) return { count: 0, orphaned: 0, tasks: [] };
@@ -1804,7 +1954,51 @@ function matchesConfiguredThinkingModel(text, thinkingModel) {
   return text.toLowerCase().includes(thinkingModel.toLowerCase());
 }
 
-function evaluateSubagentCall(args = {}, projectPolicy) {
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function findMatchingModelPool(text, projectPolicy) {
+  if (!text || typeof text !== 'string') return null;
+  const lower = text.toLowerCase();
+  for (const [name, cfg] of Object.entries(projectPolicy?.agy_model_pools || {})) {
+    const token = String(cfg.match || name).toLowerCase();
+    if (token && lower.includes(token)) return { name, token, cfg };
+  }
+  return null;
+}
+
+function checkExternalPoolCliMisuse(toolName, args = {}, projectPolicy, options = {}) {
+  if (!/(?:^|[_/.:-])run_command$/i.test(toolName || '')) return { blocked: false };
+  const cmd = String(args.CommandLine || args.command || '');
+  if (!cmd.trim() || /ALLOW_EXTERNAL_POOL_CLI/i.test(cmd)) return { blocked: false };
+  if (/Mode\.ps1|mode\.cjs/i.test(cmd) && /\bpool(?:-run)?\b/i.test(cmd)) return { blocked: false };
+
+  const pools = Object.entries(projectPolicy?.agy_model_pools || {});
+  if (!pools.length) return { blocked: false };
+  const bridgeRoot = (options.bridgeRoot || path.resolve(__dirname, '..')).replace(/\\/g, '/');
+  const projectRoot = (options.projectRoot || '<PROJECT_DIR>').replace(/\\/g, '/');
+
+  for (const [poolName, cfg] of pools) {
+    const token = String(cfg.match || poolName).trim().toLowerCase();
+    if (!token || token.length < 2) continue;
+    const esc = escapeRegExp(token);
+    const externalWrapperRe = new RegExp(`\\b${esc}_mcp_server(?:\\.py)?\\b|\\b${esc}-code\\b`, 'i');
+    const standaloneCliRe = new RegExp(`(?:^|[;&|()\\s"'\\\\/])${esc}(?:\\.exe|\\.cmd|\\.ps1)?\\s+(?:-p\\b|--print\\b|mcp\\b|--output-format\\b)`, 'i');
+    if (externalWrapperRe.test(cmd) || standaloneCliRe.test(cmd)) {
+      const modelHint = cfg.review_model || cfg.default_model || `<已配置${poolName}模型>`;
+      return {
+        blocked: true,
+        kind: 'local_pool_available',
+        pool: poolName,
+        reason: `[LOCAL_POOL_AVAILABLE] 本机 Antigravity 已内置并配置了本地 "${poolName}" 模型池（默认审查模型：${modelHint}，直接共用当前 Antigravity 登录凭证与独立额度桶，无需外部 API Key），禁止在 Antigravity 中调用外部未登录的 ${token} CLI 或 ${token}_mcp_server 包装脚本！请直接改用受配额保护的本地模型池命令：\npwsh -NoProfile -File "${bridgeRoot}/scripts/Mode.ps1" pool-run --pool ${poolName} --cwd "${projectRoot}" --prompt-file "<UTF8提示词文件>"\n（默认 --exec-mode plan 只读审查，也支持直接传 --prompt "..."；或在聊天窗口左上角手动切换至本地 ${poolName} 模型）。`
+      };
+    }
+  }
+  return { blocked: false };
+}
+
+function evaluateSubagentCall(args = {}, projectPolicy, currentHostModelName = '') {
   const typeName = String(args.TypeName || args.typeName || args.type_name || 'self').trim().toLowerCase();
   const modelKey = Object.hasOwn(args, 'Model') ? 'Model' : Object.hasOwn(args, 'model') ? 'model' : 'Model';
   const currentModel = typeof args[modelKey] === 'string' ? args[modelKey].trim() : '';
@@ -1816,6 +2010,18 @@ function evaluateSubagentCall(args = {}, projectPolicy) {
     return { overwrite: null, note: null };
   }
 
+  const hostPool = findMatchingModelPool(currentHostModelName, projectPolicy);
+  const promptPool = findMatchingModelPool(roleAndPrompt, projectPolicy);
+  if (hostPool && promptPool && hostPool.name === promptPool.name && (!currentModel || currentModel === 'inherit')) {
+    return {
+      overwrite: currentModel === 'inherit' ? null : { [modelKey]: 'inherit' },
+      note: `主会话当前已处于本地 ${hostPool.name} 模型池且子任务明确点名该池，保留 Model="inherit" 直接复用本地 ${hostPool.name} 池模型，不降档为 flash。`
+    };
+  }
+  const crossFamilyNote = (promptPool && (!hostPool || hostPool.name !== promptPool.name))
+    ? `提示：invoke_subagent 的枚举仅支持 Gemini 子档位或继承当前主窗口模型，无法跨家族切换到本地 ${promptPool.name} 池；若用户明确要求由本地 ${promptPool.name} 池审查/执行，请直接运行 scripts/Mode.ps1 pool-run --pool ${promptPool.name}（共用本机 Antigravity 账号，无需外部 CLI）。`
+    : null;
+
   const backupMatched = Array.isArray(projectPolicy.thinking_backups)
     && projectPolicy.thinking_backups.some(m => matchesConfiguredThinkingModel(roleAndPrompt, m));
   const isQuantThinking = projectPolicy.review_category === 'quant'
@@ -1823,25 +2029,25 @@ function evaluateSubagentCall(args = {}, projectPolicy) {
     && !MECHANICAL_SUBTASK_RE.test(args.Role || args.role || '');
 
   if (isQuantThinking && (currentModel === 'inherit' || currentModel === 'pro')) {
-    return { overwrite: null, note: '量化策略核心思考子任务保留原高思考档位，不降级。' };
+    return { overwrite: null, note: ['量化策略核心思考子任务保留原高思考档位，不降级。', crossFamilyNote].filter(Boolean).join(' ') };
   }
 
   if (typeName === 'research') {
     const target = projectPolicy.subagent_research_model || 'flash_lite';
     if (!currentModel || (projectPolicy.enforce_subagent_low_cost && currentModel === 'inherit' && !isQuantThinking)) {
-      return { overwrite: { [modelKey]: target }, note: `只读 research 子代理默认路由至低成本 ${target}。` };
+      return { overwrite: { [modelKey]: target }, note: [`只读 research 子代理默认路由至低成本 ${target}。`, crossFamilyNote].filter(Boolean).join(' ') };
     }
-    return { overwrite: null, note: null };
+    return { overwrite: null, note: crossFamilyNote };
   }
 
   const defaultExec = projectPolicy.subagent_default_model || 'flash';
   if (!currentModel) {
-    return { overwrite: { [modelKey]: defaultExec }, note: `AGY 执行子代理未指定模型，自动路由至低成本 ${defaultExec}。` };
+    return { overwrite: { [modelKey]: defaultExec }, note: [`AGY 执行子代理未指定模型，自动路由至低成本 ${defaultExec}。`, crossFamilyNote].filter(Boolean).join(' ') };
   }
   if (projectPolicy.enforce_subagent_low_cost && currentModel === 'inherit' && !isQuantThinking && !EXPLICIT_UPGRADE_RE.test(roleAndPrompt) && !matchesConfiguredThinkingModel(roleAndPrompt, projectPolicy.thinking_model)) {
-    return { overwrite: { [modelKey]: defaultExec }, note: `为避免普通子任务误继承高配主模型，自动降档为低成本 ${defaultExec}（如需升级请显式指定 pro 或在提示中说明复杂/量化思考）。` };
+    return { overwrite: { [modelKey]: defaultExec }, note: [`为避免普通子任务误继承高配主模型，自动降档为低成本 ${defaultExec}（如需升级请显式指定 pro 或在提示中说明复杂/量化思考）。`, crossFamilyNote].filter(Boolean).join(' ') };
   }
-  return { overwrite: null, note: null };
+  return { overwrite: null, note: crossFamilyNote };
 }
 
 function readQuotaCache(cachePath, ttlSeconds = 60, nowMs = Date.now()) {
@@ -2207,6 +2413,8 @@ module.exports = {
   runExternalAgyProbe,
   runExternalAgyProbeAsync,
   probeAgyQuotaAsync,
+  runAgyPoolTaskAsync,
+  checkExternalPoolCliMisuse,
   resolveSharedQuotaSnapshot,
   activeCodexTasks,
   cooldownActive,

@@ -325,7 +325,8 @@ pwsh -NoProfile -File scripts/Mode.ps1 set --mode codex --project 'C:/work/my-pr
 pwsh -NoProfile -File scripts/Mode.ps1 codex-pacing --days 5 --target 100 --ahead-max 3 --high-max 2 --protect-max 1
 pwsh -NoProfile -File scripts/Mode.ps1 quant-thinking --model 'YOUR_PRIMARY_TOP_MODEL' --general 'YOUR_DEEP_MODEL' --backups 'BACKUP_A,BACKUP_B'
 pwsh -NoProfile -File scripts/Mode.ps1 agy-models --standard 'YOUR_FAST_EXEC_MODEL' --complex 'YOUR_COMPLEX_MODEL' --expert 'YOUR_PRIMARY_TOP_MODEL'
-pwsh -NoProfile -File scripts/Mode.ps1 pool --name 'top-pool' --match 'family-prefix' --bucket-5h '3p-5h' --bucket-7d '3p-weekly' --weekly-protect 90 --unlock-hours 6 --5h-caution 75 --5h-protect 88
+pwsh -NoProfile -File scripts/Mode.ps1 pool --name 'top-pool' --match 'family-prefix' --review-model 'YOUR_POOL_REVIEW_MODEL_ID' --default-model 'YOUR_POOL_DEFAULT_MODEL_ID' --bucket-5h '3p-5h' --bucket-7d '3p-weekly' --weekly-protect 90 --unlock-hours 6 --5h-caution 75 --5h-protect 88
+pwsh -NoProfile -File scripts/Mode.ps1 pool-run --pool 'top-pool' --cwd 'C:/work/my-project' --prompt '只读审查当前改动风险与边界遗漏'
 pwsh -NoProfile -File scripts/Mode.ps1 agy-hint --level normal
 pwsh -NoProfile -File scripts/Mode.ps1 agy-quota --weekly-used 35 --weekly-reset (Get-Date).ToUniversalTime().AddDays(4).ToString('o') --5h-used 40 --5h-reset (Get-Date).ToUniversalTime().AddHours(3).ToString('o')
 pwsh -NoProfile -File scripts/Mode.ps1 agy-budget --target 90 --weekly-protect 90 --unlock-hours 6 --tokens-5h 8000000 --tokens-7d 80000000

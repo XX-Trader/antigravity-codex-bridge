@@ -12,9 +12,11 @@ const {
   loadRoutingPolicy,
   saveRoutingPolicy,
   resolveProjectPolicy,
+  resolveSharedQuotaSnapshot,
+  runAgyPoolTaskAsync,
   activeCodexTasks
 } = require('../src/routing-policy.cjs');
-const { defaultGuardStatePath, resetAgyGuard } = require('../src/agy-guard.cjs');
+const { defaultGuardStatePath, resetAgyGuard, readGuardQuotaCooldown } = require('../src/agy-guard.cjs');
 
 function usage() {
   return [
@@ -33,7 +35,8 @@ function usage() {
     '  reset-agy-guard [--conversation UUID] [--policy POLICY_JSON]',
     '  quant-thinking [--model NAME] [--general NAME] [--backups A,B] [--clear] [--config MCP_JSON] [--policy POLICY_JSON]',
     '  agy-models [--standard NAME] [--complex NAME] [--expert NAME] [--clear] [--policy POLICY_JSON]',
-    '  pool --name POOL [--match TEXT] [--weekly-protect PCT] [--5h-caution PCT] [--5h-protect PCT] [--tokens-5h N] [--tokens-7d N] [--weekly-used PCT] [--weekly-reset ISO] [--5h-used PCT] [--5h-reset ISO] [--clear-snapshot] [--remove]',
+    '  pool --name POOL [--match TEXT] [--review-model MODEL] [--default-model MODEL] [--weekly-protect PCT] [--unlock-hours N] [--5h-caution PCT] [--5h-protect PCT] [--tokens-5h N] [--tokens-7d N] [--weekly-used PCT] [--weekly-reset ISO] [--5h-used PCT] [--5h-reset ISO] [--clear-snapshot] [--remove]',
+    '  pool-run --pool POOL [--model MODEL] [--exec-mode plan|auto|accept-edits] [--cwd ABS_PATH] [--conversation UUID] [--prompt TEXT | --prompt-file UTF8_FILE] [--force]',
     '  tier [--simple MODEL] [--standard MODEL] [--complex MODEL] [--expert MODEL] [--enforce-low-cost true|false]',
     '  cooldown --engine codex|agy --minutes N [--reason TEXT]',
     '  clear-cooldown --engine codex|agy'
@@ -44,7 +47,7 @@ function parseArgs(argv) {
   const command = argv[0] && !argv[0].startsWith('--') ? argv[0] : 'status';
   const rest = argv[0] && !argv[0].startsWith('--') ? argv.slice(1) : argv;
   const opts = { command };
-  const flags = new Set(['--refresh', '--clear', '--clear-snapshot', '--remove', '--help', '-h']);
+  const flags = new Set(['--refresh', '--clear', '--clear-snapshot', '--remove', '--force', '--help', '-h']);
   for (let i = 0; i < rest.length; i++) {
     const token = rest[i];
     if (flags.has(token)) { opts[token.replace(/^-+/, '')] = true; continue; }
@@ -339,6 +342,8 @@ async function run(argv) {
     }
     if (opts['bucket-5h'] !== undefined) next.bucket_5h = String(opts['bucket-5h']).trim() || null;
     if (opts['bucket-7d'] !== undefined) next.bucket_7d = String(opts['bucket-7d']).trim() || null;
+    if (opts['default-model'] !== undefined) next.default_model = String(opts['default-model']).trim() || null;
+    if (opts['review-model'] !== undefined) next.review_model = String(opts['review-model']).trim() || null;
     if (opts['clear-snapshot']) {
       next.manual_snapshot = null;
     } else if (opts['weekly-used'] !== undefined || opts['5h-used'] !== undefined || opts['weekly-reset'] !== undefined || opts['5h-reset'] !== undefined) {
@@ -360,6 +365,41 @@ async function run(argv) {
     current.agy_model_pools[name] = next;
     const saved = saveRoutingPolicy(policyFile, current);
     return JSON.stringify({ state: 'updated', policy_path: saved.path, pool: saved.agy_model_pools[name] }, null, 2);
+  }
+
+  if (opts.command === 'pool-run') {
+    const poolName = String(opts.pool || '').trim().toLowerCase();
+    if (!poolName) throw new Error('--pool is required for pool-run');
+    const cwd = opts.cwd ? path.resolve(opts.cwd) : (settings?.project || process.cwd());
+    const promptText = opts['prompt-file']
+      ? fs.readFileSync(path.resolve(opts['prompt-file']), 'utf8')
+      : (opts.prompt || '');
+    const scope = (settings?.projects || (settings ? [settings] : [])).find(p => p?.project && cwd.toLowerCase().startsWith(String(p.project).toLowerCase()))
+      || settings?.projects?.[0]
+      || settings
+      || { project: cwd };
+    const guardCooldown = readGuardQuotaCooldown(defaultGuardStatePath(policyFile, scope));
+    const projectPolicy = { ...resolveProjectPolicy(current, scope), ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
+    const snap = resolveSharedQuotaSnapshot(scope, projectPolicy, { policyPath: policyFile });
+    const res = await runAgyPoolTaskAsync({
+      poolName,
+      model: opts.model,
+      execMode: opts['exec-mode'] || 'plan',
+      cwd,
+      prompt: promptText,
+      conversationId: opts.conversation,
+      force: opts.force === true,
+      timeoutMs: opts['timeout-ms'] ? Number(opts['timeout-ms']) : 600000,
+      projectPolicy,
+      codexPacing: snap.codexPacing,
+      agyUsage: snap.agyUsage,
+      agyExternal: snap.agyExternal,
+      agyBin: opts['agy-bin']
+    });
+    if (!res.ok) {
+      process.exitCode = res.blocked ? 2 : 1;
+    }
+    return JSON.stringify(res, null, 2);
   }
 
   if (opts.command === 'agy-models') {
