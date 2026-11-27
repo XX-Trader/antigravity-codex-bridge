@@ -1659,5 +1659,87 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
     assert.equal(qAcctB.agy_pacing.window_7d.used_percent, 0);
     assert.equal(qAcctB.agy_pacing.window_5h.status, 'ok', 'Old account 429 cooldown must be purged upon switching to fresh Account B');
     assert.equal(readGuardQuotaCooldown(guardPath, switchTimeMs + 1000), null);
+
+    // (g) Severe AGY 7-day overburn (`65%` used at `10%` elapsed while Codex is at `1%`) intercepts `send_message` / `invoke_subagent`
+    //     to stop runaway AGY subagent loops, blocks `run_command` when AGY hits hard limit, and triggers deduplicated usage alerts!
+    const { notifyAgyQuotaUsageIfNeeded } = require('../src/notifier.cjs');
+    const overburnExt = parseAgyProbePayload({
+      status: 'SUCCESS',
+      command: { data: { groups: [{ buckets: [
+        { id: 'gemini-weekly', remaining_fraction: 0.35, reset_time: relIso(now, 148 * HOUR_MS) },
+        { id: 'gemini-5h', remaining_fraction: 0.94, reset_time: relIso(now, 4 * HOUR_MS) }
+      ] }] } }
+    });
+    writeQuotaCache(cachePath, {
+      codex_pacing: { available: true, window_active: true, band: 'codex_priority', elapsed_percent: 5.5, used_percent: 1, pacing_delta: -4.5, resets_at: relIso(now, 161 * HOUR_MS), hours_until_reset: 161 },
+      agy_usage: { available: true, window_5h: { total_tokens: 0 }, window_7d: { total_tokens: 0 }, quota_errors_5h: 0, auto_degraded: false },
+      agy_external: overburnExt,
+      fetched_at: relIso(now, 0)
+    });
+    // Orchestrator trying to feed existing AGY subagents via `send_message` while Codex sits at 1% is intercepted!
+    const blockedSendMsg = bindOrigin(
+      { conversationId: '69d255d8-1b93-4f96-8c63-6a5496208bb6', workspacePaths: [f.project], toolCall: { name: 'send_message', args: { Recipient: '89724722-8ade-40f7-a776-c8fbfb379b4e', Message: '继续复核下一批 10 只股票' } } },
+      [{ project: f.project, data: f.data }],
+      { policyPath: f.policyPath, cachePath, nowMs: now }
+    );
+    assert.equal(blockedSendMsg.decision, 'deny');
+    assert.match(blockedSendMsg.reason, /\[AGY_PACING_OVERBURN_HANDOVER\]/);
+
+    // Subagent handoff receipt message back to parent IS allowed so it can hand over cleanly to `codex_run`!
+    const allowedHandoffMsg = bindOrigin(
+      { conversationId: '6200e7ec-d95f-4879-9f0b-7f15dd025db2', workspacePaths: [f.project], toolCall: { name: 'send_message', args: { Recipient: '69d255d8-1b93-4f96-8c63-6a5496208bb6', Message: '因触发 [AGY_QUOTA_PROTECTED]，已暂停并将上下文交接由 codex_run 执行' } } },
+      [{ project: f.project, data: f.data }],
+      { policyPath: f.policyPath, cachePath, nowMs: now }
+    );
+    assert.equal(allowedHandoffMsg.decision, 'allow');
+
+    // Deduplicated usage surge alert (`weekly_overburn`) fires once per cycle in tray & injects `[AGY 额度高消耗预警]` in chat!
+    const overburnRoute = decideRoute({
+      projectPolicy: resolveProjectPolicy(defaultPolicy(), { project: f.project }),
+      codexPacing: { available: true, window_active: true, band: 'codex_priority', elapsed_percent: 5.5, used_percent: 1, pacing_delta: -4.5, resets_at: relIso(now, 161 * HOUR_MS), hours_until_reset: 161 },
+      agyExternal: overburnExt,
+      nowMs: now
+    });
+    assert.equal(overburnRoute.agy_usage_alert?.level, 'weekly_overburn');
+    const usageNotifs = [];
+    assert.equal(notifyAgyQuotaUsageIfNeeded(mockBroker, overburnRoute, { now: now, desktopNotify: p => usageNotifs.push(p) }), true);
+    assert.equal(usageNotifs.length, 1);
+    assert.equal(notifyAgyQuotaUsageIfNeeded(mockBroker, overburnRoute, { now: now + MINUTE_MS, desktopNotify: p => usageNotifs.push(p) }), false);
+    assert.equal(usageNotifs.length, 1);
+
+    const overburnCtx = contextHook(
+      { hookEventName: 'PreInvocation', conversationId: '77777777-7777-7777-7777-777777777777', workspacePaths: [f.project] },
+      [{ project: f.project, data: f.data }],
+      { policyPath: f.policyPath, cachePath, nowMs: now }
+    );
+    assert.match(overburnCtx.injectSteps[0].systemMessage.systemMessage, /\[AGY 额度高消耗预警\]/);
+
+    // When AGY hits hard 5h/7d limit (`92%` 5h), even `run_command` Python writers are blocked (while `git status` stays allowed)!
+    const hardLimitExt = parseAgyProbePayload({
+      status: 'SUCCESS',
+      command: { data: { groups: [{ buckets: [
+        { id: 'gemini-weekly', remaining_fraction: 0.35, reset_time: relIso(now, 148 * HOUR_MS) },
+        { id: 'gemini-5h', remaining_fraction: 0.08, reset_time: relIso(now, 2 * HOUR_MS) }
+      ] }] } }
+    });
+    writeQuotaCache(cachePath, {
+      codex_pacing: { available: true, window_active: true, band: 'codex_priority', elapsed_percent: 5.5, used_percent: 1, pacing_delta: -4.5, resets_at: relIso(now, 161 * HOUR_MS), hours_until_reset: 161 },
+      agy_usage: { available: true, window_5h: { total_tokens: 0 }, window_7d: { total_tokens: 0 }, quota_errors_5h: 0, auto_degraded: false },
+      agy_external: hardLimitExt,
+      fetched_at: relIso(now, 0)
+    });
+    const blockedPyWrite = bindOrigin(
+      { conversationId: '89724722-8ade-40f7-a776-c8fbfb379b4e', workspacePaths: [f.project], toolCall: { name: 'run_command', args: { CommandLine: 'python write_batch.py' } } },
+      [{ project: f.project, data: f.data }],
+      { policyPath: f.policyPath, cachePath, nowMs: now }
+    );
+    assert.equal(blockedPyWrite.decision, 'deny');
+    assert.match(blockedPyWrite.reason, /\[AGY_QUOTA_PROTECTED\]/);
+    const allowedGitStatus = bindOrigin(
+      { conversationId: '89724722-8ade-40f7-a776-c8fbfb379b4e', workspacePaths: [f.project], toolCall: { name: 'run_command', args: { CommandLine: 'git status -sb' } } },
+      [{ project: f.project, data: f.data }],
+      { policyPath: f.policyPath, cachePath, nowMs: now }
+    );
+    assert.equal(allowedGitStatus.decision, 'allow');
   }
 });

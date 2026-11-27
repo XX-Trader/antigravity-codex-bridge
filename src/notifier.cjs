@@ -474,6 +474,23 @@ function notifyAgyHealthIfNeeded(broker, report, options = {}) {
   return false;
 }
 
+function notifyAgyQuotaUsageIfNeeded(broker, report, options = {}) {
+  const alert = report?.agy_usage_alert;
+  if (!broker?.jobs || !alert?.alert_key) return false;
+  const alertFile = path.join(path.dirname(broker.jobs), 'agy-quota-alert.json');
+  const nowIso = new Date(options.now ?? Date.now()).toISOString();
+  const prev = fs.existsSync(alertFile) ? read(alertFile) : { notified_keys: [] };
+  const known = Array.isArray(prev?.notified_keys) ? prev.notified_keys : [];
+  if (known.includes(alert.alert_key)) return false;
+  sendDesktopBalloonAlert(alert.title || 'Antigravity 额度消耗提醒', alert.message, options);
+  save(alertFile, {
+    notified_keys: [...known.slice(-24), alert.alert_key],
+    last_alert: alert,
+    notified_at: nowIso
+  });
+  return true;
+}
+
 function startQuotaSyncLoop(broker, options = {}) {
   const intervalMs = options.intervalMs ?? 120000;
   const initialDelayMs = options.initialDelayMs ?? 1500;
@@ -493,6 +510,7 @@ function startQuotaSyncLoop(broker, options = {}) {
     try {
       const report = await broker.quota({ background: true });
       try { notifyAgyHealthIfNeeded(broker, report, options); } catch {}
+      try { notifyAgyQuotaUsageIfNeeded(broker, report, options); } catch {}
       return report;
     } catch (error) {
       process.stderr.write(`Shared quota sync: ${error.message}\n`);
@@ -507,7 +525,7 @@ function startQuotaSyncLoop(broker, options = {}) {
   timer.unref?.();
   return { close, tick };
 }
-module.exports = { originHook, contextHook, postToolHook, deliver, watch, startQuotaSyncLoop, notifyAgyHealthIfNeeded, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
+module.exports = { originHook, contextHook, postToolHook, deliver, watch, startQuotaSyncLoop, notifyAgyHealthIfNeeded, notifyAgyQuotaUsageIfNeeded, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
 if (require.main === module) {
   if (['--origin-hook', '--context-hook', '--post-tool-hook'].includes(process.argv[2])) {
     const mode = process.argv[2];

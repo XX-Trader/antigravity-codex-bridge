@@ -2102,6 +2102,65 @@ function codexIsExhausted(p) {
   return p.hard_limited === true || (typeof p.used_percent === 'number' && p.used_percent >= 100);
 }
 
+function evaluateAgyUsageAlert({ agyPacing, codexPacing, mode }) {
+  const w7 = agyPacing?.window_7d;
+  const w5 = agyPacing?.window_5h;
+  const codexNote = codexPacing?.available
+    ? `Codex 当前已用 ${codexPacing.used_percent}%`
+    : 'Codex 可分担执行';
+  const anchor7d = w7?.resets_at || 'active-7d';
+  const anchor5h = w5?.resets_at || 'active-5h';
+
+  if (w7?.available && w7.band === 'agy_protected') {
+    return {
+      level: 'weekly_protected',
+      alert_key: `weekly_protected:${anchor7d}`,
+      title: `Antigravity 周额度已触及 ${w7.protect_used_percent}% 保护线`,
+      message: `AGY 7天额度已用 ${w7.used_percent}%（触及 ${w7.protect_used_percent}% 保护线，保留 ${w7.buffer_percent}% 主对话缓冲），${codexNote}；后续执行与子代理已硬性交由 Codex 接管。`
+    };
+  }
+  if (w5?.status === 'limited') {
+    return {
+      level: '5h_protected',
+      alert_key: `5h_protected:${anchor5h}`,
+      title: 'Antigravity 5小时额度已达保护线',
+      message: `AGY 5小时窗口已受限（${w5.used_percent !== null ? `已用 ${w5.used_percent}%，` : ''}原因=${w5.reason || 'limited'}），${codexNote}；当前窗口重置前执行已切往 Codex 兜底。`
+    };
+  }
+  if (w7?.available && typeof w7.used_percent === 'number' && w7.used_percent >= 75) {
+    return {
+      level: 'weekly_75_high',
+      alert_key: `weekly_75_high:${anchor7d}`,
+      title: `Antigravity 周额度高水位提醒（已用 ${w7.used_percent}%）`,
+      message: `AGY 7天额度已消耗 ${w7.used_percent}%（距 ${w7.protect_used_percent}% 保护线仅剩 ${w7.usable_remaining_percent}%${typeof w7.hours_until_reset === 'number' ? `，距周重置 ${w7.hours_until_reset}h` : ''}），${codexNote}；重任务请优先使用 Codex。`
+    };
+  }
+  if (
+    mode !== 'agy'
+    && w7?.available
+    && typeof w7.used_percent === 'number'
+    && w7.used_percent >= 40
+    && typeof w7.pacing_delta === 'number'
+    && w7.pacing_delta >= 20
+  ) {
+    return {
+      level: 'weekly_overburn',
+      alert_key: `weekly_overburn:${anchor7d}`,
+      title: `Antigravity 额度消耗超前预警（已用 ${w7.used_percent}%）`,
+      message: `AGY 7天额度已用 ${w7.used_percent}%（按时间进度线性目标仅 ${w7.target_used_percent}%，超前 +${w7.pacing_delta}%${typeof w7.hours_until_reset === 'number' ? `，距周重置还有 ${w7.hours_until_reset}h` : ''}），而 ${codexNote}；已自动拦截 AGY 批量子代理/工作流派发并切往 Codex。`
+    };
+  }
+  if (w5?.status === 'caution' && typeof w5.used_percent === 'number') {
+    return {
+      level: '5h_75_caution',
+      alert_key: `5h_75_caution:${anchor5h}`,
+      title: `Antigravity 5小时额度警戒（已用 ${w5.used_percent}%）`,
+      message: `AGY 5小时窗口已用 ${w5.used_percent}%（≥${w5.caution_percent}% 警戒线），${codexNote}；建议将执行任务分流给 Codex。`
+    };
+  }
+  return null;
+}
+
 function decideRoute(input = {}) {
   const nowMs = input.nowMs ?? Date.now();
   const policy = input.projectPolicy || resolveProjectPolicy(input.policy || defaultPolicy(), input.projectScope);
@@ -2348,6 +2407,8 @@ function decideRoute(input = {}) {
           ? `AGY 已触及保护线（7天缓冲线或 5h 窗口限制），为保住主聊天窗不断粮，执行与子代理已硬性切往 Codex 接管。`
           : null;
 
+  const agyUsageAlert = evaluateAgyUsageAlert({ agyPacing, codexPacing, mode });
+
   return {
     mode,
     mode_source: policy.mode_source,
@@ -2362,6 +2423,7 @@ function decideRoute(input = {}) {
     agy_usage: agyUsage,
     agy_external: agyExternal,
     agy_health: agyHealth,
+    agy_usage_alert: agyUsageAlert,
     agy_constrained: agyConstrained,
     agy_exhausted: agyExhausted,
     agy_5h_limited: agy5hLimited,
@@ -2643,7 +2705,8 @@ function readLatestCodexRolloutRateLimits(options = {}) {
 
 const NATIVE_CODEX_REQUIRED_RE = /native_luna|spawn_agent|waiting_background|原生\s*luna|原生子\s*agent|后台托管/i;
 const ALLOW_EXTRA_CREDITS_RE = /CODEX_ALLOW_EXTRA_CREDITS/i;
-const HEAVY_AGY_EXEC_RE = /(?:^|[_/.:-])(?:invoke_subagent|run_workflow|write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content|apply_patch)$/i;
+const HEAVY_AGY_EXEC_RE = /(?:^|[_/.:-])(?:invoke_subagent|send_message|run_workflow|run_command|write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content|apply_patch)$/i;
+const SAFE_HANDOFF_CMD_RE = /^\s*git\s+(?:status|diff|log)\b(?![^|;&]*[|;&>])|\bMode\.ps1\b|\bmode\.cjs\b/i;
 
 function evaluateCodexConcurrencyGate({ args = {}, projectPolicy, codexPacing, agyPacing, totalActiveCodexTasks = 0 }) {
   if (!projectPolicy || projectPolicy.mode !== 'auto') return { blocked: false };
@@ -2726,9 +2789,16 @@ function evaluateAgyQuotaGate({ toolName = '', args = {}, projectPolicy, codexPa
   if (!HEAVY_AGY_EXEC_RE.test(toolName)) return { blocked: false };
 
   const isInvokeSubagent = /(?:^|[_/.:-])invoke_subagent$/i.test(toolName);
+  const isSendMessage = /(?:^|[_/.:-])send_message$/i.test(toolName);
   const isWorkflow = /(?:^|[_/.:-])run_workflow$/i.test(toolName);
+  const isRunCommand = /(?:^|[_/.:-])run_command$/i.test(toolName);
   const subType = String(args.TypeName || args.typeName || args.type_name || 'self').trim().toLowerCase();
   const isReadOnlyResearch = isInvokeSubagent && subType === 'research';
+  const cmdText = String(args.CommandLine || args.command || '');
+  if (isRunCommand && SAFE_HANDOFF_CMD_RE.test(cmdText)) return { blocked: false };
+  const msgText = String(args.Message || args.message || '');
+  const isHandoffReceiptMsg = isSendMessage && /AGY_QUOTA_PROTECTED|AGY_PACING_OVERBURN|codex_run|暂停[^\r\n]{0,30}交接/i.test(msgText);
+
   const codexCooling = cooldownActive(projectPolicy.cooldowns?.codex, nowMs);
   const codexDead = codexIsExhausted(codexPacing);
   const codexHasRoom = Boolean(codexPacing?.available && !codexDead && !codexCooling);
@@ -2747,7 +2817,7 @@ function evaluateAgyQuotaGate({ toolName = '', args = {}, projectPolicy, codexPa
 
   // 2. AGY hit protection line (7d >= 90% when >6h before reset, or 5h >= 88%, or 429) while Codex still has quota => protect AGY's 10% main-chat buffer!
   if (agyPacing?.limited && codexHasRoom) {
-    if (isReadOnlyResearch && !agyPacing.exhausted) return { blocked: false };
+    if ((isReadOnlyResearch && !agyPacing.exhausted) || isHandoffReceiptMsg) return { blocked: false };
     const agyResetNote = typeof agyPacing.window_7d?.hours_until_reset === 'number'
       ? `距周重置 ${agyPacing.window_7d.hours_until_reset}h；剩余 ≤${agyPacing.window_7d.buffer_unlock_window_hours}h 时将自动解锁`
       : `待周重置窗口激活且剩余 ≤${agyPacing.window_7d?.buffer_unlock_window_hours ?? 6}h 时自动解锁`;
@@ -2757,8 +2827,37 @@ function evaluateAgyQuotaGate({ toolName = '', args = {}, projectPolicy, codexPa
     return {
       blocked: true,
       kind: 'agy_quota_protected',
-      reason: `[AGY_QUOTA_PROTECTED] AGY 当前${agyDetail}，且 Codex 仍有可用额度（已用 ${codexPacing.used_percent}%）：为保证主聊天窗口不断粮，AGY 写操作与子代理已硬性保护，请将当前任务（含在途事项的已完成上下文与文件差异）跨端交接给 codex_run 执行。`
+      reason: `[AGY_QUOTA_PROTECTED] AGY 当前${agyDetail}，且 Codex 仍有可用额度（已用 ${codexPacing.used_percent}%）：为保证主聊天窗口不断粮，AGY 写操作、命令执行与子代理派发已硬性保护，请立即停止 AGY 子代理循环并将任务（含已完成上下文与文件差异）跨端交接给 codex_run 执行。`
     };
+  }
+
+  // 2b. Severe 7-day pacing overburn handover: when AGY has already burned >=35% and is >=+20% ahead of its linear curve
+  //     while Codex is healthy and on/below pace (<85% used, delta <= +5%), block AGY subagent/send_message/workflow fan-out
+  //     so multi-agent batches automatically return to Codex once Codex quota refreshes!
+  const w7 = agyPacing?.window_7d;
+  const agySeverelyOverburned = Boolean(
+    w7?.available
+    && typeof w7.used_percent === 'number'
+    && w7.used_percent >= 35
+    && typeof w7.pacing_delta === 'number'
+    && w7.pacing_delta >= 20
+  );
+  const codexPlenty = Boolean(
+    codexHasRoom
+    && (codexPacing.used_percent ?? 0) < 85
+    && (codexPacing.pacing_delta === null || codexPacing.pacing_delta === undefined || codexPacing.pacing_delta <= 5)
+  );
+  if (agySeverelyOverburned && codexPlenty) {
+    const isBatchDelegation = (isInvokeSubagent && !isReadOnlyResearch && !['browser', 'image-generator'].includes(subType))
+      || isWorkflow
+      || (isSendMessage && !isHandoffReceiptMsg);
+    if (isBatchDelegation) {
+      return {
+        blocked: true,
+        kind: 'agy_pacing_overburn_handover',
+        reason: `[AGY_PACING_OVERBURN_HANDOVER] AGY 7天额度已大幅超前消耗（当前已用 ${w7.used_percent}%，线性目标仅 ${w7.target_used_percent}%，超前 +${w7.pacing_delta}%），而 Codex 当前额度充裕（仅用 ${codexPacing.used_percent}%）：已自动拦截 AGY 子代理续派/新建与批量工作流（invoke_subagent / send_message / run_workflow），请将后续任务直接交由 codex_run 执行以均衡双端额度（如确需强制使用 AGY，可运行 Mode.ps1 set --mode agy）。`
+      };
+    }
   }
 
   // 3. Codex is 100% exhausted AND AGY is in its soft buffer (e.g. 90%~99% with >6h to reset) => Emergency Rationing Mode!
@@ -2890,6 +2989,7 @@ module.exports = {
   evaluateCodexPacing,
   evaluateAgyPacing,
   evaluateAgyModelPools,
+  evaluateAgyUsageAlert,
   evaluateCodexConcurrencyGate,
   evaluateAgyQuotaGate,
   codexIsExhausted,

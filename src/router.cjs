@@ -198,7 +198,8 @@ function contextHook(payload, projects, options = {}) {
     updated_at: rawPolicy.updated_at || null,
     quant_reminder: route.thinking_guidance?.matches_required === false ? route.thinking_guidance.required_thinking_model : null,
     pool_stopped: Boolean(route.thinking_guidance?.current_model_pool_stopped),
-    agy_alert: route.agy_health?.alert_needed ? `${route.agy_health.status}:${route.agy_health.since || ''}` : null
+    agy_alert: route.agy_health?.alert_needed ? `${route.agy_health.status}:${route.agy_health.since || ''}` : null,
+    usage_alert: route.agy_usage_alert?.alert_key || null
   });
   const markerFile = options.markerFile || (policyPath ? path.join(path.dirname(policyPath), 'context-hook-state.json') : null);
   if (eventName === 'PreInvocation' && conversationId && markerFile) {
@@ -252,6 +253,9 @@ function contextHook(payload, projects, options = {}) {
   ];
   if (route.agy_health?.alert_needed && route.agy_health.message) {
     lines.push(`[AGY 账号与额度告警] ${route.agy_health.message}（请在回复开头向用户简要提示一次该状态及恢复方式，禁止未经用户同意自行打开浏览器）。`);
+  }
+  if (route.agy_usage_alert?.message) {
+    lines.push(`[AGY 额度高消耗预警] ${route.agy_usage_alert.message}（若本会话尚未提示用户，请在回复开头简要提醒一次当前 AGY 与 Codex 额度使用情况）。`);
   }
   if (route.exhaustion_handover?.guidance) lines.push(`[额度耗尽与交接] ${route.exhaustion_handover.guidance}`);
   if (route.thinking_guidance?.reminder) lines.push(`${route.thinking_guidance.current_model_pool_stopped ? '[模型池硬停告警]' : '[思考模型提示]'} ${route.thinking_guidance.reminder}`);
