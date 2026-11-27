@@ -486,7 +486,8 @@ class Broker {
     // crash fallback. Recover only this exact corruption with matching saved evidence.
     const overwritten = job.status === 'failed' && job.error === 'Worker exited before recording completion' &&
       ((job.execution_block && job.handoff?.kind === 'execution_blocked') || ['review_revise', 'review_needs_evidence', 'needs_input'].includes(job.handoff?.kind));
-    if (overwritten || (!terminal.has(job.status) && (fs.existsSync(crashFile) || (Date.now() - Date.parse(job.created_at) > 15000 && !alive(workerPid))))) {
+    const alreadyOrphaned = job.status === 'orphaned' && (Boolean(job.background_wait) || alive(job.child_pid));
+    if (overwritten || (!alreadyOrphaned && !terminal.has(job.status) && (fs.existsSync(crashFile) || (Date.now() - Date.parse(job.created_at) > 15000 && !alive(workerPid))))) {
       return changeJob(file, current => {
       if (current.status === 'failed' && current.error === 'Worker exited before recording completion' &&
           ['review_revise', 'review_needs_evidence', 'needs_input'].includes(current.handoff?.kind)) {
@@ -508,8 +509,14 @@ class Broker {
       job = current;
       if (!fs.existsSync(crashFile) && (Date.now() - Date.parse(job.created_at) <= 15000 || alive(job.worker_pid || workerPid))) return job;
       // Keep the exact session owned while its child may still run; other matters remain independent.
-      if (job.background_wait) return { ...job, status: 'orphaned', error: 'Worker exited during owned background wait; preserve registration and session, never replay the command' };
-      if (alive(job.child_pid)) return { ...job, status: 'orphaned', error: 'Worker exited but Codex may still run; inspect this owned job before retrying' };
+      if (job.background_wait) {
+        const msg = 'Worker exited during owned background wait; preserve registration and session, never replay the command';
+        return current.status === 'orphaned' && current.error === msg ? current : { ...job, status: 'orphaned', error: msg };
+      }
+      if (alive(job.child_pid)) {
+        const msg = 'Worker exited but Codex may still run; inspect this owned job before retrying';
+        return current.status === 'orphaned' && current.error === msg ? current : { ...job, status: 'orphaned', error: msg };
+      }
       const dir = path.dirname(file), result = path.join(dir, 'result.txt');
       const handoff = fs.existsSync(result) ? finalHandoff(fs.readFileSync(result, 'utf8')) : null;
       const stderr = tail(path.join(dir, 'stderr.log'), 8000), execution_block = executionBlock(handoff, stderr, id);

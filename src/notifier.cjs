@@ -42,15 +42,112 @@ async function nativeSend(executable, recipient, message, call = agentCall) {
   if (result.exit_code === 0) return result;
   throw new Error(`agentapi exit=${result.exit_code}: ${result.stderr || result.stdout}`);
 }
-function recordedReceipt(directory, event) {
-  if (!directory || !fs.existsSync(directory)) return false;
-  for (const name of fs.readdirSync(directory).filter(n => n.endsWith('.json'))) {
-    try {
-      const receipt = read(path.join(directory, name)), message = receipt.payload?.sendMessage;
-      if (!receipt.error && message?.recipientId === event.conversation_id && message.content?.includes(`[CODEX_EVENT ${event.job_id}]`) && (event.schema !== 2 || message.content.includes(`event_id=${event.event_id} `))) return true;
-    } catch { /* Ignore unrelated/partially written host records. */ }
+const SETTLED_DELIVERY_STATES = new Set(['sent', 'accepted', 'superseded', 'suppressed']);
+
+function parseReceiptRecord(file) {
+  try {
+    const receipt = read(file), message = receipt.payload?.sendMessage;
+    if (!message || typeof message.content !== 'string') return { parsed: true, valid: false };
+    const jobMatch = message.content.match(/\[CODEX_EVENT ([a-f0-9]{24})\]/);
+    if (!jobMatch) return { parsed: true, valid: false };
+    const eventMatch = message.content.match(/\bevent_id=([^\s]+)\s/);
+    return {
+      parsed: true,
+      valid: !receipt.error,
+      recipientId: message.recipientId || null,
+      jobId: jobMatch[1],
+      eventId: eventMatch ? eventMatch[1] : null
+    };
+  } catch {
+    return { parsed: false, valid: false };
   }
-  return false;
+}
+
+function createReceiptCache() {
+  return { dir: null, dirMtimeMs: null, entryCount: null, hasUnparsed: false, files: new Map(), byKey: new Set(), byLegacyKey: new Set() };
+}
+
+function recordedReceipt(directory, event, cache = null) {
+  if (!directory || !fs.existsSync(directory)) return false;
+  if (!cache) {
+    for (const name of fs.readdirSync(directory).filter(n => n.endsWith('.json'))) {
+      try {
+        const receipt = read(path.join(directory, name)), message = receipt.payload?.sendMessage;
+        if (!receipt.error && message?.recipientId === event.conversation_id && message.content?.includes(`[CODEX_EVENT ${event.job_id}]`) && (event.schema !== 2 || message.content.includes(`event_id=${event.event_id} `))) return true;
+      } catch { /* Ignore unrelated/partially written host records. */ }
+    }
+    return false;
+  }
+  if (cache.dir !== directory) {
+    cache.dir = directory; cache.dirMtimeMs = null; cache.entryCount = null; cache.hasUnparsed = false;
+    cache.files.clear(); cache.byKey.clear(); cache.byLegacyKey.clear();
+  }
+  let dirMtimeMs = null;
+  try { dirMtimeMs = fs.statSync(directory).mtimeMs; } catch { return false; }
+  if (cache.dirMtimeMs !== dirMtimeMs || cache.hasUnparsed) {
+    const names = fs.readdirSync(directory).filter(n => n.endsWith('.json'));
+    const present = new Set(names);
+    let pruned = false, unparsed = false;
+    for (const existing of cache.files.keys()) {
+      if (!present.has(existing)) { cache.files.delete(existing); pruned = true; }
+    }
+    for (const name of names) {
+      if (cache.files.has(name)) continue;
+      const rec = parseReceiptRecord(path.join(directory, name));
+      // Only cache successfully parsed host receipts; partially written files retry on next check.
+      if (!rec.parsed) { unparsed = true; continue; }
+      cache.files.set(name, rec);
+      if (rec.valid && rec.recipientId && rec.jobId) {
+        cache.byLegacyKey.add(`${rec.recipientId}|${rec.jobId}`);
+        if (rec.eventId) cache.byKey.add(`${rec.recipientId}|${rec.jobId}|${rec.eventId}`);
+      }
+    }
+    if (pruned) {
+      cache.byKey.clear(); cache.byLegacyKey.clear();
+      for (const rec of cache.files.values()) {
+        if (rec.valid && rec.recipientId && rec.jobId) {
+          cache.byLegacyKey.add(`${rec.recipientId}|${rec.jobId}`);
+          if (rec.eventId) cache.byKey.add(`${rec.recipientId}|${rec.jobId}|${rec.eventId}`);
+        }
+      }
+    }
+    cache.dirMtimeMs = dirMtimeMs;
+    cache.entryCount = names.length;
+    cache.hasUnparsed = unparsed;
+  }
+  if (event.schema === 2) return cache.byKey.has(`${event.conversation_id}|${event.job_id}|${event.event_id}`);
+  return cache.byLegacyKey.has(`${event.conversation_id}|${event.job_id}`);
+}
+
+function createJobIndex(broker) {
+  const entries = new Map();
+  let lastScanMs = 0;
+  const loadOne = id => {
+    try {
+      const next = read(broker.jobPath(id));
+      entries.set(id, {
+        topic_id: next.topic_id || null,
+        conversation_id: next.conversation_id || null,
+        created_at: next.created_at || '',
+        refusal_job_id: next.plan_decision?.refusal_job_id || null,
+        resume_blocked_ids: next.execution_followup?.intent === 'resume_after_resolution' && Array.isArray(next.execution_followup.blocked_job_ids)
+          ? next.execution_followup.blocked_job_ids : null
+      });
+    } catch { entries.delete(id); }
+  };
+  const sync = (force = false) => {
+    const now = Date.now();
+    if (!force && lastScanMs && now - lastScanMs < 1500) return entries;
+    lastScanMs = now;
+    let names;
+    try { names = fs.readdirSync(broker.jobs).filter(n => /^[a-f0-9]{24}$/.test(n)); } catch { return entries; }
+    const present = new Set(names);
+    for (const id of entries.keys()) if (!present.has(id)) entries.delete(id);
+    for (const id of names) if (!entries.has(id)) loadOne(id);
+    return entries;
+  };
+  const invalidate = id => { if (id) entries.delete(id); lastScanMs = 0; };
+  return { entries, sync, invalidate, loadOne };
 }
 const checks = new Set(['notification_check', 'parallel_check', 'subagent_check']);
 const important = new Set(['terminal', 'execution_alert', 'notification_alert', 'monitoring_alert']);
@@ -145,13 +242,22 @@ function claimHost(data, generation) {
 }
 async function deliverEvent(job, event, deliveryFile, send, options) {
   if (event.job_id !== job.job_id || !uuid(event.conversation_id) || event.conversation_id !== job.conversation_id || event.topic_id !== job.topic_id) throw new Error('Notice identity mismatch');
+  const fastPrev = fs.existsSync(deliveryFile) ? (() => { try { return read(deliveryFile); } catch { return null; } })() : null;
+  if (SETTLED_DELIVERY_STATES.has(fastPrev?.state)) return false;
+  if (fastPrev?.state === 'uncertain' && fastPrev.action_required) {
+    if (!(await options.reconcile?.(event))) return false;
+  }
   const release = takeClaim(deliveryFile + '.claim'); if (!release) return false;
   try {
     const previous = fs.existsSync(deliveryFile) ? read(deliveryFile) : null;
-    if (['sent', 'accepted', 'superseded', 'suppressed'].includes(previous?.state)) return false;
+    if (SETTLED_DELIVERY_STATES.has(previous?.state)) return false;
     if (['sending', 'uncertain'].includes(previous?.state)) {
       if (await options.reconcile?.(event)) { save(deliveryFile, { ...previous, state: 'accepted', reconciled_at: new Date().toISOString() }); return false; }
-      save(deliveryFile, { ...previous, state: 'uncertain', action_required: 'No positive host receipt. Inspect recipient history before explicitly replaying; automatic replay is disabled.' }); return false;
+      const action = 'No positive host receipt. Inspect recipient history before explicitly replaying; automatic replay is disabled.';
+      if (previous.state !== 'uncertain' || previous.action_required !== action) {
+        save(deliveryFile, { ...previous, state: 'uncertain', action_required: action });
+      }
+      return false;
     }
     if (notificationPolicy(job, event, options.now ?? Date.now()) === 'silent') {
       save(deliveryFile, { ...previous, state: 'suppressed', event_id: event.event_id, reason: 'Routine event retained locally; no host/model wakeup.' }); return false;
@@ -183,16 +289,44 @@ async function deliverEvent(job, event, deliveryFile, send, options) {
 }
 async function deliver(broker, id, send, options = {}) {
   const job = broker.get(id), dir = path.dirname(broker.jobPath(id)); let events = notificationEvents(broker.jobPath(id));
-  const newer = fs.readdirSync(broker.jobs).filter(n => /^[a-f0-9]{24}$/.test(n) && n !== id).some(n => {
-    try { const next = read(broker.jobPath(n)); return next.topic_id === job.topic_id && next.conversation_id === job.conversation_id && next.created_at > job.created_at; } catch { return false; }
-  });
-  // An unacknowledged refusal cannot disappear merely because a later job exists.
-  const decisionRecorded = job.handoff?.requires_user_decision && fs.readdirSync(broker.jobs).filter(n => /^[a-f0-9]{24}$/.test(n)).some(n => {
-    try { const next = read(broker.jobPath(n)); return next.topic_id === job.topic_id && next.plan_decision?.refusal_job_id === id; } catch { return false; }
-  });
-  const executionResolved = job.execution_block && fs.readdirSync(broker.jobs).filter(n => /^[a-f0-9]{24}$/.test(n)).some(n => {
-    try { const next = read(broker.jobPath(n)); return next.topic_id === job.topic_id && next.execution_followup?.intent === 'resume_after_resolution' && next.execution_followup.blocked_job_ids?.includes(id); } catch { return false; }
-  });
+  // Fast exit before scanning sibling jobs when every event (or legacy notice) is already settled.
+  if (events.length) {
+    const hasPending = events.some(e => {
+      const f = e.file.replace(/\.json$/, '.delivery.json');
+      if (!fs.existsSync(f)) return true;
+      try { return !SETTLED_DELIVERY_STATES.has(read(f).state); } catch { return true; }
+    });
+    if (!hasPending) return false;
+  } else {
+    const noticeFile = path.join(dir, 'notice.json');
+    if (!fs.existsSync(noticeFile)) return false;
+    const legacyDelivery = path.join(dir, 'delivery.json');
+    if (fs.existsSync(legacyDelivery)) {
+      try { if (SETTLED_DELIVERY_STATES.has(read(legacyDelivery).state)) return false; } catch {}
+    }
+  }
+  let newer = false, decisionRecorded = false, executionResolved = false;
+  if (options.jobIndex) {
+    const index = options.jobIndex.sync();
+    for (const [otherId, meta] of index) {
+      if (meta.topic_id !== job.topic_id) continue;
+      if (!newer && otherId !== id && meta.conversation_id === job.conversation_id && meta.created_at > job.created_at) newer = true;
+      if (job.handoff?.requires_user_decision && !decisionRecorded && meta.refusal_job_id === id) decisionRecorded = true;
+      if (job.execution_block && !executionResolved && meta.resume_blocked_ids?.includes(id)) executionResolved = true;
+      if (newer && (!job.handoff?.requires_user_decision || decisionRecorded) && (!job.execution_block || executionResolved)) break;
+    }
+  } else {
+    const siblingIds = fs.readdirSync(broker.jobs).filter(n => /^[a-f0-9]{24}$/.test(n));
+    for (const n of siblingIds) {
+      let next;
+      try { next = read(broker.jobPath(n)); } catch { continue; }
+      if (next.topic_id !== job.topic_id) continue;
+      if (!newer && n !== id && next.conversation_id === job.conversation_id && next.created_at > job.created_at) newer = true;
+      if (job.handoff?.requires_user_decision && !decisionRecorded && next.plan_decision?.refusal_job_id === id) decisionRecorded = true;
+      if (job.execution_block && !executionResolved && next.execution_followup?.intent === 'resume_after_resolution' && next.execution_followup.blocked_job_ids?.includes(id)) executionResolved = true;
+      if (newer && (!job.handoff?.requires_user_decision || decisionRecorded) && (!job.execution_block || executionResolved)) break;
+    }
+  }
   if (newer && (!job.handoff?.requires_user_decision || decisionRecorded) && (!job.execution_block || executionResolved)) {
     for (const event of events.filter(e => !['notification_check', 'parallel_check', 'subagent_check'].includes(e.kind))) {
       const file = event.file.replace(/\.json$/, '.delivery.json');
@@ -291,22 +425,53 @@ function auditNotifications(broker, ids, options = {}) {
   return ledger;
 }
 function watch(broker, send, options = {}) {
-  const pending = new Set(), timers = new Map(), offsets = new Map(), known = new Set(), tracked = new Set(); let draining = false, closed = false, interval, watcher;
+  const pendingByRecipient = new Map(), recipientByJob = new Map(), timers = new Map(), offsets = new Map(), known = new Set(), tracked = new Set(), schema2Jobs = new Set(), orphanedPublished = new Set(); let draining = false, drainScheduled = false, reconcileTimer = null, closed = false, interval, watcher;
+  const jobIndex = createJobIndex(broker);
+  const deliverOptions = { ...options, jobIndex };
   // Delivery slots bound native API calls, not execution jobs. Serialize one
   // conversation while allowing other recipients past a slow or timed-out host.
   const inFlight = new Set(), deliveryConcurrency = 4;
   const healthFile = path.join(path.dirname(broker.jobs), 'notification-health.json');
   const health = { pid: process.pid, generation: options.generation || null, interval_ms: options.reconcileMs ?? 15000, last_delivery_at: null, watch_error: null };
   const heartbeat = () => { if (fs.existsSync(path.dirname(healthFile))) save(healthFile, { ...health, checked_at: new Date().toISOString(), tracked_jobs: tracked.size, closed }); };
+  const recipientOf = id => {
+    if (recipientByJob.has(id)) return recipientByJob.get(id);
+    const meta = jobIndex.entries.get(id);
+    if (meta && meta.conversation_id) { recipientByJob.set(id, meta.conversation_id); return meta.conversation_id; }
+    const recipient = broker.get(id).conversation_id || id;
+    recipientByJob.set(id, recipient);
+    return recipient;
+  };
+  const enqueue = id => {
+    if (closed) return;
+    let recipient;
+    try { recipient = recipientOf(id); }
+    catch (error) { process.stderr.write(`${id}: ${error.message}\n`); return; }
+    let bucket = pendingByRecipient.get(recipient);
+    if (!bucket) { bucket = new Set(); pendingByRecipient.set(recipient, bucket); }
+    bucket.add(id);
+  };
+  const scheduleDrain = () => {
+    if (closed || drainScheduled) return;
+    drainScheduled = true;
+    setImmediate(() => { drainScheduled = false; drain(); });
+  };
   const schedule = (id, delay = 300, urgent = false) => {
     if (closed) return;
     if (timers.has(id) && !urgent) return; // A busy log stream cannot postpone a progress event indefinitely.
     clearTimeout(timers.get(id));
-    timers.set(id, setTimeout(() => { timers.delete(id); pending.add(id); void drain(); }, delay));
+    timers.set(id, setTimeout(() => { timers.delete(id); enqueue(id); void drain(); }, delay));
   };
   const adaptLegacy = id => {
     const job = broker.get(id); if (!job.conversation_id) return;
-    if (job.status === 'orphaned') { publishNotification(broker.jobPath(id), job, 'orphaned-worker', 'execution_alert', '执行器进程已退出，但其后台子进程可能仍在运行。结果未知，需要核对进程归属与日志。'); return; }
+    if (job.notification_schema === 2) schema2Jobs.add(id);
+    if (job.status === 'orphaned') {
+      if (!orphanedPublished.has(id)) {
+        publishNotification(broker.jobPath(id), job, 'orphaned-worker', 'execution_alert', '执行器进程已退出，但其后台子进程可能仍在运行。结果未知，需要核对进程归属与日志。');
+        orphanedPublished.add(id);
+      }
+      return;
+    }
     if (job.notification_schema === 2) {
       // A worker crash can persist a terminal state without ever running its finalizer.
       if (terminal.has(job.status) && !notificationEvents(broker.jobPath(id)).some(e => e.kind === 'terminal')) publishNotification(broker.jobPath(id), job, 'terminal', 'terminal', job.error || '执行轮次已结束，请核对原回执与业务验收。');
@@ -328,12 +493,13 @@ function watch(broker, send, options = {}) {
   const deliverOne = async id => {
     try {
       adaptLegacy(id);
-      if (await deliver(broker, id, send, options)) health.last_delivery_at = new Date().toISOString();
+      if (await deliver(broker, id, send, deliverOptions)) health.last_delivery_at = new Date().toISOString();
       const job = broker.get(id), rows = notificationEvents(broker.jobPath(id));
+      if (job.notification_schema === 2) schema2Jobs.add(id);
       // Worker status is saved before its terminal outbox event. Do not retire
       // that job in the gap, or a lost final callback will bypass reconciliation.
       const settled = terminal.has(job.status) && ((job.notification_schema !== 2 && rows.length === 0) || rows.some(e => e.kind === 'terminal')) && rows.every(e => {
-        const f = e.file.replace(/\.json$/, '.delivery.json'); return fs.existsSync(f) && ['sent', 'accepted', 'superseded', 'suppressed'].includes(read(f).state);
+        const f = e.file.replace(/\.json$/, '.delivery.json'); return fs.existsSync(f) && SETTLED_DELIVERY_STATES.has(read(f).state);
       });
       if (settled) tracked.delete(id); else tracked.add(id);
     }
@@ -347,15 +513,16 @@ function watch(broker, send, options = {}) {
     if (draining || closed) return;
     draining = true;
     try {
-      for (const id of pending) {
+      for (const [recipient, bucket] of pendingByRecipient) {
         if (closed || (options.owns && !options.owns())) { close(); break; }
         if (inFlight.size >= deliveryConcurrency) break;
-        let recipient;
-        try { recipient = broker.get(id).conversation_id || id; }
-        catch (error) { pending.delete(id); process.stderr.write(`${id}: ${error.message}\n`); continue; }
         if (inFlight.has(recipient)) continue;
-        pending.delete(id); inFlight.add(recipient);
-        void deliverOne(id).finally(() => { inFlight.delete(recipient); drain(); });
+        const id = bucket.values().next().value;
+        if (!id) { pendingByRecipient.delete(recipient); continue; }
+        bucket.delete(id);
+        if (bucket.size === 0) pendingByRecipient.delete(recipient);
+        inFlight.add(recipient);
+        void deliverOne(id).finally(() => { inFlight.delete(recipient); scheduleDrain(); });
       }
     } finally { draining = false; }
   };
@@ -371,14 +538,22 @@ function watch(broker, send, options = {}) {
       if (fs.existsSync(alertFile)) for (const g of Object.values(read(alertFile).groups)) if (g.state === 'open') for (const id of g.jobs) ids.add(id);
       const ledger = auditNotifications(broker, ids, options);
       for (const g of Object.values(ledger.groups)) if (g.state === 'open') ids.add(g.alert_job_id);
-      for (const id of ids) { tracked.add(id); pending.add(id); }
+      for (const id of ids) { tracked.add(id); enqueue(id); }
       heartbeat(); void drain();
     } catch (error) { health.watch_error = error.message; heartbeat(); process.stderr.write(`Local reconciliation: ${error.message}\n`); }
   };
+  const scheduleReconcile = () => {
+    if (closed || reconcileTimer) return;
+    const delay = Math.min(500, Math.max(50, Math.floor(health.interval_ms / 4)));
+    reconcileTimer = setTimeout(() => { reconcileTimer = null; reconcile(); }, delay);
+  };
   const onChange = (_event, name) => {
-    if (!name) { reconcile(); return; }
+    if (!name) { scheduleReconcile(); return; }
     const parts = String(name).split(/[\\/]/);
     if (/^[a-f0-9]{24}$/.test(parts[0]) && ((parts.length === 2 && ['notice.json', 'job.json', 'events.jsonl'].includes(parts[1])) || (parts.length === 3 && parts[1] === 'notifications' && /^\d{8}\.json$/.test(parts[2])))) {
+      if (parts.length === 2 && parts[1] === 'job.json') { jobIndex.invalidate(parts[0]); recipientByJob.delete(parts[0]); }
+      // Modern schema-2 jobs emit explicit outbox files under notifications/ and do not consume events.jsonl.
+      if (parts.length === 2 && parts[1] === 'events.jsonl' && schema2Jobs.has(parts[0])) return;
       known.add(parts[0]); tracked.add(parts[0]);
       let urgent = parts[1] === 'notice.json';
       if (parts[1] === 'notifications') { try { urgent = read(path.join(broker.jobs, String(name))).kind === 'terminal'; } catch {} }
@@ -402,8 +577,8 @@ function watch(broker, send, options = {}) {
   };
   attachWatch();
   // Subscribe before recovery scan, so completion during startup cannot be missed.
-  for (const name of fs.readdirSync(broker.jobs)) if (/^[a-f0-9]{24}$/.test(name)) { known.add(name); tracked.add(name); pending.add(name); }
-  const close = () => { if (closed) return; closed = true; watcher?.close(); watcher = null; clearInterval(interval); for (const timer of timers.values()) clearTimeout(timer); timers.clear(); heartbeat(); };
+  for (const name of fs.readdirSync(broker.jobs)) if (/^[a-f0-9]{24}$/.test(name)) { known.add(name); tracked.add(name); enqueue(name); }
+  const close = () => { if (closed) return; closed = true; watcher?.close(); watcher = null; clearInterval(interval); if (reconcileTimer) { clearTimeout(reconcileTimer); reconcileTimer = null; } for (const timer of timers.values()) clearTimeout(timer); timers.clear(); heartbeat(); };
   interval = setInterval(reconcile, health.interval_ms);
   heartbeat(); void drain(); return { close, reconcile };
 }
@@ -525,7 +700,7 @@ function startQuotaSyncLoop(broker, options = {}) {
   timer.unref?.();
   return { close, tick };
 }
-module.exports = { originHook, contextHook, postToolHook, deliver, watch, startQuotaSyncLoop, notifyAgyHealthIfNeeded, notifyAgyQuotaUsageIfNeeded, nativeSend, agentCall, recordedReceipt, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
+module.exports = { originHook, contextHook, postToolHook, deliver, watch, startQuotaSyncLoop, notifyAgyHealthIfNeeded, notifyAgyQuotaUsageIfNeeded, nativeSend, agentCall, recordedReceipt, createReceiptCache, createJobIndex, claimHost, eventMessage, notificationPolicy, notificationHeading, auditNotifications };
 if (require.main === module) {
   if (['--origin-hook', '--context-hook', '--post-tool-hook'].includes(process.argv[2])) {
     const mode = process.argv[2];
@@ -557,7 +732,8 @@ if (require.main === module) {
       const generation = crypto.createHash('sha256').update(process.env.ANTIGRAVITY_LS_ADDRESS + '|' + (process.env.CODEX_EXECUTOR_BUILD || '')).digest('hex');
       const owner = claimHost(settings.data, generation);
       const eventDirectory = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR ? path.resolve(process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR, '../events') : null;
-      const watchers = projects.map(p => watch(new Broker(p), (recipient, message) => nativeSend(executable, recipient, message), { generation, owns: owner.owns, reconcile: event => recordedReceipt(eventDirectory, event) }));
+      const receiptCache = createReceiptCache();
+      const watchers = projects.map(p => watch(new Broker(p), (recipient, message) => nativeSend(executable, recipient, message), { generation, owns: owner.owns, reconcile: event => recordedReceipt(eventDirectory, event, receiptCache) }));
       const quotaSync = projects[0] ? startQuotaSyncLoop(new Broker(projects[0]), { owns: owner.owns }) : null;
       save(path.join(settings.data, 'notification-host.json'), { ...owner.host, projects: projects.map(p => p.project), watcher_count: watchers.length, shared_quota_sync: Boolean(quotaSync) });
       const ownership = fs.watch(settings.data, (_event, name) => { if (String(name) === 'notification-host.json' && !owner.owns()) { quotaSync?.close(); for (const w of watchers) w.close(); ownership.close(); } });

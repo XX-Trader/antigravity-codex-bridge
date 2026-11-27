@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { Broker, save, read, publishNotification, notificationEvents, notificationSummary, commandPhase, dispatch, finalHandoff, executionBlock, takeFileClaim } = require('../src/server.cjs');
-const { deliver, watch, claimHost, recordedReceipt, nativeSend, eventMessage, notificationPolicy, notificationHeading, auditNotifications } = require('../src/notifier.cjs');
+const { deliver, watch, claimHost, recordedReceipt, createReceiptCache, createJobIndex, nativeSend, eventMessage, notificationPolicy, notificationHeading, auditNotifications } = require('../src/notifier.cjs');
 const chat = '11111111-1111-1111-1111-111111111111';
 const id = 'aaaaaaaaaaaaaaaaaaaaaaaa';
 
@@ -691,4 +691,82 @@ test('a temporarily locked result is a known pre-send failure and retries withou
   assert.equal(sends, 0); assert.equal(notificationSummary(f.file).latest.state, 'not_sent');
   await deliver(f.broker, id, async (_, message) => { sends++; assert.match(message, /收藏事务修复/); return {}; });
   assert.equal(sends, 1); assert.equal(notificationSummary(f.file).latest.state, 'accepted');
+});
+
+test('deliver fast-exits on settled jobs, caches job index, and recordedReceipt indexes host events incrementally', async t => {
+  const f = fixture(t, 'completed'), event = f.emit('terminal', 'terminal');
+  // Seed 25 sibling historical jobs so any O(N^2) rescan is immediately caught by read counter.
+  for (let i = 0; i < 25; i++) {
+    const sid = i.toString(16).padStart(24, 'b');
+    fs.mkdirSync(path.dirname(f.broker.jobPath(sid)), { recursive: true });
+    save(f.broker.jobPath(sid), { ...f.job, job_id: sid, topic_id: sid, created_at: '2026-10-01T00:00:00.000Z' });
+  }
+  const jobIndex = createJobIndex(f.broker);
+  await deliver(f.broker, id, async () => ({}), { jobIndex });
+  assert.equal(notificationSummary(f.file).latest.state, 'accepted');
+
+  // Once settled, subsequent deliver() calls MUST NOT re-read sibling job.json files at all.
+  const origRead = fs.readFileSync;
+  let siblingReads = 0;
+  fs.readFileSync = (file, ...args) => {
+    if (/b{20,}[0-9a-f]+[\\/]job\.json$/i.test(String(file))) siblingReads++;
+    return origRead(file, ...args);
+  };
+  t.after(() => { fs.readFileSync = origRead; });
+  assert.equal(await deliver(f.broker, id, async () => ({}), { jobIndex }), false);
+  assert.equal(siblingReads, 0, 'Settled jobs must fast-exit without scanning sibling jobs');
+
+  // Incremental receipt cache: parse once, skip unchanged files, retry partial writes once completed.
+  const receipts = path.join(f.root, 'receipts-inc');
+  fs.mkdirSync(receipts);
+  for (let i = 0; i < 15; i++) {
+    save(path.join(receipts, `other-${i}.json`), { error: '', payload: { sendMessage: { recipientId: '33333333-3333-3333-3333-333333333333', content: 'unrelated' } } });
+  }
+  fs.writeFileSync(path.join(receipts, 'partial.json'), '{"incomplete":', 'utf8');
+  const receiptCache = createReceiptCache();
+  assert.equal(recordedReceipt(receipts, event, receiptCache), false);
+  assert.equal(receiptCache.hasUnparsed, true);
+
+  let receiptReads = 0;
+  fs.readFileSync = (file, ...args) => {
+    if (String(file).startsWith(receipts)) receiptReads++;
+    return origRead(file, ...args);
+  };
+  // Finish writing partial.json with matching receipt (even without changing directory mtime)
+  save(path.join(receipts, 'partial.json'), { error: '', payload: { sendMessage: { recipientId: chat, content: eventMessage(f.job, event) } } });
+  assert.equal(recordedReceipt(receipts, event, receiptCache), true);
+  assert.equal(receiptReads, 1, 'Only the previously unparsed file should be read');
+  assert.equal(receiptCache.hasUnparsed, false);
+
+  receiptReads = 0;
+  assert.equal(recordedReceipt(receipts, event, receiptCache), true);
+  assert.equal(receiptReads, 0, 'Unchanged receipt directory must be answered from memory with zero disk reads');
+});
+
+test('broker.get on already-orphaned job does not rewrite job.json or trigger fs.watch feedback loop', async t => {
+  const f = fixture(t);
+  save(f.file, { ...f.job, status: 'orphaned', background_wait: { id: 'bg-1' }, worker_pid: 2147483647, created_at: new Date(Date.now() - 60000).toISOString(), error: 'Worker exited during owned background wait; preserve registration and session, never replay the command' });
+  const origWrite = fs.writeFileSync;
+  let jobWrites = 0;
+  fs.writeFileSync = (file, ...args) => {
+    if (String(file).includes('job.json')) jobWrites++;
+    return origWrite(file, ...args);
+  };
+  t.after(() => { fs.writeFileSync = origWrite; });
+  assert.equal(f.broker.get(id).status, 'orphaned');
+  assert.equal(f.broker.get(id).status, 'orphaned');
+  assert.equal(jobWrites, 0, 'Repeated broker.get() on an already-orphaned job must never rewrite job.json');
+});
+
+test('deliverEvent on already-uncertain event performs zero claim or disk writes when unreconciled', async t => {
+  const f = fixture(t, 'completed'), event = f.emit('terminal', 'terminal');
+  const dfile = event.file.replace(/\.json$/, '.delivery.json');
+  save(dfile, { state: 'uncertain', event_id: event.event_id, action_required: 'No positive host receipt. Inspect recipient history before explicitly replaying; automatic replay is disabled.' });
+  const origWrite = fs.writeFileSync, origMkdir = fs.mkdirSync;
+  let diskMut = 0;
+  fs.writeFileSync = (p, ...a) => { if (String(p).includes(path.dirname(dfile))) diskMut++; return origWrite(p, ...a); };
+  fs.mkdirSync = (p, ...a) => { if (String(p).includes(path.dirname(dfile))) diskMut++; return origMkdir(p, ...a); };
+  t.after(() => { fs.writeFileSync = origWrite; fs.mkdirSync = origMkdir; });
+  assert.equal(await deliver(f.broker, id, async () => { throw Error('must not send'); }, { reconcile: async () => false }), false);
+  assert.equal(diskMut, 0, 'Already-uncertain event must not create .claim or rewrite delivery.json when still unreconciled');
 });
