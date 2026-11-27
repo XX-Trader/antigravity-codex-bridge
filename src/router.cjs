@@ -349,7 +349,7 @@ class ProjectRouter {
   }
   forInput(input) {
     let matches = [];
-    if (input.topic_id) matches = this.brokers.filter(b => b.listRaw().some(j => j.topic_id === input.topic_id));
+    if (input.topic_id) matches = this.brokers.filter(b => b.listIndex().some(j => j.topic_id === input.topic_id));
     else if (input.session_id && !input.cwd) matches = this.brokers.filter(b => b.knownSessions().some(s => s.session_id === input.session_id));
     if (matches.length > 1) throw new Error('Ambiguous cross-project matter/session');
     const owner = matches[0];

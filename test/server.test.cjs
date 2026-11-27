@@ -1070,5 +1070,111 @@ test('worker timeout diagnostics', async t => {
       const stderrLog = fs.readFileSync(path.join(jobDir, 'stderr.log'), 'utf8');
       assert.match(stderrLog, /notification persistence: Notification publisher busy/);
     });
+    await t.test('persistent snapshot + WAL index eliminates repeated reads, handles legacy dirs, corrupt index and reboot recovery', () => {
+      const { findRecentCodexReview } = require('../src/agy-guard.cjs');
+      const crypto = require('node:crypto');
+      const idxData = fs.mkdtempSync(path.join(root, 'idx-'));
+      const jobsDir = path.join(idxData, 'jobs');
+      fs.mkdirSync(jobsDir, { recursive: true });
+      const oldIso = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      const ids = [];
+      // 1. Legacy directory with NO jobs-index.json (raw fs.writeFileSync simulating old data)
+      for (let i = 0; i < 8; i++) {
+        const id = crypto.randomBytes(12).toString('hex');
+        ids.push(id);
+        const jdir = path.join(jobsDir, id);
+        fs.mkdirSync(jdir, { recursive: true });
+        fs.writeFileSync(path.join(jdir, 'job.json'), JSON.stringify({
+          job_id: id, status: 'completed', created_at: oldIso, ended_at: oldIso,
+          cwd: project, sandbox: 'danger-full-access', topic_id: id,
+          thread_id: `10000000-0000-0000-0000-00000000000${i}`, topic: `legacy ${i}`,
+          plan_review: i === 0 ? { status: 'approved', reviewed_at: new Date().toISOString(), allowed_scope: ['src'], reason: 'ok' } : undefined,
+          settings
+        }));
+      }
+      const b1 = new Broker({ ...settings, data: idxData });
+      const cold = b1.listIndex();
+      assert.equal(cold.length, 8);
+      assert.equal(fs.existsSync(b1.indexFile), true, 'cold scan of legacy dir creates jobs-index.json');
+
+      // 2. Warm read (same broker AND brand-new broker process) must read ZERO old terminal job.json files
+      const origReadFileSync = fs.readFileSync;
+      let jobReads = 0;
+      fs.readFileSync = (...args) => {
+        if (String(args[0]).endsWith(path.sep + 'job.json')) jobReads++;
+        return origReadFileSync(...args);
+      };
+      try {
+        assert.equal(b1.listIndex().length, 8);
+        assert.equal(jobReads, 0, 'warm in-process listIndex reads 0 old job.json files');
+        const b2 = new Broker({ ...settings, data: idxData });
+        assert.equal(b2.listIndex().length, 8);
+        assert.equal(b2.knownSessions().length, 8);
+        assert.equal(jobReads, 0, 'cold new Broker process reads snapshot only, 0 old job.json files');
+      } finally {
+        fs.readFileSync = origReadFileSync;
+      }
+
+      // 3. O(1) WAL append via save() is picked up incrementally without re-reading old terminal jobs
+      const newId = crypto.randomBytes(12).toString('hex');
+      fs.mkdirSync(path.join(jobsDir, newId), { recursive: true });
+      save(path.join(jobsDir, newId, 'job.json'), {
+        job_id: newId, status: 'completed', created_at: oldIso, ended_at: oldIso,
+        cwd: project, sandbox: 'danger-full-access', topic_id: newId,
+        thread_id: '20000000-0000-0000-0000-000000000001', topic: 'wal-appended', settings
+      });
+      assert.equal(fs.existsSync(b1.indexWalFile), true);
+      let walJobReads = 0;
+      fs.readFileSync = (...args) => {
+        if (String(args[0]).endsWith(path.sep + 'job.json')) walJobReads++;
+        return origReadFileSync(...args);
+      };
+      try {
+        const b3 = new Broker({ ...settings, data: idxData });
+        const afterWal = b3.listIndex();
+        assert.equal(afterWal.length, 9);
+        assert.ok(afterWal.some(e => e.job_id === newId && e.topic === 'wal-appended'));
+        assert.equal(walJobReads, 0, 'WAL replay avoids reading any job.json');
+      } finally {
+        fs.readFileSync = origReadFileSync;
+      }
+
+      // 4. agy-guard findRecentCodexReview uses jobs-index.json fast-path
+      const recentReview = findRecentCodexReview({ project, data: idxData }, 12, null, Date.now());
+      assert.equal(recentReview?.job_id, ids[0]);
+
+      // 5. Sudden reboot/crash simulation: corrupt snapshot + truncated trailing WAL line + active dead-PID job with lease
+      const deadId = crypto.randomBytes(12).toString('hex');
+      fs.mkdirSync(path.join(jobsDir, deadId), { recursive: true });
+      fs.mkdirSync(b1.lock, { recursive: true });
+      fs.writeFileSync(path.join(b1.lock, `${deadId}.json`), JSON.stringify({ job_id: deadId, worker_pid: 99999999 }));
+      fs.writeFileSync(path.join(jobsDir, deadId, 'job.json'), JSON.stringify({
+        job_id: deadId, status: 'running', worker_pid: 99999999,
+        created_at: new Date(Date.now() - 120000).toISOString(),
+        cwd: project, sandbox: 'danger-full-access', topic_id: deadId, settings
+      }));
+      fs.writeFileSync(b1.indexFile, '{corrupt-truncated-json', 'utf8');
+      fs.writeFileSync(b1.indexWalFile, '{"job_id":"partial-line-no-newline', 'utf8');
+      fs.writeFileSync(b1.indexCompactingWalFile, JSON.stringify({ job_id: ids[0], status: 'completed', created_at: oldIso, mtime_ms: 1 }) + '\n', 'utf8');
+
+      const bReboot = new Broker({ ...settings, data: idxData });
+      const recovered = bReboot.listIndex();
+      assert.equal(recovered.length, 10);
+      const deadEntry = recovered.find(e => e.job_id === deadId);
+      assert.equal(deadEntry.status, 'failed', 'rebooted dead worker recovered to failed');
+      assert.equal(fs.existsSync(path.join(bReboot.lock, `${deadId}.json`)), false, 'stale lease released on reboot recovery');
+      assert.equal(fs.existsSync(bReboot.indexCompactingWalFile), false, 'leftover compacting WAL cleaned up');
+      assert.equal(JSON.parse(fs.readFileSync(bReboot.indexFile, 'utf8')).schema, 1, 'corrupt snapshot self-healed');
+
+      // 6. Deleted job dir is pruned & rebuildIndex() catches external raw edits on old jobs
+      fs.rmSync(path.join(jobsDir, ids[1]), { recursive: true, force: true });
+      assert.equal(bReboot.listIndex().length, 9);
+      fs.writeFileSync(path.join(jobsDir, ids[2], 'job.json'), JSON.stringify({
+        job_id: ids[2], status: 'completed', created_at: oldIso, ended_at: oldIso,
+        cwd: project, sandbox: 'danger-full-access', topic_id: ids[2], topic: 'manually-edited', settings
+      }));
+      const rebuilt = bReboot.rebuildIndex();
+      assert.equal(rebuilt.find(e => e.job_id === ids[2]).topic, 'manually-edited');
+    });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

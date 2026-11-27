@@ -121,21 +121,67 @@ function findRecentCodexReview(scope, validHours = 12, conversationId = null, no
   const jobsDir = path.join(dataRoot, 'jobs');
   if (!fs.existsSync(jobsDir)) return null;
   const cutoffMs = nowMs - validHours * 3600 * 1000;
-  let dirs = [];
-  try {
-    dirs = fs.readdirSync(jobsDir, { withFileTypes: true })
-      .filter(d => d.isDirectory() && /^[a-f0-9]{24}$/.test(d.name))
-      .map(d => {
-        const jobFile = path.join(jobsDir, d.name, 'job.json');
-        try {
-          const st = fs.statSync(jobFile);
-          return st.isFile() && st.mtimeMs >= cutoffMs ? { id: d.name, jobFile, mtimeMs: st.mtimeMs } : null;
-        } catch { return null; }
-      })
-      .filter(Boolean)
-      .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      .slice(0, 30);
-  } catch { return null; }
+  let dirs = null;
+
+  // Fast incremental path: when Broker's persistent jobs-index.json exists, avoid statSync across hundreds of job dirs.
+  const indexFile = path.join(dataRoot, 'jobs-index.json');
+  if (fs.existsSync(indexFile)) {
+    try {
+      const doc = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+      if (doc?.schema === 1 && doc.jobs && typeof doc.jobs === 'object') {
+        const merged = new Map(Object.entries(doc.jobs));
+        for (const walName of ['jobs-index.wal.compacting', 'jobs-index.wal.jsonl']) {
+          const walFile = path.join(dataRoot, walName);
+          if (!fs.existsSync(walFile)) continue;
+          for (const line of fs.readFileSync(walFile, 'utf8').split(/\r?\n/)) {
+            if (!line) continue;
+            try {
+              const entry = JSON.parse(line);
+              if (entry?.job_id) merged.set(entry.job_id, entry);
+            } catch {}
+          }
+        }
+        dirs = [...merged.values()]
+          .filter(e => e?.plan_review_status === 'approved')
+          .map(e => {
+            const ts = Date.parse(e.plan_review_at || e.ended_at || e.created_at || '');
+            const mtimeMs = Number.isFinite(ts) ? ts : (e.mtime_ms || 0);
+            return mtimeMs >= cutoffMs ? { id: e.job_id, jobFile: path.join(jobsDir, e.job_id, 'job.json'), mtimeMs } : null;
+          })
+          .filter(Boolean)
+          .sort((a, b) => b.mtimeMs - a.mtimeMs)
+          .slice(0, 30);
+        const walPath = path.join(dataRoot, 'jobs-index.wal.jsonl');
+        const indexMtime = Math.max(
+          fs.statSync(indexFile).mtimeMs,
+          fs.existsSync(walPath) ? fs.statSync(walPath).mtimeMs : 0
+        );
+        const jobsDirMtime = fs.statSync(jobsDir).mtimeMs;
+        if (dirs.length > 0 || jobsDirMtime <= indexMtime + 50) {
+          // Index + WAL is up-to-date (or already found a valid approved review).
+        } else {
+          dirs = null;
+        }
+      }
+    } catch { dirs = null; }
+  }
+
+  if (!dirs) {
+    try {
+      dirs = fs.readdirSync(jobsDir, { withFileTypes: true })
+        .filter(d => d.isDirectory() && /^[a-f0-9]{24}$/.test(d.name))
+        .map(d => {
+          const jobFile = path.join(jobsDir, d.name, 'job.json');
+          try {
+            const st = fs.statSync(jobFile);
+            return st.isFile() && st.mtimeMs >= cutoffMs ? { id: d.name, jobFile, mtimeMs: st.mtimeMs } : null;
+          } catch { return null; }
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.mtimeMs - a.mtimeMs)
+        .slice(0, 30);
+    } catch { return null; }
+  }
 
   let bestOther = null;
   for (const item of dirs) {
