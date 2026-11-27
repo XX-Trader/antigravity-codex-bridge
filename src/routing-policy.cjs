@@ -143,6 +143,7 @@ function defaultPolicy() {
     agy_quota_hint: 'normal',
     agy_manual_snapshot: null,
     agy_quota_command: null,
+    agy_probe_home: null,
     cache_ttl_seconds: 300,
     cooldowns: { codex: null, agy: null },
     updated_at: null
@@ -326,6 +327,12 @@ function parsePolicy(raw) {
   if (Array.isArray(raw.agy_quota_command) && raw.agy_quota_command.length > 0 && raw.agy_quota_command.every(v => typeof v === 'string' && v.trim())) {
     policy.agy_quota_command = raw.agy_quota_command.slice(0, 16);
   }
+  if (typeof raw.agy_probe_home === 'string' && raw.agy_probe_home.trim()) {
+    const candidate = path.resolve(raw.agy_probe_home.trim());
+    if (path.isAbsolute(candidate) && /^[\x20-\x7e]+$/.test(candidate)) {
+      policy.agy_probe_home = candidate;
+    }
+  }
   if (typeof raw.cache_ttl_seconds === 'number' && Number.isFinite(raw.cache_ttl_seconds) && raw.cache_ttl_seconds >= 0 && raw.cache_ttl_seconds <= 3600) {
     policy.cache_ttl_seconds = Math.floor(raw.cache_ttl_seconds);
   }
@@ -468,6 +475,7 @@ function resolveProjectPolicy(policy, projectScope) {
     agy_quota_hint: base.agy_quota_hint,
     agy_manual_snapshot: base.agy_manual_snapshot ? { ...base.agy_manual_snapshot } : null,
     agy_quota_command: base.agy_quota_command,
+    agy_probe_home: base.agy_probe_home,
     cache_ttl_seconds: base.cache_ttl_seconds,
     cooldowns: { ...base.cooldowns }
   };
@@ -1647,7 +1655,16 @@ function runExternalAgyProbeAsync(command, options = {}) {
   });
 }
 
-function defaultAgyProbeHome() {
+function defaultAgyProbeHome(options = {}) {
+  const configured = options?.probeHomeDir
+    || options?.projectPolicy?.agy_probe_home
+    || options?.policy?.agy_probe_home
+    || process.env.CODEX_EXECUTOR_AGY_PROBE_HOME
+    || null;
+  if (typeof configured === 'string' && configured.trim()) {
+    const resolved = path.resolve(configured.trim());
+    if (path.isAbsolute(resolved) && /^[\x20-\x7e]+$/.test(resolved)) return resolved;
+  }
   const candidates = [
     process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'agy', 'probe-home') : null,
     path.join(os.tmpdir(), 'agy-probe-home'),
@@ -1656,7 +1673,53 @@ function defaultAgyProbeHome() {
   return candidates.find(p => /^[\x20-\x7e]+$/.test(p)) || candidates[0];
 }
 
-function prepareSilentAgyProbeHome(probeHome, nowMs = Date.now()) {
+function rotateAgyProbeLogs(probeHome, options = {}) {
+  const maxLogs = Number.isInteger(options.maxLogs) && options.maxLogs >= 1 ? options.maxLogs : 10;
+  const nowMs = options.nowMs ?? Date.now();
+  const dryRun = options.dryRun === true;
+  let pruned = 0;
+  let freedBytes = 0;
+  if (!probeHome || !fs.existsSync(probeHome)) return { pruned, freed_bytes: freedBytes };
+
+  // 1. Rotate `antigravity-cli/log/cli-*.log` keeping the newest `maxLogs` files.
+  const logDir = path.join(probeHome, 'antigravity-cli', 'log');
+  if (fs.existsSync(logDir)) {
+    try {
+      const logs = fs.readdirSync(logDir, { withFileTypes: true })
+        .filter(e => e.isFile() && /^cli-.*\.log$/i.test(e.name))
+        .map(e => {
+          const p = path.join(logDir, e.name);
+          const st = fs.statSync(p);
+          return { p, mtimeMs: st.mtimeMs, size: st.size };
+        })
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+      for (const item of logs.slice(maxLogs)) {
+        pruned += 1;
+        freedBytes += item.size;
+        if (!dryRun) { try { fs.unlinkSync(item.p); } catch {} }
+      }
+    } catch {}
+  }
+
+  // 2. Clean orphaned temporary `probe-cli-*.log` / `login-cli-*.log` / `oauth-intercept-*.flag` older than 1 hour.
+  try {
+    for (const e of fs.readdirSync(probeHome, { withFileTypes: true })) {
+      if (!e.isFile()) continue;
+      if (!/^(?:probe-cli-|login-cli-|oauth-intercept-|pool-oauth-intercept-)/i.test(e.name)) continue;
+      const p = path.join(probeHome, e.name);
+      const st = fs.statSync(p);
+      if (nowMs - st.mtimeMs > 3600 * 1000) {
+        pruned += 1;
+        freedBytes += st.size;
+        if (!dryRun) { try { fs.unlinkSync(p); } catch {} }
+      }
+    }
+  } catch {}
+
+  return { pruned, freed_bytes: freedBytes };
+}
+
+function prepareSilentAgyProbeHome(probeHome, nowMs = Date.now(), options = {}) {
   if (!probeHome) return { noBrowserBinDir: null };
   let noBrowserBinDir = null;
   try {
@@ -1668,7 +1731,10 @@ function prepareSilentAgyProbeHome(probeHome, nowMs = Date.now()) {
     if (!fs.existsSync(tsFile)) fs.writeFileSync(tsFile, '', 'utf8');
     else fs.utimesSync(tsFile, nowDate, nowDate);
 
-    // 2. Install private PATH shim to block `agy.exe` (`printmode.go:433` -> `rundll32 url.dll,FileProtocolHandler`)
+    // 2. Rotate old `cli-*.log` files so probe-home stays bounded on disk.
+    rotateAgyProbeLogs(probeHome, { maxLogs: options.maxLogs ?? 10, nowMs });
+
+    // 3. Install private PATH shim to block `agy.exe` (`printmode.go:433` -> `rundll32 url.dll,FileProtocolHandler`)
     //    from ever opening the user's web browser when hourly token refresh takes >10s!
     noBrowserBinDir = path.join(probeHome, 'no-browser-bin');
     fs.mkdirSync(noBrowserBinDir, { recursive: true });
@@ -1714,7 +1780,7 @@ async function probeAgyQuotaAsync(projectPolicy, options = {}) {
   }
   const agyBin = resolveRealAgyBin(options);
   if (!agyBin) return null;
-  const probeHome = options.probeHomeDir || defaultAgyProbeHome();
+  const probeHome = options.probeHomeDir || defaultAgyProbeHome({ projectPolicy });
   const { noBrowserBinDir } = prepareSilentAgyProbeHome(probeHome, options.nowMs);
   const runOnce = attempt => {
     const stamp = `${process.pid}-${Date.now()}-${attempt}`;
@@ -1746,7 +1812,7 @@ async function runAgyInteractiveLoginAsync(options = {}) {
       error: '未找到本机官方 agy CLI（%LOCALAPPDATA%\\agy\\bin\\agy.exe），也可直接在 CC Switch 中完成 Antigravity 账号授权。'
     };
   }
-  const probeHome = options.probeHomeDir || defaultAgyProbeHome();
+  const probeHome = options.probeHomeDir || defaultAgyProbeHome({ projectPolicy: options.projectPolicy, policy: options.policy });
   prepareSilentAgyProbeHome(probeHome, options.nowMs);
   const logFile = path.join(probeHome, `login-cli-${process.pid}-${Date.now()}.log`);
   const cmdPrefix = Array.isArray(agyBin) ? agyBin : [agyBin];
@@ -1939,7 +2005,7 @@ async function runAgyPoolTaskAsync(options = {}) {
     };
   }
 
-  const probeHome = options.probeHomeDir || defaultAgyProbeHome();
+  const probeHome = options.probeHomeDir || defaultAgyProbeHome({ projectPolicy });
   const { noBrowserBinDir } = prepareSilentAgyProbeHome(probeHome, nowMs);
   const cliArgs = [
     `--gemini_dir=${probeHome}`,
@@ -2964,6 +3030,161 @@ function resolveSharedQuotaSnapshot(scope, projectPolicy, options = {}) {
   }
 }
 
+const SAFE_PRUNE_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'timed_out']);
+const DELIVERED_NOTICE_STATES = new Set(['accepted', 'sent', 'superseded', 'suppressed']);
+
+function pruneBridgeRuntimeCache(options = {}) {
+  const nowMs = options.nowMs ?? Date.now();
+  const apply = options.apply === true;
+  const olderThanDays = typeof options.olderThanDays === 'number' && Number.isFinite(options.olderThanDays) && options.olderThanDays >= 0
+    ? options.olderThanDays
+    : 7;
+  const keepProbeLogs = Number.isInteger(options.keepProbeLogs) && options.keepProbeLogs >= 1 ? options.keepProbeLogs : 10;
+  const cutoffMs = nowMs - olderThanDays * 24 * 3600 * 1000;
+  const dataRoots = [...new Set((options.dataRoots || []).filter(d => typeof d === 'string' && d.trim()).map(d => path.resolve(d)))];
+
+  let scannedJobs = 0;
+  let eligibleJobs = 0;
+  let skippedActiveOrRecent = 0;
+  let candidateFiles = 0;
+  let freedBytes = 0;
+  const byCategory = {
+    events_jsonl: { files: 0, bytes: 0 },
+    attempt_results: { files: 0, bytes: 0 },
+    delivered_notifications: { files: 0, bytes: 0 },
+    finished_background_logs: { files: 0, bytes: 0 },
+    probe_logs: { files: 0, bytes: 0 }
+  };
+
+  const recordCandidate = (category, filePath, size) => {
+    candidateFiles += 1;
+    freedBytes += size;
+    byCategory[category].files += 1;
+    byCategory[category].bytes += size;
+    if (apply) {
+      try { fs.unlinkSync(filePath); } catch {}
+    }
+  };
+
+  for (const dataRoot of dataRoots) {
+    const jobsDir = path.join(dataRoot, 'jobs');
+    const activeDir = path.join(dataRoot, 'active-tasks');
+    if (!fs.existsSync(jobsDir)) continue;
+    let jobIds = [];
+    try { jobIds = fs.readdirSync(jobsDir).filter(n => /^[a-f0-9]{24}$/.test(n)); } catch { continue; }
+    for (const id of jobIds) {
+      scannedJobs += 1;
+      const jobDir = path.join(jobsDir, id);
+      const jobFile = path.join(jobDir, 'job.json');
+      if (!fs.existsSync(jobFile)) { skippedActiveOrRecent += 1; continue; }
+      if (fs.existsSync(path.join(activeDir, `${id}.json`))) { skippedActiveOrRecent += 1; continue; }
+      let job;
+      let jobStat;
+      try {
+        jobStat = fs.statSync(jobFile);
+        job = JSON.parse(fs.readFileSync(jobFile, 'utf8'));
+      } catch {
+        skippedActiveOrRecent += 1;
+        continue;
+      }
+      const refMs = Date.parse(job.ended_at || job.updated_at || '') || jobStat.mtimeMs;
+      if (
+        !SAFE_PRUNE_TERMINAL_STATUSES.has(job.status)
+        || job.background_wait
+        || job.handoff?.requires_user_decision
+        || job.execution_block
+        || refMs > cutoffMs
+      ) {
+        skippedActiveOrRecent += 1;
+        continue;
+      }
+
+      eligibleJobs += 1;
+      const hasFinalSummary = fs.existsSync(path.join(jobDir, 'receipt.json')) || fs.existsSync(path.join(jobDir, 'result.txt'));
+
+      // 1. Verbose raw stream events.jsonl (only if final receipt/result exists; job.json/receipt.json/result.txt stay intact!)
+      if (hasFinalSummary) {
+        const eventsFile = path.join(jobDir, 'events.jsonl');
+        try {
+          if (fs.existsSync(eventsFile)) {
+            const st = fs.statSync(eventsFile);
+            if (st.isFile()) recordCandidate('events_jsonl', eventsFile, st.size);
+          }
+        } catch {}
+      }
+
+      // 2. Intermediate attempt-*.result.txt / review-attempt-*.result.txt when final result.txt exists
+      if (fs.existsSync(path.join(jobDir, 'result.txt'))) {
+        try {
+          for (const e of fs.readdirSync(jobDir, { withFileTypes: true })) {
+            if (!e.isFile()) continue;
+            if (!/^(?:review-)?attempt-\d+\.result\.txt$/i.test(e.name)) continue;
+            const fp = path.join(jobDir, e.name);
+            recordCandidate('attempt_results', fp, fs.statSync(fp).size);
+          }
+        } catch {}
+      }
+
+      // 3. Already delivered/superseded/suppressed notification outbox files (never touch pending/sending/uncertain/not_sent!)
+      const notifDir = path.join(jobDir, 'notifications');
+      if (fs.existsSync(notifDir)) {
+        try {
+          const notifEntries = fs.readdirSync(notifDir, { withFileTypes: true }).filter(e => e.isFile());
+          for (const e of notifEntries) {
+            if (!/^\d{8}\.delivery\.json$/.test(e.name)) continue;
+            const dFile = path.join(notifDir, e.name);
+            let dDoc;
+            try { dDoc = JSON.parse(fs.readFileSync(dFile, 'utf8')); } catch { continue; }
+            if (!DELIVERED_NOTICE_STATES.has(dDoc?.state)) continue;
+            const evtFile = path.join(notifDir, e.name.replace(/\.delivery\.json$/, '.json'));
+            if (fs.existsSync(evtFile)) {
+              recordCandidate('delivered_notifications', evtFile, fs.statSync(evtFile).size);
+            }
+            recordCandidate('delivered_notifications', dFile, fs.statSync(dFile).size);
+          }
+        } catch {}
+      }
+
+      // 4. Finished background command logs (job.background_wait already verified null above)
+      const bgDir = path.join(jobDir, 'background');
+      if (fs.existsSync(bgDir)) {
+        try {
+          for (const e of fs.readdirSync(bgDir, { withFileTypes: true })) {
+            if (!e.isFile()) continue;
+            const fp = path.join(bgDir, e.name);
+            recordCandidate('finished_background_logs', fp, fs.statSync(fp).size);
+          }
+        } catch {}
+      }
+    }
+  }
+
+  // 5. Probe-home CLI logs rotation
+  const probeHome = options.probeHomeDir || defaultAgyProbeHome({ projectPolicy: options.projectPolicy, policy: options.policy });
+  const rot = rotateAgyProbeLogs(probeHome, { maxLogs: keepProbeLogs, nowMs, dryRun: !apply });
+  if (rot.pruned > 0) {
+    candidateFiles += rot.pruned;
+    freedBytes += rot.freed_bytes;
+    byCategory.probe_logs.files += rot.pruned;
+    byCategory.probe_logs.bytes += rot.freed_bytes;
+  }
+
+  return {
+    dry_run: !apply,
+    older_than_days: olderThanDays,
+    keep_probe_logs: keepProbeLogs,
+    probe_home: probeHome || null,
+    data_roots: dataRoots,
+    scanned_jobs: scannedJobs,
+    eligible_jobs: eligibleJobs,
+    skipped_active_or_recent: skippedActiveOrRecent,
+    candidate_files: candidateFiles,
+    freed_bytes: freedBytes,
+    freed_mb: round2(freedBytes / 1048576),
+    by_category: Object.fromEntries(Object.entries(byCategory).map(([k, v]) => [k, { files: v.files, mb: round2(v.bytes / 1048576) }]))
+  };
+}
+
 module.exports = {
   MODE_ALIASES,
   DEFAULT_PACING,
@@ -2978,6 +3199,9 @@ module.exports = {
   defaultQuotaCachePath,
   defaultTranscriptIndexPath,
   defaultCodexSessionsDir,
+  defaultAgyProbeHome,
+  rotateAgyProbeLogs,
+  pruneBridgeRuntimeCache,
   takeQuotaRefreshClaim,
   loadRoutingPolicy,
   saveRoutingPolicy,

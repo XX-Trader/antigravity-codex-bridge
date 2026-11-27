@@ -15,6 +15,9 @@ const {
   resolveProjectPolicy,
   resolveSharedQuotaSnapshot,
   detectCcSwitchAccountsMtimeMs,
+  detectAgyKeyringLastWrittenMs,
+  defaultAgyProbeHome,
+  pruneBridgeRuntimeCache,
   evaluateAgyProbeHealth,
   runAgyInteractiveLoginAsync,
   runAgyPoolTaskAsync,
@@ -31,6 +34,8 @@ function usage() {
     'Commands:',
     '  status [--refresh] [--project ABS_PATH] [--config MCP_JSON]',
     '  agy-login [--timeout-ms N] [--config MCP_JSON] [--policy POLICY_JSON]',
+    '  probe-home [--path ABS_ASCII_DIR | --clear] [--policy POLICY_JSON]',
+    '  prune-cache [--older-than-days N] [--keep-probe-logs N] [--apply] [--config MCP_JSON] [--policy POLICY_JSON]',
     '  set --mode auto|agy|codex [--project ABS_PATH] [--config MCP_JSON] [--policy POLICY_JSON]',
     '      (aliases: agy/AGY/Agy/antigravity -> agy; auto/hybrid/balanced -> auto)',
     '  reset-project --project ABS_PATH [--config MCP_JSON] [--policy POLICY_JSON]',
@@ -54,7 +59,7 @@ function parseArgs(argv) {
   const command = argv[0] && !argv[0].startsWith('--') ? argv[0] : 'status';
   const rest = argv[0] && !argv[0].startsWith('--') ? argv.slice(1) : argv;
   const opts = { command };
-  const flags = new Set(['--refresh', '--clear', '--clear-snapshot', '--remove', '--force', '--help', '-h']);
+  const flags = new Set(['--refresh', '--clear', '--clear-snapshot', '--remove', '--force', '--apply', '--help', '-h']);
   for (let i = 0; i < rest.length; i++) {
     const token = rest[i];
     if (flags.has(token)) { opts[token.replace(/^-+/, '')] = true; continue; }
@@ -112,7 +117,9 @@ async function run(argv) {
   }
 
   if (opts.command === 'agy-login') {
+    const policyDoc = loadRoutingPolicy(policyFile);
     const loginRes = await runAgyInteractiveLoginAsync({
+      policy: policyDoc,
       agyBin: opts['agy-bin'],
       timeoutMs: opts['timeout-ms'] ? Number(opts['timeout-ms']) : 180000
     });
@@ -126,11 +133,13 @@ async function run(argv) {
       const nowMs = Date.now();
       const prev = readStaleQuotaCache(cachePath, nowMs, 86400);
       const ccSwitchMtimeMs = detectCcSwitchAccountsMtimeMs();
+      const keyringLastWrittenMs = detectAgyKeyringLastWrittenMs({ probeHomeDir: policyDoc.agy_probe_home || undefined });
       const agyHealth = evaluateAgyProbeHealth({
         probed: loginRes.agy_external,
         prevHealth: prev?.agy_health || null,
         prevExternal: prev?.agy_external || null,
         ccSwitchMtimeMs,
+        keyringLastWrittenMs,
         nowMs,
         modeScriptPath: path.resolve(__dirname, 'Mode.ps1')
       });
@@ -147,6 +156,54 @@ async function run(argv) {
       account_email: loginRes.account_email,
       agy_external: loginRes.agy_external
     }, null, 2);
+  }
+
+  if (opts.command === 'probe-home') {
+    const current = loadRoutingPolicy(policyFile);
+    if (opts.clear) {
+      current.agy_probe_home = null;
+      const saved = saveRoutingPolicy(policyFile, current);
+      return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_probe_home: saved.agy_probe_home, effective_probe_home: defaultAgyProbeHome({ policy: saved }) }, null, 2);
+    }
+    if (!opts.path) {
+      return JSON.stringify({ policy_path: policyFile, agy_probe_home: current.agy_probe_home, effective_probe_home: defaultAgyProbeHome({ policy: current }) }, null, 2);
+    }
+    const resolved = path.resolve(String(opts.path).trim());
+    if (!path.isAbsolute(resolved) || !/^[\x20-\x7e]+$/.test(resolved)) {
+      throw new Error('--path must be an absolute pure-ASCII directory path (required by agy CLI)');
+    }
+    current.agy_probe_home = resolved;
+    const saved = saveRoutingPolicy(policyFile, current);
+    return JSON.stringify({ state: 'updated', policy_path: saved.path, agy_probe_home: saved.agy_probe_home, effective_probe_home: defaultAgyProbeHome({ policy: saved }) }, null, 2);
+  }
+
+  if (opts.command === 'prune-cache') {
+    const current = loadRoutingPolicy(policyFile);
+    const dataRoots = [];
+    if (opts['data-root']) {
+      dataRoots.push(path.resolve(opts['data-root']));
+    } else if (settings) {
+      for (const p of (settings.projects || [settings])) {
+        if (p?.data) dataRoots.push(p.data);
+      }
+    }
+    const olderThanDays = opts['older-than-days'] !== undefined ? Number(opts['older-than-days']) : 7;
+    if (!Number.isFinite(olderThanDays) || olderThanDays < 0 || olderThanDays > 3650) {
+      throw new Error('--older-than-days must be a number in 0..3650');
+    }
+    const keepProbeLogs = opts['keep-probe-logs'] !== undefined ? Math.floor(Number(opts['keep-probe-logs'])) : 10;
+    if (!Number.isFinite(keepProbeLogs) || keepProbeLogs < 1 || keepProbeLogs > 500) {
+      throw new Error('--keep-probe-logs must be an integer in 1..500');
+    }
+    const report = pruneBridgeRuntimeCache({
+      dataRoots,
+      policy: current,
+      probeHomeDir: opts['probe-home'] ? path.resolve(opts['probe-home']) : undefined,
+      olderThanDays,
+      keepProbeLogs,
+      apply: opts.apply === true
+    });
+    return JSON.stringify(report, null, 2);
   }
 
   const current = loadRoutingPolicy(policyFile);

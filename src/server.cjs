@@ -858,9 +858,10 @@ class Broker {
       let agyProbedAt = prev?.agy_probed_at || null;
       const prevAgyProbeMs = Date.parse(agyProbedAt || '');
       const ccSwitchMtimeMs = fastCcMtimeMs;
+      const effectiveProbeHome = input.probe_home_dir || projectPolicy.agy_probe_home || undefined;
       const preKeyringMs = detectAgyKeyringLastWrittenMs({
         keyringLastWrittenMs: input.keyring_last_written_ms,
-        probeHomeDir: input.probe_home_dir
+        probeHomeDir: effectiveProbeHome
       });
       const ccSwitchChanged = ccSwitchMtimeMs !== null
         && prev?.agy_health?.cc_switch_mtime_ms !== undefined
@@ -884,7 +885,7 @@ class Broker {
       } else {
         const probed = await probeAgyQuotaAsync(projectPolicy, {
           agyBin: input.agy_bin,
-          probeHomeDir: input.probe_home_dir,
+          probeHomeDir: effectiveProbeHome,
           retryDelaysMs: input.retry_delays_ms,
           interceptGraceMs: input.intercept_grace_ms,
           cachePath,
@@ -893,7 +894,7 @@ class Broker {
         // Re-read keyring timestamp AFTER probe so our own hourly token refresh is recorded cleanly without double-probing next tick.
         const postKeyringMs = detectAgyKeyringLastWrittenMs({
           keyringLastWrittenMs: input.keyring_last_written_ms,
-          probeHomeDir: input.probe_home_dir
+          probeHomeDir: effectiveProbeHome
         }) ?? preKeyringMs;
         agyHealth = evaluateAgyProbeHealth({
           probed,

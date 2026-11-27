@@ -1735,5 +1735,72 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
       { policyPath: f.policyPath, cachePath, nowMs: now }
     );
     assert.equal(allowedGitStatus.decision, 'allow');
+
+    // (h) Configurable ASCII `agy_probe_home`, automatic `cli-*.log` rotation, and safe `prune-cache` (dry-run & --apply):
+    const { defaultAgyProbeHome, rotateAgyProbeLogs, pruneBridgeRuntimeCache } = require('../src/routing-policy.cjs');
+    const os = require('node:os');
+    const customProbeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-probe-test-'));
+    t.after(() => fs.rmSync(customProbeHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+    await runModeCli(['probe-home', '--path', customProbeHome, '--policy', f.policyPath]);
+    const policyWithProbeHome = loadRoutingPolicy(f.policyPath);
+    assert.equal(policyWithProbeHome.agy_probe_home, customProbeHome);
+    assert.equal(defaultAgyProbeHome({ policy: policyWithProbeHome }), customProbeHome);
+    await assert.rejects(() => runModeCli(['probe-home', '--path', path.join(f.root, '中文目录'), '--policy', f.policyPath]), /pure-ASCII/i);
+
+    const logDir = path.join(customProbeHome, 'antigravity-cli', 'log');
+    fs.mkdirSync(logDir, { recursive: true });
+    for (let i = 1; i <= 14; i++) {
+      const lf = path.join(logDir, `cli-20261127_${String(i).padStart(6, '0')}.log`);
+      fs.writeFileSync(lf, 'x'.repeat(200), 'utf8');
+      const ts = new Date(now - (20 - i) * MINUTE_MS);
+      fs.utimesSync(lf, ts, ts);
+    }
+    const rotDry = rotateAgyProbeLogs(customProbeHome, { maxLogs: 10, nowMs: now, dryRun: true });
+    assert.equal(rotDry.pruned, 4);
+    assert.equal(fs.readdirSync(logDir).length, 14, 'dryRun must not delete logs');
+    const rotReal = rotateAgyProbeLogs(customProbeHome, { maxLogs: 10, nowMs: now, dryRun: false });
+    assert.equal(rotReal.pruned, 4);
+    assert.equal(fs.readdirSync(logDir).length, 10, 'Rotation keeps exactly the 10 newest CLI logs');
+
+    // Prepare 1 old completed job (10d old) and 1 active/running job (10d old) to verify `pruneBridgeRuntimeCache` safety boundaries!
+    const pruneData = path.join(f.root, 'prune-data');
+    const oldJobId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+    const activeJobId = 'bbbbbbbbbbbbbbbbbbbbbbbb';
+    const oldJobDir = path.join(pruneData, 'jobs', oldJobId);
+    const activeJobDir = path.join(pruneData, 'jobs', activeJobId);
+    fs.mkdirSync(path.join(oldJobDir, 'notifications'), { recursive: true });
+    fs.mkdirSync(path.join(activeJobDir, 'notifications'), { recursive: true });
+    fs.writeFileSync(path.join(oldJobDir, 'job.json'), JSON.stringify({ job_id: oldJobId, status: 'completed', ended_at: relIso(now, -10 * DAY_MS) }), 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'receipt.json'), '{"ok":true}', 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'result.txt'), 'FINAL_RESULT', 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'events.jsonl'), 'e'.repeat(4096), 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'attempt-1.result.txt'), 'attempt1', 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000001.json'), '{"kind":"terminal"}', 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000001.delivery.json'), '{"state":"accepted"}', 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000002.json'), '{"kind":"terminal"}', 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000002.delivery.json'), '{"state":"uncertain"}', 'utf8');
+
+    fs.writeFileSync(path.join(activeJobDir, 'job.json'), JSON.stringify({ job_id: activeJobId, status: 'running', created_at: relIso(now, -10 * DAY_MS) }), 'utf8');
+    fs.writeFileSync(path.join(activeJobDir, 'events.jsonl'), 'active-events', 'utf8');
+
+    const preview = pruneBridgeRuntimeCache({ dataRoots: [pruneData], policy: policyWithProbeHome, olderThanDays: 7, nowMs: now, apply: false });
+    assert.equal(preview.dry_run, true);
+    assert.equal(preview.eligible_jobs, 1);
+    assert.equal(preview.skipped_active_or_recent, 1);
+    assert.equal(preview.by_category.events_jsonl.files, 1);
+    assert.equal(preview.by_category.attempt_results.files, 1);
+    assert.equal(preview.by_category.delivered_notifications.files, 2);
+    assert.equal(fs.existsSync(path.join(oldJobDir, 'events.jsonl')), true, 'Dry-run preview must not delete anything');
+
+    const applied = pruneBridgeRuntimeCache({ dataRoots: [pruneData], policy: policyWithProbeHome, olderThanDays: 7, nowMs: now, apply: true });
+    assert.equal(applied.dry_run, false);
+    assert.equal(fs.existsSync(path.join(oldJobDir, 'events.jsonl')), false);
+    assert.equal(fs.existsSync(path.join(oldJobDir, 'attempt-1.result.txt')), false);
+    assert.equal(fs.existsSync(path.join(oldJobDir, 'notifications', '00000001.delivery.json')), false);
+    assert.equal(fs.existsSync(path.join(oldJobDir, 'notifications', '00000002.delivery.json')), true, 'Uncertain notifications must NEVER be pruned');
+    assert.equal(fs.existsSync(path.join(oldJobDir, 'job.json')), true, 'Core job.json must be preserved');
+    assert.equal(fs.existsSync(path.join(oldJobDir, 'receipt.json')), true, 'Core receipt.json must be preserved');
+    assert.equal(fs.existsSync(path.join(oldJobDir, 'result.txt')), true, 'Core result.txt must be preserved');
+    assert.equal(fs.existsSync(path.join(activeJobDir, 'events.jsonl')), true, 'Active/running jobs must NEVER be pruned');
   }
 });

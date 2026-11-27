@@ -321,6 +321,9 @@ Antigravity 切换回读：两个 MCP 入口均引用当前 main 所在的同一
 ```pwsh
 pwsh -NoProfile -File scripts/Mode.ps1 status --refresh
 pwsh -NoProfile -File scripts/Mode.ps1 agy-login
+pwsh -NoProfile -File scripts/Mode.ps1 probe-home --path 'C:/codex-runtime/cache/agy-probe-home'
+pwsh -NoProfile -File scripts/Mode.ps1 prune-cache --older-than-days 7
+pwsh -NoProfile -File scripts/Mode.ps1 prune-cache --older-than-days 7 --apply
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode auto
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode agy --project 'C:/work/my-project'
 pwsh -NoProfile -File scripts/Mode.ps1 set --mode codex --project 'C:/work/my-project'

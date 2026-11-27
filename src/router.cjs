@@ -249,6 +249,7 @@ function contextHook(payload, projects, options = {}) {
     ...(poolLines.length ? [`AGY 独立模型池保护与本地直调：${poolLines.join('；')}${poolInvokeHint}。`] : []),
     `求真与反附和红线：严禁盲目附和或迎合用户观点（禁用“你说得对”等顺应套话，用户陈述亦须实证，不符时直接出示反证）；严禁无依据随意下结论（一切结论必须绑定实查代码/日志/数据/测试事实）；凡未经证实的推测必须显式标注【假设】或【待验证假设】，严禁把假设写成事实。`,
     `编码与主代理必审门禁：严禁无依据硬编码（尤其是日期时间与环境常量，统一注入时钟基准或用相对偏移）；关键信息（外部接口原始 payload、核心阈值/PIT 公式、跨模块契约与子代理测试 diff）必须由主代理亲自回读审核；显式处理未使用/未激活(0%/null/纪元零值)及重置归零等特殊边界态。`,
+    `任务缓存与临时产物规范：临时脚本、解析缓存与研究输出按全局/项目外部产物目录按项目与功能复用，阶段收尾及时清理 .tmp 无依赖文件；禁止向系统盘会话 scratch/ 堆积大文件或跨聊天重复缓存（browser_sandbox 等宿主强制目录除外）。`,
     `AGY 安全门禁：先审后做=${projectPolicy.agy_guard.review_gate}（重要/量化改动建议先 codex_run(review_only=true) 再交 AGY 实施）；防死循环=同一错误连错 ${projectPolicy.agy_guard.max_same_error_failures} 次或无进展连错 ${projectPolicy.agy_guard.max_consecutive_failures} 次自动熔断（不同错误允许自行修复，成功即清零）。`
   ];
   if (route.agy_health?.alert_needed && route.agy_health.message) {
