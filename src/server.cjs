@@ -760,7 +760,9 @@ class Broker {
       && rawCached.agy_health?.cc_switch_mtime_ms !== undefined
       && fastCcMtimeMs !== rawCached.agy_health.cc_switch_mtime_ms
     );
-    const cached = ccChangedVsCache ? null : rawCached;
+    const cachedCodexAgeMs = rawCached?.codex_probed_at ? nowMs - Date.parse(rawCached.codex_probed_at) : 0;
+    const codexProbeExpiredHourly = Boolean(rawCached?.codex_probed_at && Number.isFinite(cachedCodexAgeMs) && cachedCodexAgeMs >= 3600 * 1000);
+    const cached = (ccChangedVsCache || codexProbeExpiredHourly) ? null : rawCached;
 
     if (cached) {
       const active = activeCodexTasks(this.settings);

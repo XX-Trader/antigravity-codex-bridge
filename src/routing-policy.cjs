@@ -2138,16 +2138,15 @@ function evaluateAgyUsageAlert({ agyPacing, codexPacing, mode }) {
   if (
     mode !== 'agy'
     && w7?.available
-    && typeof w7.used_percent === 'number'
-    && w7.used_percent >= 40
     && typeof w7.pacing_delta === 'number'
-    && w7.pacing_delta >= 20
+    && w7.pacing_delta > 10
   ) {
+    const step = w7.pacing_delta >= 40 ? 40 : (w7.pacing_delta >= 25 ? 25 : 10);
     return {
       level: 'weekly_overburn',
-      alert_key: `weekly_overburn:${anchor7d}`,
-      title: `Antigravity 额度消耗超前预警（已用 ${w7.used_percent}%）`,
-      message: `AGY 7天额度已用 ${w7.used_percent}%（按时间进度线性目标仅 ${w7.target_used_percent}%，超前 +${w7.pacing_delta}%${typeof w7.hours_until_reset === 'number' ? `，距周重置还有 ${w7.hours_until_reset}h` : ''}），而 ${codexNote}；已自动拦截 AGY 批量子代理/工作流派发并切往 Codex。`
+      alert_key: `weekly_overburn_${step}:${anchor7d}`,
+      title: `Antigravity 线性消耗超前提醒（已用 ${w7.used_percent}%，超前 +${w7.pacing_delta}%）`,
+      message: `AGY 7天额度已用 ${w7.used_percent}%（当前时间线性目标 ${w7.target_used_percent}%，已超前 +${w7.pacing_delta}% > 10% 提醒线${typeof w7.hours_until_reset === 'number' ? `，距周重置 ${w7.hours_until_reset}h` : ''}），${codexNote}；当前线性阶段仅提醒不拦截，建议后续新任务优先使用 Codex。`
     };
   }
   if (w5?.status === 'caution' && typeof w5.used_percent === 'number') {
@@ -2405,7 +2404,9 @@ function decideRoute(input = {}) {
         ? `Codex 周额度已 100% 耗尽（距重置 ${codexPacing.hours_until_reset ?? '?'}h）：原 Codex 未完事项自动解除粘性锁定，请先只读读取原任务 codex_result/job.json 与 Git 差异，在 AGY 无缝接力完成（未经用户明确授权禁止静默消耗额外 Credits 或重置券）。`
         : (agyConstrained && !codexHardBlocked && codexPacing.available)
           ? `AGY 已触及保护线（7天缓冲线或 5h 窗口限制），为保住主聊天窗不断粮，执行与子代理已硬性切往 Codex 接管。`
-          : null;
+          : (preferredEngine === 'codex' && codexPacing.available && !codexHardBlocked && typeof agyPacing.window_7d?.pacing_delta === 'number' && agyPacing.window_7d.pacing_delta > 10)
+            ? `Codex 当前额度充裕（已用 ${codexPacing.used_percent}%），而 AGY 7天消耗已超出线性目标 +${agyPacing.window_7d.pacing_delta}%：此前因 Codex 耗尽临时转交 AGY 的事项解除粘性锁定，新任务与下一批次请优先调用 codex_run 执行（当前线性阶段仅提醒引导，不硬拦截 AGY 操作）。`
+            : null;
 
   const agyUsageAlert = evaluateAgyUsageAlert({ agyPacing, codexPacing, mode });
 
@@ -2831,31 +2832,26 @@ function evaluateAgyQuotaGate({ toolName = '', args = {}, projectPolicy, codexPa
     };
   }
 
-  // 2b. Severe 7-day pacing overburn handover: when AGY has already burned >=35% and is >=+20% ahead of its linear curve
-  //     while Codex is healthy and on/below pace (<85% used, delta <= +5%), block AGY subagent/send_message/workflow fan-out
-  //     so multi-agent batches automatically return to Codex once Codex quota refreshes!
+  // 2b. Linear pacing >+10% advisory reminder (NO blocking during linear phase — only remind and guide towards Codex!):
   const w7 = agyPacing?.window_7d;
-  const agySeverelyOverburned = Boolean(
+  const agyAheadLinear10 = Boolean(
     w7?.available
-    && typeof w7.used_percent === 'number'
-    && w7.used_percent >= 35
     && typeof w7.pacing_delta === 'number'
-    && w7.pacing_delta >= 20
+    && w7.pacing_delta > 10
   );
   const codexPlenty = Boolean(
     codexHasRoom
     && (codexPacing.used_percent ?? 0) < 85
     && (codexPacing.pacing_delta === null || codexPacing.pacing_delta === undefined || codexPacing.pacing_delta <= 5)
   );
-  if (agySeverelyOverburned && codexPlenty) {
+  if (agyAheadLinear10 && codexPlenty) {
     const isBatchDelegation = (isInvokeSubagent && !isReadOnlyResearch && !['browser', 'image-generator'].includes(subType))
       || isWorkflow
       || (isSendMessage && !isHandoffReceiptMsg);
     if (isBatchDelegation) {
       return {
-        blocked: true,
-        kind: 'agy_pacing_overburn_handover',
-        reason: `[AGY_PACING_OVERBURN_HANDOVER] AGY 7天额度已大幅超前消耗（当前已用 ${w7.used_percent}%，线性目标仅 ${w7.target_used_percent}%，超前 +${w7.pacing_delta}%），而 Codex 当前额度充裕（仅用 ${codexPacing.used_percent}%）：已自动拦截 AGY 子代理续派/新建与批量工作流（invoke_subagent / send_message / run_workflow），请将后续任务直接交由 codex_run 执行以均衡双端额度（如确需强制使用 AGY，可运行 Mode.ps1 set --mode agy）。`
+        blocked: false,
+        note: `[线性额度提醒] AGY 7天额度已用 ${w7.used_percent}%（超出线性目标 +${w7.pacing_delta}% > 10%），而 Codex 当前仅用 ${codexPacing.used_percent}%；本次操作放行不拦截，建议后续新批次优先改用 codex_run 执行。`
       };
     }
   }

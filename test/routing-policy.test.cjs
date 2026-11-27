@@ -1660,13 +1660,13 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
     assert.equal(qAcctB.agy_pacing.window_5h.status, 'ok', 'Old account 429 cooldown must be purged upon switching to fresh Account B');
     assert.equal(readGuardQuotaCooldown(guardPath, switchTimeMs + 1000), null);
 
-    // (g) Severe AGY 7-day overburn (`65%` used at `10%` elapsed while Codex is at `1%`) intercepts `send_message` / `invoke_subagent`
-    //     to stop runaway AGY subagent loops, blocks `run_command` when AGY hits hard limit, and triggers deduplicated usage alerts!
+    // (g) Linear AGY 7-day overburn >10% (`23%` used vs `10.9%` target => `+12.1%` delta while Codex is at `1%`)
+    //     triggers deduplicated usage reminder WITHOUT blocking tools; hard blocking ONLY occurs at 5h>=88% / 7d>=90%!
     const { notifyAgyQuotaUsageIfNeeded } = require('../src/notifier.cjs');
     const overburnExt = parseAgyProbePayload({
       status: 'SUCCESS',
       command: { data: { groups: [{ buckets: [
-        { id: 'gemini-weekly', remaining_fraction: 0.35, reset_time: relIso(now, 148 * HOUR_MS) },
+        { id: 'gemini-weekly', remaining_fraction: 0.77, reset_time: relIso(now, 148 * HOUR_MS) },
         { id: 'gemini-5h', remaining_fraction: 0.94, reset_time: relIso(now, 4 * HOUR_MS) }
       ] }] } }
     });
@@ -1676,24 +1676,16 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
       agy_external: overburnExt,
       fetched_at: relIso(now, 0)
     });
-    // Orchestrator trying to feed existing AGY subagents via `send_message` while Codex sits at 1% is intercepted!
-    const blockedSendMsg = bindOrigin(
+    // Linear phase (>10% overburn, <90% cap): allowed without blocking, with non-blocking advisory reminder!
+    const allowedWithAdvisory = bindOrigin(
       { conversationId: '69d255d8-1b93-4f96-8c63-6a5496208bb6', workspacePaths: [f.project], toolCall: { name: 'send_message', args: { Recipient: '89724722-8ade-40f7-a776-c8fbfb379b4e', Message: '继续复核下一批 10 只股票' } } },
       [{ project: f.project, data: f.data }],
       { policyPath: f.policyPath, cachePath, nowMs: now }
     );
-    assert.equal(blockedSendMsg.decision, 'deny');
-    assert.match(blockedSendMsg.reason, /\[AGY_PACING_OVERBURN_HANDOVER\]/);
+    assert.equal(allowedWithAdvisory.decision, 'allow', 'Linear >10% overburn must NOT block tools');
+    assert.match(allowedWithAdvisory.reason, /\[线性额度提醒\]/);
 
-    // Subagent handoff receipt message back to parent IS allowed so it can hand over cleanly to `codex_run`!
-    const allowedHandoffMsg = bindOrigin(
-      { conversationId: '6200e7ec-d95f-4879-9f0b-7f15dd025db2', workspacePaths: [f.project], toolCall: { name: 'send_message', args: { Recipient: '69d255d8-1b93-4f96-8c63-6a5496208bb6', Message: '因触发 [AGY_QUOTA_PROTECTED]，已暂停并将上下文交接由 codex_run 执行' } } },
-      [{ project: f.project, data: f.data }],
-      { policyPath: f.policyPath, cachePath, nowMs: now }
-    );
-    assert.equal(allowedHandoffMsg.decision, 'allow');
-
-    // Deduplicated usage surge alert (`weekly_overburn`) fires once per cycle in tray & injects `[AGY 额度高消耗预警]` in chat!
+    // Deduplicated usage alert (`weekly_overburn`) fires immediately once pacing_delta > 10% in tray & chat!
     const overburnRoute = decideRoute({
       projectPolicy: resolveProjectPolicy(defaultPolicy(), { project: f.project }),
       codexPacing: { available: true, window_active: true, band: 'codex_priority', elapsed_percent: 5.5, used_percent: 1, pacing_delta: -4.5, resets_at: relIso(now, 161 * HOUR_MS), hours_until_reset: 161 },
@@ -1701,6 +1693,7 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
       nowMs: now
     });
     assert.equal(overburnRoute.agy_usage_alert?.level, 'weekly_overburn');
+    assert.match(overburnRoute.exhaustion_handover?.guidance || '', /解除粘性锁定/);
     const usageNotifs = [];
     assert.equal(notifyAgyQuotaUsageIfNeeded(mockBroker, overburnRoute, { now: now, desktopNotify: p => usageNotifs.push(p) }), true);
     assert.equal(usageNotifs.length, 1);
@@ -1713,6 +1706,7 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
       { policyPath: f.policyPath, cachePath, nowMs: now }
     );
     assert.match(overburnCtx.injectSteps[0].systemMessage.systemMessage, /\[AGY 额度高消耗预警\]/);
+    assert.match(overburnCtx.injectSteps[0].systemMessage.systemMessage, /仅提醒不拦截/);
 
     // When AGY hits hard 5h/7d limit (`92%` 5h), even `run_command` Python writers are blocked (while `git status` stays allowed)!
     const hardLimitExt = parseAgyProbePayload({
