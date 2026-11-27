@@ -39,6 +39,39 @@ function scopesFor(workspaces, projects) {
   }));
 }
 
+function isBridgeSelfWorkspace(workspaces, options = {}) {
+  const bridgeRoot = (() => {
+    try { return real(options.bridgeRoot || path.resolve(__dirname, '..')); }
+    catch { return path.resolve(options.bridgeRoot || path.resolve(__dirname, '..')); }
+  })();
+  return (workspaces || []).some(w => {
+    try {
+      const root = real(w);
+      return same(root, bridgeRoot) || inside(root, bridgeRoot) || inside(bridgeRoot, root);
+    } catch { return false; }
+  });
+}
+
+function resolveUnregisteredContext(workspaces, projects, options = {}) {
+  if (!Array.isArray(workspaces) || !workspaces.length) return null;
+  if (isBridgeSelfWorkspace(workspaces, options)) return null;
+  const anchor = projects?.[0] || null;
+  const policyPath = options.policyPath || defaultPolicyPath(anchor);
+  const rawPolicy = options.policy || loadRoutingPolicy(policyPath, { defaultMode: options.defaultMode || 'auto' });
+  if (!rawPolicy?.apply_to_unregistered_projects) return null;
+  let projectRoot;
+  try { projectRoot = real(workspaces[0]); } catch { projectRoot = path.resolve(workspaces[0]); }
+  const scope = { project: projectRoot, data: anchor?.data || null, review_category: 'general', unregistered: true };
+  const baseResolved = resolveProjectPolicy(rawPolicy, scope);
+  const policy = {
+    ...baseResolved,
+    mode: 'agy',
+    mode_source: 'unregistered_local_agy',
+    agy_guard: { ...(baseResolved.agy_guard || {}), review_gate: 'off' }
+  };
+  return { rawPolicy, policyPath, selected: { scope, policy } };
+}
+
 function effectiveScopePolicy(scopes, options = {}) {
   const first = scopes[0];
   const policyPath = options.policyPath || defaultPolicyPath(first);
@@ -69,18 +102,21 @@ function bindOrigin(payload, projects, options = {}) {
   }
   const match = name.match(/(?:^|[_/.:-])(codex_run|codex_sessions|codex_list|codex_wait|codex_result|codex_cancel|codex_quota)$/);
   if (!match) {
-    const scopes = scopesFor(payload.workspacePaths || [], projects);
+    const workspaces = payload.workspacePaths || [];
+    const scopes = scopesFor(workspaces, projects);
     if (!executionPattern.test(name)) return { decision: 'allow' };
-    if (!scopes.length) return { decision: 'allow' };
-    const { policyPath, selected } = effectiveScopePolicy(scopes, options);
+    const unregisteredCtx = !scopes.length ? resolveUnregisteredContext(workspaces, projects, options) : null;
+    if (!scopes.length && !unregisteredCtx) return { decision: 'allow' };
+    const isUnregistered = !scopes.length;
+    const { policyPath, selected } = isUnregistered ? unregisteredCtx : effectiveScopePolicy(scopes, options);
     const projectPolicy = selected.policy;
-    if (projectPolicy.mode === 'codex') {
+    if (!isUnregistered && projectPolicy.mode === 'codex') {
       return { decision: 'deny', reason: '本项目当前处于 codex 锁定模式：由 Antigravity 规划和验收，执行必须交给 codex_run；需要子 agent 时由 Codex 会话启动原生子 agent。如需同时启用 AGY 低成本多子代理，请将模式切回 auto 或 agy。' };
     }
     const args = payload.toolCall?.args || {};
     if (isReadOnlyTaskStatusCall(name, args)) return { decision: 'allow' };
     const extCliMisuse = checkExternalPoolCliMisuse(name, args, projectPolicy, {
-      bridgeRoot: path.resolve(__dirname, '..'),
+      bridgeRoot: options.bridgeRoot || path.resolve(__dirname, '..'),
       projectRoot: selected.scope?.project
     });
     if (extCliMisuse.blocked) return { decision: 'deny', reason: extCliMisuse.reason };
@@ -92,23 +128,29 @@ function bindOrigin(payload, projects, options = {}) {
     const gate = checkAgyExecutionGate(payload, selected.scope, effPolicy, {
       policyPath,
       guardStateFile: guardFile,
-      codexExhausted: codexIsExhausted(codexPacing),
+      codexExhausted: isUnregistered ? true : codexIsExhausted(codexPacing),
       nowMs: options.nowMs
     });
     if (gate.blocked) return { decision: 'deny', reason: gate.reason };
     const agyQuotaGate = evaluateAgyQuotaGate({ toolName: name, args, projectPolicy: effPolicy, codexPacing, agyPacing, nowMs: options.nowMs });
-    if (agyQuotaGate.blocked) return { decision: 'deny', reason: agyQuotaGate.reason };
-    const active = activeCodexTasks(selected.scope);
+    if (!isUnregistered && agyQuotaGate.blocked) return { decision: 'deny', reason: agyQuotaGate.reason };
+    const active = isUnregistered ? { count: 0, tasks: [] } : activeCodexTasks(selected.scope);
     const notes = [];
     if (gate.advisory) notes.push(gate.advisory);
     if (gate.review) notes.push(`已关联 Codex 只读审核(${gate.review.job_id.slice(0, 8)})。`);
-    if (agyQuotaGate.note) notes.push(agyQuotaGate.note);
+    if (isUnregistered && agyPacing?.limited) {
+      const h5 = agyPacing.window_5h?.used_percent;
+      const w7 = agyPacing.window_7d?.used_percent;
+      notes.push(`[AGY 额度提醒] 当前项目未登记 Codex，仍放行本机 AGY 执行；AGY 当前已达保护线（5h=${h5 !== null && h5 !== undefined ? h5 + '%' : '未知'}，7d=${w7 !== null && w7 !== undefined ? w7 + '%' : '未知'}），建议降档省流或用 Setup.ps1 登记后切 Codex 兜底。`);
+    } else if (agyQuotaGate.note) {
+      notes.push(agyQuotaGate.note);
+    }
     let overwrite;
     if (subagentInvokePattern.test(name)) {
       const sub = evaluateSubagentCall(args, effPolicy, payload?.modelName || '');
       if (sub.overwrite) overwrite = sub.overwrite;
-      if (agyQuotaGate.overwrite) overwrite = { ...(overwrite || {}), ...agyQuotaGate.overwrite };
-      if (sub.note && !agyQuotaGate.overwrite) notes.push(sub.note);
+      if (!isUnregistered && agyQuotaGate.overwrite) overwrite = { ...(overwrite || {}), ...agyQuotaGate.overwrite };
+      if (sub.note && (!agyQuotaGate.overwrite || isUnregistered)) notes.push(sub.note);
       if (active.count > 0 && !readOnlySubagentType(args) && !isolatedWorkspace(args)) {
         notes.push(`注意：当前项目有 ${active.count} 个活跃 Codex 任务；并行写同一仓库时请切分非重叠目录或为子代理指定 Workspace="share"，并由主会话串行做 Git 提交。`);
       }
@@ -164,9 +206,12 @@ function readContextMarker(file) {
 }
 
 function contextHook(payload, projects, options = {}) {
-  const scopes = scopesFor(payload?.workspacePaths || [], projects);
-  if (!scopes.length) return {};
-  const { rawPolicy, policyPath, selected } = effectiveScopePolicy(scopes, options);
+  const workspaces = payload?.workspacePaths || [];
+  const scopes = scopesFor(workspaces, projects);
+  const unregisteredCtx = !scopes.length ? resolveUnregisteredContext(workspaces, projects, options) : null;
+  if (!scopes.length && !unregisteredCtx) return {};
+  const isUnregistered = !scopes.length;
+  const { rawPolicy, policyPath, selected } = isUnregistered ? unregisteredCtx : effectiveScopePolicy(scopes, options);
   const guardFile = options.guardStateFile || defaultGuardStatePath(policyPath, selected.scope);
   const guardCooldown = readGuardQuotaCooldown(guardFile, options.nowMs);
   const projectPolicy = { ...selected.policy, ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
@@ -175,7 +220,7 @@ function contextHook(payload, projects, options = {}) {
     policyPath,
     transcriptPath: payload?.transcriptPath
   });
-  const active = activeCodexTasks(selected.scope);
+  const active = isUnregistered ? { count: 0, tasks: [] } : activeCodexTasks(selected.scope);
   const route = decideRoute({
     policy: rawPolicy,
     projectPolicy,
@@ -243,7 +288,9 @@ function contextHook(payload, projects, options = {}) {
   const agyBufferPct = Math.max(0, Math.round((100 - (projectPolicy.agy_pacing?.weekly_protect_used_percent ?? 90)) * 100) / 100);
   const lines = [
     `[双引擎路由状态] ${route.summary_line}`,
-    `执行模式：${route.mode}（支持缩写 agy/AGY/Agy 与 codex；用户显式点名优先；同事项粘性锁定单执行端；Codex 按 ${projectPolicy.pacing?.plan_days ?? 5} 天 100% 等比例消化、AGY 默认只用 ${agyTargetPct}% 额度并预留 ${agyBufferPct}% 应急缓冲且叠加 5 小时窗口限制，AGY 触及缓冲线/5h受限时由 Codex 兜底；凡需 Codex 原生子代理协作或依赖 Codex 原生子会话契约的任务固定留 Codex 执行）。`,
+    isUnregistered
+      ? `执行模式：本机 Antigravity 直接执行（当前项目未登记 Codex 执行根，默认直接在 AGY 内灵活完成，不强制走 Codex；如需启用 Codex 派发与独立只读审核，可随时使用 Setup.ps1 登记项目）。`
+      : `执行模式：${route.mode}（支持缩写 agy/AGY/Agy 与 codex；用户显式点名优先；同事项粘性锁定单执行端；Codex 按 ${projectPolicy.pacing?.plan_days ?? 5} 天 100% 等比例消化、AGY 默认只用 ${agyTargetPct}% 额度并预留 ${agyBufferPct}% 应急缓冲且叠加 5 小时窗口限制，AGY 触及缓冲线/5h受限时由 Codex 兜底；凡需 Codex 原生子代理协作或依赖 Codex 原生子会话契约的任务固定留 Codex 执行）。`,
     `AGY 低成本多子代理分层与保缓存：simple/research→${projectPolicy.agy_tiers.simple}，standard(默认)→${projectPolicy.agy_tiers.standard}，complex→${projectPolicy.agy_tiers.complex}，expert→${projectPolicy.agy_tiers.expert}；同模块内通过 send_message 长期复用同一个低成本子代理以维持高缓存命中率，避免高配主会话亲自跑长循环或每次小改冷启动新子代理；Codex 未达保护线时，极轻量机械任务优先 Codex simple；批量扇出用 run_workflow，并行写用 Workspace="share"，Git 串行收口。`,
     ...(hostMapParts.length ? [`AGY 本机主对话档位对照：${hostMapParts.join('，')}${projectPolicy.thinking_backups?.length ? `；顶配备用顺序：${projectPolicy.thinking_backups.join(' → ')}` : ''}（整段常规开发留 AGY 主对话执行时优先切 standard 档位）。`] : []),
     ...(poolLines.length ? [`AGY 独立模型池保护与本地直调：${poolLines.join('；')}${poolInvokeHint}。`] : []),
@@ -268,9 +315,11 @@ function contextHook(payload, projects, options = {}) {
 }
 
 function postToolHook(payload, projects, options = {}) {
-  const scopes = scopesFor(payload?.workspacePaths || [], projects);
-  if (!scopes.length) return {};
-  const { policyPath, selected } = effectiveScopePolicy(scopes, options);
+  const workspaces = payload?.workspacePaths || [];
+  const scopes = scopesFor(workspaces, projects);
+  const unregisteredCtx = !scopes.length ? resolveUnregisteredContext(workspaces, projects, options) : null;
+  if (!scopes.length && !unregisteredCtx) return {};
+  const { policyPath, selected } = scopes.length ? effectiveScopePolicy(scopes, options) : unregisteredCtx;
   if (selected.policy.mode === 'codex') return {};
   recordToolOutcome(payload, selected.scope, selected.policy, {
     policyPath,

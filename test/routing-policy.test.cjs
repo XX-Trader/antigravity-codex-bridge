@@ -16,7 +16,8 @@ const {
   runExternalAgyProbe,
   decideRoute,
   evaluateSubagentCall,
-  isAgyQuotaError
+  isAgyQuotaError,
+  writeQuotaCache
 } = require('../src/routing-policy.cjs');
 const { bindOrigin, contextHook, postToolHook, hookMatcher, ProjectRouter } = require('../src/router.cjs');
 const { Broker, dispatch, save } = require('../src/server.cjs');
@@ -1803,4 +1804,100 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
     assert.equal(fs.existsSync(path.join(oldJobDir, 'result.txt')), true, 'Core result.txt must be preserved');
     assert.equal(fs.existsSync(path.join(activeJobDir, 'events.jsonl')), true, 'Active/running jobs must NEVER be pruned');
   }
+});
+
+test('apply_to_unregistered_projects enables flexible local AGY guard across unregistered projects while always exempting bridge self and keeping codex_run registered-only', async t => {
+  const f = fixture(t);
+  const now = Date.now();
+  const relIso = (ms, deltaMs) => new Date(ms + deltaMs).toISOString();
+  const unregisteredProject = path.join(f.root, 'other-business-app');
+  const fakeBridgeRoot = path.join(f.root, 'bridge-self-repo');
+  fs.mkdirSync(unregisteredProject, { recursive: true });
+  fs.mkdirSync(fakeBridgeRoot, { recursive: true });
+
+  const projects = [{ project: f.project, data: f.data, review_category: 'general' }];
+  const markerFile = path.join(f.root, 'runtime', 'unregistered-ctx-state.json');
+  const guardStateFile = path.join(f.root, 'runtime', 'unregistered-guard.json');
+  const cachePath = path.join(path.dirname(f.policyPath), 'quota-cache.json');
+
+  // Enable via Mode CLI (`global-guard --enabled true`) and verify persistence
+  const toggleOut = JSON.parse(await runModeCli(['global-guard', '--enabled', 'true', '--policy', f.policyPath]));
+  assert.equal(toggleOut.apply_to_unregistered_projects, true);
+
+  // Configure Claude pool + high AGY 5h usage to verify unregistered projects stay non-blocking on AGY quota
+  const pol = loadRoutingPolicy(f.policyPath);
+  saveRoutingPolicy(f.policyPath, {
+    ...pol,
+    default_mode: 'codex', // Even if global mode is codex, unregistered project allows direct local AGY!
+    agy_guard: { ...pol.agy_guard, review_gate: 'strict', max_same_error_failures: 3 },
+    agy_model_pools: {
+      claude: {
+        match: 'claude',
+        default_model: 'claude-sonnet-5-5-high',
+        review_model: 'claude-opus-5-5-high',
+        weekly_protect_used_percent: 90,
+        buffer_unlock_window_hours: 6,
+        window_5h_caution_percent: 75,
+        window_5h_protect_percent: 88
+      }
+    }
+  });
+  writeQuotaCache(cachePath, {
+    fetched_at: relIso(now, -30_000),
+    codex_pacing: { available: true, used_percent: 10, remaining_percent: 90, window_active: true, resets_at: relIso(now, 5 * 86400_000) },
+    agy_external: {
+      available: true,
+      source: 'agy_cli_usage',
+      five_hour_used_percent: 92,
+      five_hour_resets_at: relIso(now, 2 * 3600_000),
+      weekly_used_percent: 40,
+      weekly_resets_at: relIso(now, 4 * 86400_000),
+      pools: {
+        claude: { weekly_used_percent: 15, weekly_resets_at: relIso(now, 5 * 86400_000), five_hour_used_percent: 0 }
+      }
+    }
+  });
+
+  const opts = { policyPath: f.policyPath, markerFile, guardStateFile, bridgeRoot: fakeBridgeRoot, nowMs: now, agyQuotaCachePath: cachePath };
+
+  // 1. Bridge repo itself MUST always be completely exempt
+  assert.deepEqual(contextHook({ hookEventName: 'SessionStart', conversationId: 'aaaa1111-1111-1111-1111-111111111111', workspacePaths: [fakeBridgeRoot] }, projects, opts), {});
+  const selfExec = bindOrigin({ conversationId: 'aaaa1111-1111-1111-1111-111111111111', workspacePaths: [fakeBridgeRoot], toolCall: { name: 'edit_file', args: { Path: 'src/server.cjs' } } }, projects, opts);
+  assert.equal(selfExec.decision, 'allow');
+  assert.equal(selfExec.reason, undefined);
+
+  // 2. Unregistered project receives context injection describing flexible direct local AGY execution + Claude pool
+  const ctx = contextHook({ hookEventName: 'PreInvocation', conversationId: 'bbbb2222-2222-2222-2222-222222222222', workspacePaths: [unregisteredProject] }, projects, opts);
+  assert.equal(ctx.injectSteps.length, 1);
+  assert.match(ctx.injectSteps[0].systemMessage.systemMessage, /本机 Antigravity 直接执行/);
+  assert.match(ctx.injectSteps[0].systemMessage.systemMessage, /claude池/);
+
+  // 3. Unregistered project allows direct local edit_file even when AGY 5h=92% & global default_mode=codex & review_gate=strict (advisory only, never deadlocks!)
+  const localEdit = bindOrigin({ conversationId: 'bbbb2222-2222-2222-2222-222222222222', workspacePaths: [unregisteredProject], toolCall: { name: 'edit_file', args: { Path: 'app.py' } } }, projects, opts);
+  assert.equal(localEdit.decision, 'allow');
+  assert.match(localEdit.reason || '', /AGY 额度提醒/);
+
+  // 4. External unauthenticated Claude CLI is still blocked on unregistered project
+  const extBlock = bindOrigin({ conversationId: 'bbbb2222-2222-2222-2222-222222222222', workspacePaths: [unregisteredProject], toolCall: { name: 'run_command', args: { CommandLine: 'claude -p "review this"' } } }, projects, opts);
+  assert.equal(extBlock.decision, 'deny');
+
+  // 5. Smart loop guard works via postToolHook + bindOrigin on unregistered project
+  const convLoop = 'cccc3333-3333-3333-3333-333333333333';
+  for (let i = 0; i < 3; i++) {
+    postToolHook({
+      conversationId: convLoop,
+      workspacePaths: [unregisteredProject],
+      lastUserInput: 'fix build',
+      toolCall: { name: 'run_command', args: { CommandLine: 'npm run build' } },
+      error: 'SyntaxError: unexpected token at line 42'
+    }, projects, opts);
+  }
+  const loopTripped = bindOrigin({ conversationId: convLoop, workspacePaths: [unregisteredProject], lastUserInput: 'fix build', toolCall: { name: 'edit_file', args: { Path: 'index.js' } } }, projects, opts);
+  assert.equal(loopTripped.decision, 'deny');
+  assert.match(loopTripped.reason || '', /AGY_LOOP_GUARD/);
+
+  // 6. codex_run remains registered-project-only (security boundary preserved)
+  const codexDenied = bindOrigin({ conversationId: 'bbbb2222-2222-2222-2222-222222222222', workspacePaths: [unregisteredProject], toolCall: { name: 'codex_run', args: { prompt: 'do work' } } }, projects, opts);
+  assert.equal(codexDenied.decision, 'deny');
+  assert.match(codexDenied.reason || '', /没有已登记的 Codex 执行根/);
 });

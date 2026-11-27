@@ -257,6 +257,7 @@ pwsh -NoProfile -File scripts/Mode.ps1 pool-run --pool claude --cwd 'C:/work/my-
   "agy_manual_snapshot": null,
   "agy_quota_command": null,
   "agy_probe_home": "D:\\BridgeData\\cache\\agy-probe-home",
+  "apply_to_unregistered_projects": true,
   "cache_ttl_seconds": 300,
   "cooldowns": {
     "codex": null,
@@ -272,6 +273,7 @@ pwsh -NoProfile -File scripts/Mode.ps1 pool-run --pool claude --cwd 'C:/work/my-
   - 当 AGY 周用量超前线性目标 **$>10\%$** 时，仅发送**非阻塞提醒**（不拦截），同时 `auto` 路由会自动倾向把新事项派往更落后的 Codex；
   - 只有触及硬保护线（5h $\ge 88\%$ 或 7d $\ge 90\%$ 有效上限）时，才会由 `PreToolUse` 硬拦截重型写入/子代理并切回 Codex 兜底。
 - **单边 100% 耗尽交接**：Codex 100% 硬归零时自动解除原事项粘性锁定并免除 `strict` 审核门禁死锁，改由 AGY 接力；双边均 100% 归零时熔断暂停交用户处理。
+- **全项目通用与灵活直调（`apply_to_unregistered_projects: true`）**：除桥接仓库自身始终豁免外，开启该开关后，所有未登记 Codex 的 Antigravity 项目也会自动获得双引擎水位提醒、AGY 子代理防盲目降档、智能防死循环与禁调外部未登录 Claude CLI 保护，并且**默认允许直接在本机 Antigravity 执行、不强制走 Codex**（高水位仅给非阻塞提醒）；在任意项目中，用户随时可以显式点名指定或强制走 `agy` / `codex` / `claude` 池，不再受“非要哪个不可”的死锁限制。
 
 ### 5. Antigravity 宿主设置建议（`~/.gemini/config/config.json` 关键字段）
 
@@ -319,6 +321,9 @@ pwsh -NoProfile -File scripts/Mode.ps1 prune-cache --older-than-days 7 --apply
 
 # 7. AGY 账号掉线或切号后显式重新登录
 pwsh -NoProfile -File scripts/Mode.ps1 agy-login
+
+# 8. 开启/关闭“对所有未登记项目生效的 AGY 通用守护与水位注入”（桥接仓库自身始终豁免，不强制走 Codex）
+pwsh -NoProfile -File scripts/Mode.ps1 global-guard --enabled true
 ```
 
 ---

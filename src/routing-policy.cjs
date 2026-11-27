@@ -144,6 +144,7 @@ function defaultPolicy() {
     agy_manual_snapshot: null,
     agy_quota_command: null,
     agy_probe_home: null,
+    apply_to_unregistered_projects: false,
     cache_ttl_seconds: 300,
     cooldowns: { codex: null, agy: null },
     updated_at: null
@@ -332,6 +333,9 @@ function parsePolicy(raw) {
     if (path.isAbsolute(candidate) && /^[\x20-\x7e]+$/.test(candidate)) {
       policy.agy_probe_home = candidate;
     }
+  }
+  if (raw.apply_to_unregistered_projects !== undefined) {
+    policy.apply_to_unregistered_projects = Boolean(raw.apply_to_unregistered_projects);
   }
   if (typeof raw.cache_ttl_seconds === 'number' && Number.isFinite(raw.cache_ttl_seconds) && raw.cache_ttl_seconds >= 0 && raw.cache_ttl_seconds <= 3600) {
     policy.cache_ttl_seconds = Math.floor(raw.cache_ttl_seconds);

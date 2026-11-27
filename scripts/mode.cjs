@@ -51,7 +51,8 @@ function usage() {
     '  pool-run --pool POOL [--model MODEL] [--exec-mode plan|auto|accept-edits] [--cwd ABS_PATH] [--conversation UUID] [--prompt TEXT | --prompt-file UTF8_FILE] [--force]',
     '  tier [--simple MODEL] [--standard MODEL] [--complex MODEL] [--expert MODEL] [--enforce-low-cost true|false]',
     '  cooldown --engine codex|agy --minutes N [--reason TEXT]',
-    '  clear-cooldown --engine codex|agy'
+    '  clear-cooldown --engine codex|agy',
+    '  global-guard --enabled true|false [--policy POLICY_JSON]'
   ].join('\n');
 }
 
@@ -558,6 +559,27 @@ async function run(argv) {
     current.cooldowns = { ...(current.cooldowns || {}), [mapped]: null };
     const saved = saveRoutingPolicy(policyFile, current);
     return JSON.stringify({ state: 'updated', policy_path: saved.path, cooldowns: saved.cooldowns }, null, 2);
+  }
+
+  if (opts.command === 'global-guard') {
+    if (opts.enabled === undefined) {
+      return JSON.stringify({
+        state: 'current',
+        policy_path: policyFile,
+        apply_to_unregistered_projects: Boolean(current.apply_to_unregistered_projects)
+      }, null, 2);
+    }
+    const rawVal = String(opts.enabled).trim().toLowerCase();
+    if (!['true', 'false', '1', '0', 'on', 'off'].includes(rawVal)) {
+      throw new Error('--enabled must be true or false');
+    }
+    current.apply_to_unregistered_projects = ['true', '1', 'on'].includes(rawVal);
+    const saved = saveRoutingPolicy(policyFile, current);
+    return JSON.stringify({
+      state: 'updated',
+      policy_path: saved.path,
+      apply_to_unregistered_projects: saved.apply_to_unregistered_projects
+    }, null, 2);
   }
 
   throw new Error('Unknown command: ' + opts.command);
