@@ -21,7 +21,7 @@ const {
 const { bindOrigin, contextHook, postToolHook, hookMatcher, ProjectRouter } = require('../src/router.cjs');
 const { Broker, dispatch, save } = require('../src/server.cjs');
 const { run: runModeCli } = require('../scripts/mode.cjs');
-const { loadGuardState, readGuardQuotaCooldown } = require('../src/agy-guard.cjs');
+const { defaultGuardStatePath, loadGuardState, recordToolOutcome, readGuardQuotaCooldown } = require('../src/agy-guard.cjs');
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 3600 * 1000;
@@ -1583,5 +1583,81 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
     const secondDrop = evaluateAgyProbeHealth({ probed: droppedProbe, prevHealth: recoveredHealth, nowMs: now + 30 * MINUTE_MS });
     assert.equal(notifyAgyHealthIfNeeded(mockBroker, { agy_health: secondDrop }, { now: now + 30 * MINUTE_MS, desktopNotify: p => alerts.push(p) }), true, 'New drop after recovery must alert cleanly again');
     assert.equal(alerts.length, 2);
+
+    // (f) CC Switch Antigravity account switch: immediately bypasses cache TTL + 10m probe throttle,
+    //     refreshes to the newly switched account's quota, and purges old account's stale 429 cooldown!
+    const ccAccountsFile = path.join(f.root, 'mock-cc-agy-accounts.json');
+    fs.writeFileSync(ccAccountsFile, '{"version":1}\n', 'utf8');
+    fs.utimesSync(ccAccountsFile, new Date(now), new Date(now));
+    const activeAcctFile = path.join(f.root, 'active-agy-acct.json');
+    fs.writeFileSync(activeAcctFile, JSON.stringify({ email: 'exhausted-a@example.com', rem5h: 0.02, rem7d: 0.08 }), 'utf8');
+    const mockSwitchableCli = path.join(f.root, 'mock-switchable-agy.cjs');
+    fs.writeFileSync(mockSwitchableCli, [
+      'const fs = require("node:fs");',
+      `const state = JSON.parse(fs.readFileSync(${JSON.stringify(activeAcctFile)}, "utf8"));`,
+      'const logArg = process.argv.find(a => a.startsWith("--log-file="));',
+      'if (logArg) fs.writeFileSync(logArg.slice("--log-file=".length), `server_oauth.go:221] applyAuthResult: email=${state.email}, authMethod=consumer\\n`, "utf8");',
+      `console.log(JSON.stringify({ status: "SUCCESS", command: { data: { groups: [{ buckets: [{ id: "gemini-weekly", remaining_fraction: state.rem7d, reset_time: ${JSON.stringify(relIso(now, 80 * HOUR_MS))} }, { id: "gemini-5h", remaining_fraction: state.rem5h, reset_time: ${JSON.stringify(relIso(now, 4 * HOUR_MS))} }] }] } } }));`
+    ].join('\n'), 'utf8');
+
+    const dummyEntry = path.join(f.root, 'fake-codex.cmd');
+    fs.writeFileSync(dummyEntry, '@echo off\r\n', 'utf8');
+    const switchBroker = new Broker({
+      project: f.project,
+      data: f.data,
+      entry: dummyEntry,
+      pwsh: 'pwsh.exe',
+      model: 'gpt-test',
+      model_aliases: {},
+      reasoning_effort: 'medium',
+      service_tier: 'default',
+      web_search: 'live',
+      allow_sandbox: false,
+      review_category: 'general',
+      review_models: {}
+    }, async () => ({
+      ordinaryUsageAllowed: true,
+      rateLimits: { planType: 'pro', primary: { usedPercent: 60, windowDurationMins: 10080, resetsAt: relSec(now, 72 * HOUR_MS) } }
+    }));
+
+    // Step 1: Account A (`exhausted-a@example.com`) is at 98% 5h / 92% 7d AND hit a 429 cooldown:
+    const guardPath = defaultGuardStatePath(f.policyPath, { data: f.data });
+    recordToolOutcome({
+      conversationId: 'aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb',
+      toolCall: { name: 'edit_file', args: { Path: 'a.js' } },
+      toolResult: { error: '429 RESOURCE_EXHAUSTED: quota exceeded' }
+    }, guardPath, now);
+    const qAcctA = await switchBroker.quota({
+      refresh: true,
+      agy_bin: [process.execPath, mockSwitchableCli],
+      probe_home_dir: path.join(f.root, 'switch-probe-home'),
+      cc_switch_accounts_file: ccAccountsFile,
+      keyring_last_written_ms: now,
+      nowMs: now + 5000
+    });
+    assert.equal(qAcctA.agy_health.account_email, 'exhausted-a@example.com');
+    assert.equal(qAcctA.agy_pacing.window_5h.used_percent, 98);
+    assert.equal(qAcctA.agy_pacing.window_5h.status, 'limited');
+
+    // Step 2: 30 seconds later (well inside 5m cache TTL & 10m probe throttle!), user switches to Account B in CC Switch:
+    fs.writeFileSync(activeAcctFile, JSON.stringify({ email: 'fresh-b@example.com', rem5h: 1.0, rem7d: 1.0 }), 'utf8');
+    const switchTimeMs = now + 30 * 1000;
+    fs.utimesSync(ccAccountsFile, new Date(switchTimeMs), new Date(switchTimeMs));
+
+    const qAcctB = await switchBroker.quota({
+      // Note: refresh is NOT set! Must auto-detect CC Switch mtime change, bypass cache, probe Account B, and clear Account A's 429 cooldown!
+      agy_bin: [process.execPath, mockSwitchableCli],
+      probe_home_dir: path.join(f.root, 'switch-probe-home'),
+      cc_switch_accounts_file: ccAccountsFile,
+      keyring_last_written_ms: switchTimeMs,
+      nowMs: switchTimeMs + 1000
+    });
+    assert.equal(qAcctB.cached, false, 'CC Switch mtime change must bypass cached quota immediately');
+    assert.equal(qAcctB.agy_health.account_email, 'fresh-b@example.com');
+    assert.equal(qAcctB.agy_health.account_switched, true);
+    assert.equal(qAcctB.agy_pacing.window_5h.used_percent, 0);
+    assert.equal(qAcctB.agy_pacing.window_7d.used_percent, 0);
+    assert.equal(qAcctB.agy_pacing.window_5h.status, 'ok', 'Old account 429 cooldown must be purged upon switching to fresh Account B');
+    assert.equal(readGuardQuotaCooldown(guardPath, switchTimeMs + 1000), null);
   }
 });

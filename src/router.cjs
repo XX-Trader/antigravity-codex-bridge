@@ -87,8 +87,8 @@ function bindOrigin(payload, projects, options = {}) {
     const guardFile = options.guardStateFile || defaultGuardStatePath(policyPath, selected.scope);
     const guardCooldown = readGuardQuotaCooldown(guardFile, options.nowMs);
     const effPolicy = { ...projectPolicy, ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
-    const { codexPacing, agyUsage, agyExternal } = resolveSharedQuotaSnapshot(selected.scope, effPolicy, { ...options, policyPath });
-    const agyPacing = evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy: effPolicy, codexPacing, nowMs: options.nowMs });
+    const { codexPacing, agyUsage, agyExternal, agyHealth } = resolveSharedQuotaSnapshot(selected.scope, effPolicy, { ...options, policyPath });
+    const agyPacing = evaluateAgyPacing({ agyUsage, agyExternal, agyHealth, projectPolicy: effPolicy, codexPacing, nowMs: options.nowMs });
     const gate = checkAgyExecutionGate(payload, selected.scope, effPolicy, {
       policyPath,
       guardStateFile: guardFile,
@@ -145,9 +145,9 @@ function bindOrigin(payload, projects, options = {}) {
     const guardCooldown = readGuardQuotaCooldown(guardFile, options.nowMs);
     const effPolicy = { ...selected.policy, ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
     if (effPolicy.mode === 'auto') {
-      const { codexPacing, agyUsage, agyExternal } = resolveSharedQuotaSnapshot(selected.scope, effPolicy, { ...options, policyPath });
+      const { codexPacing, agyUsage, agyExternal, agyHealth } = resolveSharedQuotaSnapshot(selected.scope, effPolicy, { ...options, policyPath });
       if (codexPacing.available) {
-        const agyPacing = evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy: effPolicy, codexPacing, nowMs: options.nowMs });
+        const agyPacing = evaluateAgyPacing({ agyUsage, agyExternal, agyHealth, projectPolicy: effPolicy, codexPacing, nowMs: options.nowMs });
         const totalActive = projects.reduce((sum, p) => sum + activeCodexTasks(p).count, 0);
         const concGate = evaluateCodexConcurrencyGate({ args, projectPolicy: effPolicy, codexPacing, agyPacing, totalActiveCodexTasks: totalActive });
         if (concGate.blocked) return { decision: 'deny', reason: concGate.reason };

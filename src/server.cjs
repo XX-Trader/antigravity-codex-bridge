@@ -23,6 +23,7 @@ const {
   evaluateCodexPacing,
   scanAgyTranscriptUsage,
   detectCcSwitchAccountsMtimeMs,
+  detectAgyKeyringLastWrittenMs,
   probeAgyQuotaAsync,
   evaluateAgyProbeHealth,
   activeCodexTasks,
@@ -33,7 +34,7 @@ const {
   shouldPreferRolloutOverStale,
   writeQuotaCache
 } = require('./routing-policy.cjs');
-const { defaultGuardStatePath, readGuardQuotaCooldown } = require('./agy-guard.cjs');
+const { defaultGuardStatePath, readGuardQuotaCooldown, clearGuardQuotaCooldown } = require('./agy-guard.cjs');
 
 const terminal = new Set(['completed', 'failed', 'cancelled', 'timed_out', 'needs_input', 'blocked', 'execution_blocked', 'review_revise', 'review_needs_evidence']);
 const capacityMessage = 'Selected model is at capacity. Please try a different model';
@@ -744,13 +745,22 @@ class Broker {
     const nowMs = input.nowMs ?? Date.now();
     const policyPath = defaultPolicyPath(this.settings);
     const policy = loadRoutingPolicy(policyPath);
-    const guardCooldown = readGuardQuotaCooldown(defaultGuardStatePath(policyPath, this.settings), nowMs);
-    const projectPolicy = { ...resolveProjectPolicy(policy, this.settings), ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
+    const guardStateFile = defaultGuardStatePath(policyPath, this.settings);
+    const guardCooldown = readGuardQuotaCooldown(guardStateFile, nowMs);
+    let projectPolicy = { ...resolveProjectPolicy(policy, this.settings), ...(guardCooldown ? { guard_quota_cooldown: guardCooldown } : {}) };
     const cachePath = defaultQuotaCachePath(policyPath, this.settings);
     const indexPath = defaultTranscriptIndexPath(policyPath, this.settings);
     const isRefresh = input.refresh === true;
     const isBackground = input.background === true;
-    const cached = (!isRefresh && !isBackground) ? readQuotaCache(cachePath, projectPolicy.cache_ttl_seconds, nowMs) : null;
+    const fastCcMtimeMs = detectCcSwitchAccountsMtimeMs({ ccSwitchAccountsFile: input.cc_switch_accounts_file });
+    const rawCached = (!isRefresh && !isBackground) ? readQuotaCache(cachePath, projectPolicy.cache_ttl_seconds, nowMs) : null;
+    const ccChangedVsCache = Boolean(
+      rawCached
+      && fastCcMtimeMs !== null
+      && rawCached.agy_health?.cc_switch_mtime_ms !== undefined
+      && fastCcMtimeMs !== rawCached.agy_health.cc_switch_mtime_ms
+    );
+    const cached = ccChangedVsCache ? null : rawCached;
 
     if (cached) {
       const active = activeCodexTasks(this.settings);
@@ -845,10 +855,19 @@ class Broker {
 
       let agyProbedAt = prev?.agy_probed_at || null;
       const prevAgyProbeMs = Date.parse(agyProbedAt || '');
-      const ccSwitchMtimeMs = detectCcSwitchAccountsMtimeMs({ ccSwitchAccountsFile: input.cc_switch_accounts_file });
+      const ccSwitchMtimeMs = fastCcMtimeMs;
+      const preKeyringMs = detectAgyKeyringLastWrittenMs({
+        keyringLastWrittenMs: input.keyring_last_written_ms,
+        probeHomeDir: input.probe_home_dir
+      });
       const ccSwitchChanged = ccSwitchMtimeMs !== null
         && prev?.agy_health?.cc_switch_mtime_ms !== undefined
         && ccSwitchMtimeMs !== prev.agy_health.cc_switch_mtime_ms;
+      const keyringChanged = preKeyringMs !== null
+        && prev?.agy_health?.keyring_last_written_ms !== undefined
+        && prev?.agy_health?.keyring_last_written_ms !== null
+        && preKeyringMs !== prev.agy_health.keyring_last_written_ms;
+      const authSignalChanged = ccSwitchChanged || keyringChanged;
       const probeIntervalMs = prev?.agy_health?.status === 'auth_required' ? 30 * 60 * 1000 : 10 * 60 * 1000;
       const anyBucketExpired = Boolean(
         prev?.agy_external?.buckets
@@ -857,7 +876,7 @@ class Broker {
           return Number.isFinite(ms) && ms > 0 && ms <= nowMs;
         })
       );
-      if (!isRefresh && !ccSwitchChanged && !anyBucketExpired && Number.isFinite(prevAgyProbeMs) && (nowMs - prevAgyProbeMs < probeIntervalMs) && prev?.agy_external !== undefined) {
+      if (!isRefresh && !authSignalChanged && !anyBucketExpired && Number.isFinite(prevAgyProbeMs) && (nowMs - prevAgyProbeMs < probeIntervalMs) && prev?.agy_external !== undefined) {
         agyExternal = prev.agy_external;
         agyHealth = prev.agy_health || null;
       } else {
@@ -869,15 +888,25 @@ class Broker {
           cachePath,
           nowMs
         });
+        // Re-read keyring timestamp AFTER probe so our own hourly token refresh is recorded cleanly without double-probing next tick.
+        const postKeyringMs = detectAgyKeyringLastWrittenMs({
+          keyringLastWrittenMs: input.keyring_last_written_ms,
+          probeHomeDir: input.probe_home_dir
+        }) ?? preKeyringMs;
         agyHealth = evaluateAgyProbeHealth({
           probed,
           prevHealth: prev?.agy_health || null,
           prevExternal: prev?.agy_external || null,
           prevProbedAt: prev?.agy_probed_at || prev?.fetched_at || null,
           ccSwitchMtimeMs,
+          keyringLastWrittenMs: postKeyringMs,
           nowMs,
           modeScriptPath: path.resolve(__dirname, '..', 'scripts', 'Mode.ps1')
         });
+        if (agyHealth.account_switched) {
+          clearGuardQuotaCooldown(guardStateFile);
+          projectPolicy = resolveProjectPolicy(policy, this.settings);
+        }
         if (probed !== null) {
           if (probed.available) {
             agyExternal = probed;

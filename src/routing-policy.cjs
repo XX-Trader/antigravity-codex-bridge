@@ -597,7 +597,7 @@ function advanceResetAnchor(resetMs, windowMs, nowMs) {
   return next;
 }
 
-function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, nowMs = Date.now() }) {
+function evaluateAgyPacing({ agyUsage, agyExternal, agyHealth, projectPolicy, codexPacing, nowMs = Date.now() }) {
   const cfg = { ...DEFAULT_AGY_PACING, ...(projectPolicy?.agy_pacing || {}) };
   const snapshot = projectPolicy?.agy_manual_snapshot || null;
   const snapshotAgeMs = snapshot ? nowMs - Date.parse(snapshot.recorded_at) : Infinity;
@@ -635,8 +635,14 @@ function evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy, codexPacing, 
   }
 
   const agyCooling = cooldownActive(projectPolicy?.cooldowns?.agy, nowMs);
-  const guardCooling = cooldownActive(projectPolicy?.guard_quota_cooldown, nowMs);
-  const recentQuotaErr = agyUsage?.auto_degraded === true || guardCooling;
+  const switchedAtMs = Date.parse(agyHealth?.account_switched_at || '');
+  const guardRecordedMs = Date.parse(projectPolicy?.guard_quota_cooldown?.updated_at || '');
+  const guardCooling = cooldownActive(projectPolicy?.guard_quota_cooldown, nowMs)
+    && !(Number.isFinite(switchedAtMs) && Number.isFinite(guardRecordedMs) && guardRecordedMs < switchedAtMs);
+  const latestErrMs = Date.parse(agyUsage?.latest_quota_error_at || '');
+  const postSwitchTranscript429 = agyUsage?.auto_degraded === true
+    && !(Number.isFinite(switchedAtMs) && Number.isFinite(latestErrMs) && latestErrMs < switchedAtMs);
+  const recentQuotaErr = postSwitchTranscript429 || guardCooling;
   const hintLow = projectPolicy?.agy_quota_hint === 'low';
   let status5h = 'ok';
   let reason5h = null;
@@ -1444,10 +1450,74 @@ function detectCcSwitchAccountsMtimeMs(options = {}) {
   const explicit = options.ccSwitchAccountsFile;
   if (explicit === null) return null;
   if (!explicit && process.env.CODEX_EXECUTOR_TEST_ROOT) return null;
-  const target = explicit || path.join(os.homedir(), '.cc-switch', 'agy_accounts.json');
+  const targets = explicit
+    ? [explicit]
+    : [
+      path.join(os.homedir(), '.cc-switch', 'agy_accounts.json'),
+      path.join(os.homedir(), '.cc-switch', 'agy-login-stash.json')
+    ];
+  let maxMtime = null;
+  for (const target of targets) {
+    try {
+      const st = fs.statSync(target);
+      if (st.isFile()) {
+        const ms = Math.floor(st.mtimeMs);
+        if (maxMtime === null || ms > maxMtime) maxMtime = ms;
+      }
+    } catch {}
+  }
+  return maxMtime;
+}
+
+function detectAgyKeyringLastWrittenMs(options = {}) {
+  if (options.keyringLastWrittenMs !== undefined) return options.keyringLastWrittenMs;
+  if (process.platform !== 'win32' || process.env.CODEX_EXECUTOR_TEST_ROOT) return null;
   try {
-    const st = fs.statSync(target);
-    return st.isFile() ? Math.floor(st.mtimeMs) : null;
+    const probeHome = options.probeHomeDir || defaultAgyProbeHome();
+    fs.mkdirSync(probeHome, { recursive: true });
+    const dllPath = path.join(probeHome, 'agy-cred-meta-v1.dll');
+    const pwsh = options.pwsh || process.env.CODEX_EXECUTOR_PWSH || 'pwsh.exe';
+    const script = [
+      `$dll = ${JSON.stringify(dllPath)}`,
+      'if (-not (Test-Path -LiteralPath $dll)) {',
+      '  Add-Type -OutputAssembly $dll -TypeDefinition @"',
+      'using System;',
+      'using System.Runtime.InteropServices;',
+      'public static class AgyCredMeta {',
+      '  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]',
+      '  private struct CREDENTIAL {',
+      '    public uint Flags; public uint Type; public string TargetName; public string Comment;',
+      '    public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;',
+      '    public uint CredentialBlobSize; public IntPtr CredentialBlob; public uint Persist;',
+      '    public uint AttributeCount; public IntPtr Attributes; public string TargetAlias; public string UserName;',
+      '  }',
+      '  [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]',
+      '  private static extern bool CredRead(string target, uint type, uint flags, out IntPtr credPtr);',
+      '  [DllImport("advapi32.dll", SetLastError = true)]',
+      '  private static extern void CredFree(IntPtr credPtr);',
+      '  public static long GetLastWrittenMs(string target) {',
+      '    IntPtr ptr;',
+      '    if (!CredRead(target, 1, 0, out ptr) || ptr == IntPtr.Zero) return -1;',
+      '    try {',
+      '      var cred = Marshal.PtrToStructure<CREDENTIAL>(ptr);',
+      '      long ft = (((long)cred.LastWritten.dwHighDateTime) << 32) | ((uint)cred.LastWritten.dwLowDateTime);',
+      '      return DateTimeOffset.FromFileTime(ft).ToUnixTimeMilliseconds();',
+      '    } finally { CredFree(ptr); }',
+      '  }',
+      '}',
+      '"@',
+      '}',
+      '[void][Reflection.Assembly]::LoadFile($dll)',
+      '[Console]::Out.Write([AgyCredMeta]::GetLastWrittenMs("gemini:antigravity"))'
+    ].join('\n');
+    const res = spawnSync(pwsh, ['-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 5000
+    });
+    if (res.status !== 0) return null;
+    const parsed = Number(String(res.stdout || '').trim());
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
   } catch {
     return null;
   }
@@ -1698,7 +1768,7 @@ async function runAgyInteractiveLoginAsync(options = {}) {
   };
 }
 
-function evaluateAgyProbeHealth({ probed, prevHealth, prevExternal, prevProbedAt, ccSwitchMtimeMs = null, nowMs = Date.now(), modeScriptPath = null }) {
+function evaluateAgyProbeHealth({ probed, prevHealth, prevExternal, prevProbedAt, ccSwitchMtimeMs = null, keyringLastWrittenMs = null, nowMs = Date.now(), modeScriptPath = null }) {
   const nowIso = new Date(nowMs).toISOString();
   const loginCmd = modeScriptPath
     ? `pwsh -NoProfile -File "${modeScriptPath.replace(/\\/g, '/')}" agy-login`
@@ -1710,7 +1780,10 @@ function evaluateAgyProbeHealth({ probed, prevHealth, prevExternal, prevProbedAt
       alert_needed: false,
       consecutive_failures: 0,
       account_email: null,
+      account_switched: false,
+      account_switched_at: prevHealth?.account_switched_at || null,
       cc_switch_mtime_ms: ccSwitchMtimeMs,
+      keyring_last_written_ms: keyringLastWrittenMs,
       last_success_at: prevHealth?.last_success_at || null,
       since: null,
       last_error: null,
@@ -1720,12 +1793,21 @@ function evaluateAgyProbeHealth({ probed, prevHealth, prevExternal, prevProbedAt
   }
 
   if (probed.available) {
+    const nextEmail = probed.account_email || prevHealth?.account_email || null;
+    const accountSwitched = Boolean(
+      probed.account_email
+      && prevHealth?.account_email
+      && probed.account_email.toLowerCase() !== prevHealth.account_email.toLowerCase()
+    );
     return {
       status: 'healthy',
       alert_needed: false,
       consecutive_failures: 0,
-      account_email: probed.account_email || prevHealth?.account_email || null,
+      account_email: nextEmail,
+      account_switched: accountSwitched,
+      account_switched_at: accountSwitched ? nowIso : (prevHealth?.account_switched_at || null),
       cc_switch_mtime_ms: ccSwitchMtimeMs,
+      keyring_last_written_ms: keyringLastWrittenMs,
       last_success_at: nowIso,
       since: null,
       last_error: null,
@@ -1767,7 +1849,10 @@ function evaluateAgyProbeHealth({ probed, prevHealth, prevExternal, prevProbedAt
     consecutive_failures: consecutive,
     failure_kind: probed.failure_kind || 'probe_error',
     account_email: prevHealth?.account_email || null,
+    account_switched: false,
+    account_switched_at: prevHealth?.account_switched_at || null,
     cc_switch_mtime_ms: ccSwitchMtimeMs,
+    keyring_last_written_ms: keyringLastWrittenMs,
     last_success_at: prevHealth?.last_success_at || null,
     since,
     last_error: probed.error || null,
@@ -2025,7 +2110,7 @@ function decideRoute(input = {}) {
   const agyUsage = input.agyUsage || { available: false };
   const agyExternal = input.agyExternal || null;
   const agyHealth = input.agyHealth || null;
-  const agyPacing = input.agyPacing || evaluateAgyPacing({ agyUsage, agyExternal, projectPolicy: policy, codexPacing, nowMs });
+  const agyPacing = input.agyPacing || evaluateAgyPacing({ agyUsage, agyExternal, agyHealth, projectPolicy: policy, codexPacing, nowMs });
   const activeTasks = input.activeCodexTasks || { count: 0, orphaned: 0, tasks: [] };
   const currentModelName = typeof input.modelName === 'string' ? input.modelName : '';
 
@@ -2814,6 +2899,7 @@ module.exports = {
   resolveRealAgyBin,
   inspectAgyCliLog,
   detectCcSwitchAccountsMtimeMs,
+  detectAgyKeyringLastWrittenMs,
   parseAgyProbePayload,
   runExternalAgyProbe,
   runExternalAgyProbeAsync,

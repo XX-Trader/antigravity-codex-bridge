@@ -16,7 +16,7 @@ function defaultGuardStatePath(policyPath, scope) {
 }
 
 function loadGuardState(file) {
-  if (!file || !fs.existsSync(file)) return { schema: 1, conversations: {}, agy_quota_cooldown_until: null, agy_quota_cooldown_reason: null };
+  if (!file || !fs.existsSync(file)) return { schema: 1, conversations: {}, agy_quota_cooldown_until: null, agy_quota_cooldown_reason: null, updated_at: null };
   try {
     const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!doc || typeof doc !== 'object') throw new Error('invalid');
@@ -24,10 +24,11 @@ function loadGuardState(file) {
       schema: 1,
       conversations: doc.conversations && typeof doc.conversations === 'object' && !Array.isArray(doc.conversations) ? doc.conversations : {},
       agy_quota_cooldown_until: typeof doc.agy_quota_cooldown_until === 'string' ? doc.agy_quota_cooldown_until : null,
-      agy_quota_cooldown_reason: typeof doc.agy_quota_cooldown_reason === 'string' ? doc.agy_quota_cooldown_reason : null
+      agy_quota_cooldown_reason: typeof doc.agy_quota_cooldown_reason === 'string' ? doc.agy_quota_cooldown_reason : null,
+      updated_at: typeof doc.updated_at === 'string' ? doc.updated_at : null
     };
   } catch {
-    return { schema: 1, conversations: {}, agy_quota_cooldown_until: null, agy_quota_cooldown_reason: null };
+    return { schema: 1, conversations: {}, agy_quota_cooldown_until: null, agy_quota_cooldown_reason: null, updated_at: null };
   }
 }
 
@@ -304,7 +305,20 @@ function readGuardQuotaCooldown(stateFile, nowMs = Date.now()) {
   if (!state.agy_quota_cooldown_until) return null;
   const ms = Date.parse(state.agy_quota_cooldown_until);
   if (!Number.isFinite(ms) || ms <= nowMs) return null;
-  return { until: state.agy_quota_cooldown_until, reason: state.agy_quota_cooldown_reason || 'PostToolUse 429 cooldown' };
+  return {
+    until: state.agy_quota_cooldown_until,
+    reason: state.agy_quota_cooldown_reason || 'PostToolUse 429 cooldown',
+    updated_at: state.updated_at || null
+  };
+}
+
+function clearGuardQuotaCooldown(stateFile) {
+  if (!stateFile || !fs.existsSync(stateFile)) return;
+  const state = loadGuardState(stateFile);
+  if (!state.agy_quota_cooldown_until) return;
+  state.agy_quota_cooldown_until = null;
+  state.agy_quota_cooldown_reason = null;
+  persistGuardState(stateFile, state);
 }
 
 module.exports = {
@@ -315,5 +329,6 @@ module.exports = {
   recordToolOutcome,
   checkAgyExecutionGate,
   resetAgyGuard,
-  readGuardQuotaCooldown
+  readGuardQuotaCooldown,
+  clearGuardQuotaCooldown
 };
