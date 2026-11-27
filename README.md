@@ -25,7 +25,7 @@
 ## 环境
 
 - Windows、Node.js 22+、PowerShell 7。
-- 已安装并登录的 Codex CLI。开发验收使用 Codex 0.164.0；其它版本需要自行验证兼容性。
+- 已安装并登录的 Codex CLI（已实测兼容至 `0.172.0` 的 `--no-daemon app-server` 与 `exec`；实际可用模型列表取决于账号及客户端版本）。
 - Antigravity 支持本地 MCP。自动回执另外依赖该产品版本提供 Sidecars 和 `agentapi`。
 - Codex VS Code 扩展与 CLI 使用同一本机历史目录。SSH/WSL 中另一套历史不能用本机链接代替。
 
@@ -55,7 +55,7 @@ pwsh -NoProfile -File scripts/Setup.ps1 --project 'C:/work/my-project' --data 'C
 
 安装后在 Antigravity 刷新 `codex-executor`，并重新载入项目规则。脚本不会重启应用、取消后台任务或修改 Codex 全局配置。旧进程仍使用启动时的代码，不能把文件更新当成已热加载。
 
-完整参数、手动配置和回滚见 [配置说明](docs/configuration.md)。项目编排规则正文只有一份：[Antigravity 项目说明](.agents/rules/antigravity-codex.md)。
+完整参数、手动配置和回滚见 [配置说明](docs/configuration.md)；可直接落地的双引擎配置模板、模型档位、思考强度与 Claude 独立模型池使用说明见 [实战配置与模型选型指南](docs/usage-config-guide.md)。项目编排规则正文只有一份：[Antigravity 项目说明](.agents/rules/antigravity-codex.md)。
 
 ## 常用工具
 
