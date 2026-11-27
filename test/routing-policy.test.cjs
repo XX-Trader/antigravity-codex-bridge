@@ -1901,3 +1901,75 @@ test('apply_to_unregistered_projects enables flexible local AGY guard across unr
   assert.equal(codexDenied.decision, 'deny');
   assert.match(codexDenied.reason || '', /没有已登记的 Codex 执行根/);
 });
+
+test('advanceResetAnchor is O(1) across huge epochs, detectAgyKeyringLastWrittenMsAsync works, and agy-guard skips unnecessary job scans + reclaims stale locks', async t => {
+  const { advanceResetAnchor, detectAgyKeyringLastWrittenMsAsync } = require('../src/routing-policy.cjs');
+  const { withGuardLock, checkAgyExecutionGate, recordToolOutcome, loadGuardState } = require('../src/agy-guard.cjs');
+
+  // 1. O(1) advanceResetAnchor boundary & epoch=0 safety
+  const win5h = 5 * 3600 * 1000;
+  const nowMs = Date.now();
+  const t0 = Date.now();
+  const nextFromZero = advanceResetAnchor(0, win5h, nowMs);
+  assert.ok(Date.now() - t0 < 50, 'advanceResetAnchor must not loop linearly from epoch 0');
+  assert.ok(nextFromZero > nowMs && nextFromZero <= nowMs + win5h);
+  assert.equal(advanceResetAnchor(1000, 500, 1000), 1500);
+  assert.equal(advanceResetAnchor(1000, 500, 1499), 1500);
+  assert.equal(advanceResetAnchor(1000, 500, 1500), 2000);
+  assert.equal(advanceResetAnchor(2000, 500, 1500), 2000);
+  assert.equal(advanceResetAnchor(NaN, 500, 1500), null);
+
+  // 2. Async keyring helper honors explicit override and test-root guard
+  assert.equal(await detectAgyKeyringLastWrittenMsAsync({ keyringLastWrittenMs: 123456789 }), 123456789);
+  assert.equal(await detectAgyKeyringLastWrittenMsAsync({}), null);
+
+  // 3. agy-guard skips jobs/ directory scan in advisory mode for general projects
+  const f = fixture(t);
+  const badJobsDir = path.join(f.data, 'jobs');
+  fs.mkdirSync(badJobsDir, { recursive: true });
+  const origReaddir = fs.readdirSync;
+  let jobsScanned = 0;
+  fs.readdirSync = (...args) => {
+    if (String(args[0]) === badJobsDir) jobsScanned++;
+    return origReaddir(...args);
+  };
+  try {
+    const generalGate = checkAgyExecutionGate(
+      { conversationId: 'dddd4444-4444-4444-4444-444444444444', toolCall: { name: 'edit_file', args: { Path: 'a.js' } } },
+      { project: f.project, data: f.data },
+      { review_category: 'general', agy_guard: { review_gate: 'advisory', review_valid_hours: 12, max_same_error_failures: 3, max_consecutive_failures: 8 } },
+      { guardStateFile: path.join(f.data, 'guard.json'), nowMs }
+    );
+    assert.equal(generalGate.blocked, false);
+    assert.equal(jobsScanned, 0, 'general project in advisory mode must not scan jobs/');
+
+    const quantGate = checkAgyExecutionGate(
+      { conversationId: 'dddd4444-4444-4444-4444-444444444444', toolCall: { name: 'edit_file', args: { Path: 'a.py' } } },
+      { project: f.project, data: f.data },
+      { review_category: 'quant', agy_guard: { review_gate: 'advisory', review_valid_hours: 12, max_same_error_failures: 3, max_consecutive_failures: 8 } },
+      { guardStateFile: path.join(f.data, 'guard.json'), nowMs }
+    );
+    assert.equal(quantGate.blocked, false);
+    assert.equal(jobsScanned, 1, 'quant project in advisory mode still checks recent review');
+  } finally {
+    fs.readdirSync = origReaddir;
+  }
+
+  // 4. withGuardLock reclaims dead-PID stale lock and persists state cleanly
+  const stateFile = path.join(f.data, 'locked-guard.json');
+  const lockFile = `${stateFile}.lock`;
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: 99999999, at: Date.now() }), 'utf8');
+  const rec = recordToolOutcome(
+    { conversationId: 'eeee5555-5555-5555-5555-555555555555', lastUserInput: 'run tests', toolCall: { name: 'run_command', args: { CommandLine: 'npm test' } }, error: 'boom' },
+    { project: f.project, data: f.data },
+    { agy_guard: { max_same_error_failures: 3, max_consecutive_failures: 8 } },
+    { guardStateFile: stateFile, nowMs }
+  );
+  assert.equal(rec.recorded, true);
+  assert.equal(fs.existsSync(lockFile), false, 'lock file cleaned up after recordToolOutcome');
+  assert.equal(loadGuardState(stateFile).conversations['eeee5555-5555-5555-5555-555555555555'].consecutive_failures, 1);
+
+  const lockVal = withGuardLock(stateFile, () => 'inside');
+  assert.equal(lockVal, 'inside');
+  assert.equal(fs.existsSync(lockFile), false);
+});

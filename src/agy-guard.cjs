@@ -32,6 +32,49 @@ function loadGuardState(file) {
   }
 }
 
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error.code === 'EPERM'; }
+}
+
+function withGuardLock(stateFile, fn, timeoutMs = 300) {
+  if (!stateFile) return fn();
+  const lockFile = `${stateFile}.lock`;
+  const dir = path.dirname(stateFile);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const deadline = Date.now() + timeoutMs;
+  let acquired = false;
+  while (true) {
+    try {
+      const fd = fs.openSync(lockFile, 'wx');
+      try { fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }), 'utf8'); }
+      finally { fs.closeSync(fd); }
+      acquired = true;
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') break;
+      try {
+        const info = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+        const stale = (info?.pid && !processAlive(info.pid)) || (Number.isFinite(info?.at) && Date.now() - info.at > 5000);
+        if (stale) { try { fs.unlinkSync(lockFile); } catch {} continue; }
+      } catch {
+        try {
+          const st = fs.statSync(lockFile);
+          if (Date.now() - st.mtimeMs > 5000) { try { fs.unlinkSync(lockFile); } catch {} continue; }
+        } catch { continue; }
+      }
+      if (Date.now() >= deadline) break;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (acquired) { try { fs.unlinkSync(lockFile); } catch {} }
+  }
+}
+
 function persistGuardState(file, state) {
   if (!file) return;
   const entries = Object.entries(state.conversations || {}).slice(-40);
@@ -133,20 +176,9 @@ function recordToolOutcome(payload, scope, projectPolicy, options = {}) {
   const inputHash = hashInput(payload?.lastUserInput);
   const errorText = typeof payload?.error === 'string' ? payload.error.trim() : '';
 
-  const state = loadGuardState(stateFile);
-  let entry = state.conversations[convId] || {
-    consecutive_failures: 0,
-    same_error_streak: 0,
-    last_error_sig: null,
-    tripped: false,
-    trip_reason: null,
-    last_user_input_hash: inputHash,
-    recent_failures: []
-  };
-
-  // A new human turn resets prior loop-guard counters cleanly.
-  if (inputHash && entry.last_user_input_hash && inputHash !== entry.last_user_input_hash) {
-    entry = {
+  return withGuardLock(stateFile, () => {
+    const state = loadGuardState(stateFile);
+    let entry = state.conversations[convId] || {
       consecutive_failures: 0,
       same_error_streak: 0,
       last_error_sig: null,
@@ -155,53 +187,66 @@ function recordToolOutcome(payload, scope, projectPolicy, options = {}) {
       last_user_input_hash: inputHash,
       recent_failures: []
     };
-  } else if (inputHash) {
-    entry.last_user_input_hash = inputHash;
-  }
 
-  if (!errorText) {
-    entry.consecutive_failures = 0;
-    entry.same_error_streak = 0;
-    entry.last_error_sig = null;
-    entry.tripped = false;
-    entry.trip_reason = null;
-    entry.last_success_tool = name;
-    entry.last_success_at = new Date(nowMs).toISOString();
+    // A new human turn resets prior loop-guard counters cleanly.
+    if (inputHash && entry.last_user_input_hash && inputHash !== entry.last_user_input_hash) {
+      entry = {
+        consecutive_failures: 0,
+        same_error_streak: 0,
+        last_error_sig: null,
+        tripped: false,
+        trip_reason: null,
+        last_user_input_hash: inputHash,
+        recent_failures: []
+      };
+    } else if (inputHash) {
+      entry.last_user_input_hash = inputHash;
+    }
+
+    if (!errorText) {
+      entry.consecutive_failures = 0;
+      entry.same_error_streak = 0;
+      entry.last_error_sig = null;
+      entry.tripped = false;
+      entry.trip_reason = null;
+      entry.last_success_tool = name;
+      entry.last_success_at = new Date(nowMs).toISOString();
+      state.conversations[convId] = entry;
+      persistGuardState(stateFile, state);
+      return { recorded: true, outcome: 'success_reset', entry };
+    }
+
+    if (isAgyQuotaError(errorText)) {
+      const until = new Date(nowMs + cooldownMins * 60000).toISOString();
+      state.agy_quota_cooldown_until = until;
+      state.agy_quota_cooldown_reason = errorText.slice(0, 240);
+      state.conversations[convId] = entry;
+      persistGuardState(stateFile, state);
+      return { recorded: true, outcome: 'quota_cooldown', until, entry };
+    }
+
+    if (AUTH_OR_POLICY_ERR_RE.test(errorText)) {
+      entry.last_non_business_error = { tool: name, error: errorText.slice(0, 240), at: new Date(nowMs).toISOString() };
+      state.conversations[convId] = entry;
+      persistGuardState(stateFile, state);
+      return { recorded: true, outcome: 'auth_or_policy_ignored', entry };
+    }
+
+    const sig = failureSignature(name, args, errorText);
+    entry.consecutive_failures = (entry.consecutive_failures || 0) + 1;
+    entry.same_error_streak = entry.last_error_sig === sig ? (entry.same_error_streak || 0) + 1 : 1;
+    entry.last_error_sig = sig;
+    entry.recent_failures = [...(entry.recent_failures || []), { tool: name, sig, error: errorText.slice(0, 240), at: new Date(nowMs).toISOString() }].slice(-5);
+
+    const sameTripped = maxSameFailures > 0 && entry.same_error_streak >= maxSameFailures;
+    const totalTripped = maxTotalFailures > 0 && entry.consecutive_failures >= maxTotalFailures;
+    entry.tripped = sameTripped || totalTripped;
+    entry.trip_reason = sameTripped ? 'same_error_loop' : totalTripped ? 'no_progress_cap' : null;
+
     state.conversations[convId] = entry;
     persistGuardState(stateFile, state);
-    return { recorded: true, outcome: 'success_reset', entry };
-  }
-
-  if (isAgyQuotaError(errorText)) {
-    const until = new Date(nowMs + cooldownMins * 60000).toISOString();
-    state.agy_quota_cooldown_until = until;
-    state.agy_quota_cooldown_reason = errorText.slice(0, 240);
-    state.conversations[convId] = entry;
-    persistGuardState(stateFile, state);
-    return { recorded: true, outcome: 'quota_cooldown', until, entry };
-  }
-
-  if (AUTH_OR_POLICY_ERR_RE.test(errorText)) {
-    entry.last_non_business_error = { tool: name, error: errorText.slice(0, 240), at: new Date(nowMs).toISOString() };
-    state.conversations[convId] = entry;
-    persistGuardState(stateFile, state);
-    return { recorded: true, outcome: 'auth_or_policy_ignored', entry };
-  }
-
-  const sig = failureSignature(name, args, errorText);
-  entry.consecutive_failures = (entry.consecutive_failures || 0) + 1;
-  entry.same_error_streak = entry.last_error_sig === sig ? (entry.same_error_streak || 0) + 1 : 1;
-  entry.last_error_sig = sig;
-  entry.recent_failures = [...(entry.recent_failures || []), { tool: name, sig, error: errorText.slice(0, 240), at: new Date(nowMs).toISOString() }].slice(-5);
-
-  const sameTripped = maxSameFailures > 0 && entry.same_error_streak >= maxSameFailures;
-  const totalTripped = maxTotalFailures > 0 && entry.consecutive_failures >= maxTotalFailures;
-  entry.tripped = sameTripped || totalTripped;
-  entry.trip_reason = sameTripped ? 'same_error_loop' : totalTripped ? 'no_progress_cap' : null;
-
-  state.conversations[convId] = entry;
-  persistGuardState(stateFile, state);
-  return { recorded: true, outcome: entry.tripped ? 'tripped' : 'failure_counted', entry };
+    return { recorded: true, outcome: entry.tripped ? 'tripped' : 'failure_counted', entry };
+  });
 }
 
 function checkAgyExecutionGate(payload, scope, projectPolicy, options = {}) {
@@ -225,15 +270,20 @@ function checkAgyExecutionGate(payload, scope, projectPolicy, options = {}) {
     const entry = state.conversations[convId];
     if (entry?.tripped) {
       if (inputHash && entry.last_user_input_hash && inputHash !== entry.last_user_input_hash) {
-        entry.consecutive_failures = 0;
-        entry.same_error_streak = 0;
-        entry.last_error_sig = null;
-        entry.tripped = false;
-        entry.trip_reason = null;
-        entry.last_user_input_hash = inputHash;
-        entry.reset_by = 'new_user_input';
-        state.conversations[convId] = entry;
-        persistGuardState(stateFile, state);
+        withGuardLock(stateFile, () => {
+          const latestState = loadGuardState(stateFile);
+          const latestEntry = latestState.conversations[convId];
+          if (!latestEntry) return;
+          latestEntry.consecutive_failures = 0;
+          latestEntry.same_error_streak = 0;
+          latestEntry.last_error_sig = null;
+          latestEntry.tripped = false;
+          latestEntry.trip_reason = null;
+          latestEntry.last_user_input_hash = inputHash;
+          latestEntry.reset_by = 'new_user_input';
+          latestState.conversations[convId] = latestEntry;
+          persistGuardState(stateFile, latestState);
+        });
       } else {
         const latest = entry.recent_failures?.at(-1);
         const excerpt = latest ? `${latest.tool}: ${latest.error}` : '连续工具执行失败';
@@ -252,7 +302,8 @@ function checkAgyExecutionGate(payload, scope, projectPolicy, options = {}) {
   // 2. Hybrid Review-Before-AGY Gate (off | advisory | strict)
   const gateLevel = guardCfg.review_gate || 'advisory';
   const requiresWriteReview = WRITE_TOOL_RE.test(name) || /(?:^|[_/.:-])(?:invoke_subagent|run_workflow)$/i.test(name);
-  if (gateLevel !== 'off' && requiresWriteReview) {
+  const reviewLookupNeeded = gateLevel === 'strict' || (gateLevel === 'advisory' && projectPolicy?.review_category === 'quant');
+  if (reviewLookupNeeded && requiresWriteReview) {
     const validHours = guardCfg.review_valid_hours ?? 12;
     const review = findRecentCodexReview(scope, validHours, payload?.conversationId || null, nowMs);
     if (!review) {
@@ -287,16 +338,18 @@ function checkAgyExecutionGate(payload, scope, projectPolicy, options = {}) {
 }
 
 function resetAgyGuard(stateFile, conversationId = null) {
-  const state = loadGuardState(stateFile);
-  if (conversationId) {
-    delete state.conversations[conversationId];
-  } else {
-    state.conversations = {};
-    state.agy_quota_cooldown_until = null;
-    state.agy_quota_cooldown_reason = null;
-  }
-  persistGuardState(stateFile, state);
-  return state;
+  return withGuardLock(stateFile, () => {
+    const state = loadGuardState(stateFile);
+    if (conversationId) {
+      delete state.conversations[conversationId];
+    } else {
+      state.conversations = {};
+      state.agy_quota_cooldown_until = null;
+      state.agy_quota_cooldown_reason = null;
+    }
+    persistGuardState(stateFile, state);
+    return state;
+  });
 }
 
 function readGuardQuotaCooldown(stateFile, nowMs = Date.now()) {
@@ -314,16 +367,19 @@ function readGuardQuotaCooldown(stateFile, nowMs = Date.now()) {
 
 function clearGuardQuotaCooldown(stateFile) {
   if (!stateFile || !fs.existsSync(stateFile)) return;
-  const state = loadGuardState(stateFile);
-  if (!state.agy_quota_cooldown_until) return;
-  state.agy_quota_cooldown_until = null;
-  state.agy_quota_cooldown_reason = null;
-  persistGuardState(stateFile, state);
+  withGuardLock(stateFile, () => {
+    const state = loadGuardState(stateFile);
+    if (!state.agy_quota_cooldown_until) return;
+    state.agy_quota_cooldown_until = null;
+    state.agy_quota_cooldown_reason = null;
+    persistGuardState(stateFile, state);
+  });
 }
 
 module.exports = {
   defaultGuardStatePath,
   loadGuardState,
+  withGuardLock,
   failureSignature,
   findRecentCodexReview,
   recordToolOutcome,

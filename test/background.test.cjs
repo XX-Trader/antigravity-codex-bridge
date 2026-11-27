@@ -405,6 +405,49 @@ test('owned supervisor completion, boundaries, cancellation and crashes', async 
       assert.equal(result.exit_code, null); assert.match(result.error, /without a completion record/);
       bg.release(file, id); outstanding = null;
     });
+    await t.test('write() retries transient lock errors, cleans up tmp, and createLogAppender() survives EBUSY rotation', () => {
+      const target = path.join(root, 'retry-meta.json');
+      let renameCalls = 0;
+      const flakyFs = {
+        ...fs,
+        renameSync(src, dst) {
+          renameCalls++;
+          if (process.platform === 'win32' && renameCalls < 3) {
+            const err = new Error('busy'); err.code = 'EBUSY'; throw err;
+          }
+          return fs.renameSync(src, dst);
+        }
+      };
+      bg.write(target, { ok: 1 }, flakyFs);
+      assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), { ok: 1 });
+      if (process.platform === 'win32') assert.equal(renameCalls, 3);
+      assert.deepEqual(fs.readdirSync(root).filter(n => n.startsWith('retry-meta.json.') && n.endsWith('.tmp')), []);
+
+      // Permanent failure must unlink temp file
+      const failFs = {
+        ...fs,
+        renameSync() { const err = new Error('boom'); err.code = 'EINVAL'; throw err; }
+      };
+      assert.throws(() => bg.write(path.join(root, 'fail-meta.json'), { ok: 0 }, failFs), /boom/);
+      assert.deepEqual(fs.readdirSync(root).filter(n => n.startsWith('fail-meta.json.') && n.endsWith('.tmp')), []);
+
+      // createLogAppender must not throw or double-close fd when renameSync fails with EBUSY
+      const logPath = path.join(root, 'rotate-busy.log');
+      const busyRotateFs = {
+        ...fs,
+        renameSync() { const err = new Error('locked'); err.code = 'EBUSY'; throw err; }
+      };
+      const appender = bg.createLogAppender(logPath, 16, busyRotateFs);
+      try {
+        appender.append(Buffer.from('0123456789'));
+        appender.append(Buffer.from('abcdefghij')); // triggers rotation -> EBUSY -> fallback reopen & write
+        appender.append(Buffer.from('KLMNOP'));
+      } finally {
+        appender.close();
+        appender.close(); // idempotent close must never throw EBADF
+      }
+      assert.equal(fs.readFileSync(logPath, 'utf8'), '0123456789abcdefghijKLMNOP');
+    });
   } finally {
     if (outstanding) { const info = await bg.inspect(file, outstanding); await bg.killOwned(info.launch, pwsh); }
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

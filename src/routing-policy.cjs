@@ -603,10 +603,10 @@ function evaluateCodexPacing(rateLimitReply, pacingCfg = DEFAULT_PACING, nowMs =
 }
 
 function advanceResetAnchor(resetMs, windowMs, nowMs) {
-  if (!Number.isFinite(resetMs) || !Number.isFinite(windowMs) || windowMs <= 0) return null;
-  let next = resetMs;
-  while (next <= nowMs) next += windowMs;
-  return next;
+  if (!Number.isFinite(resetMs) || !Number.isFinite(windowMs) || windowMs <= 0 || !Number.isFinite(nowMs)) return null;
+  if (resetMs > nowMs) return resetMs;
+  const steps = Math.floor((nowMs - resetMs) / windowMs) + 1;
+  return resetMs + steps * windowMs;
 }
 
 function evaluateAgyPacing({ agyUsage, agyExternal, agyHealth, projectPolicy, codexPacing, nowMs = Date.now() }) {
@@ -1481,47 +1481,52 @@ function detectCcSwitchAccountsMtimeMs(options = {}) {
   return maxMtime;
 }
 
+function buildAgyKeyringScript(options = {}) {
+  const probeHome = options.probeHomeDir || defaultAgyProbeHome();
+  fs.mkdirSync(probeHome, { recursive: true });
+  const dllPath = path.join(probeHome, 'agy-cred-meta-v1.dll');
+  const pwsh = options.pwsh || process.env.CODEX_EXECUTOR_PWSH || 'pwsh.exe';
+  const script = [
+    `$dll = ${JSON.stringify(dllPath)}`,
+    'if (-not (Test-Path -LiteralPath $dll)) {',
+    '  Add-Type -OutputAssembly $dll -TypeDefinition @"',
+    'using System;',
+    'using System.Runtime.InteropServices;',
+    'public static class AgyCredMeta {',
+    '  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]',
+    '  private struct CREDENTIAL {',
+    '    public uint Flags; public uint Type; public string TargetName; public string Comment;',
+    '    public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;',
+    '    public uint CredentialBlobSize; public IntPtr CredentialBlob; public uint Persist;',
+    '    public uint AttributeCount; public IntPtr Attributes; public string TargetAlias; public string UserName;',
+    '  }',
+    '  [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]',
+    '  private static extern bool CredRead(string target, uint type, uint flags, out IntPtr credPtr);',
+    '  [DllImport("advapi32.dll", SetLastError = true)]',
+    '  private static extern void CredFree(IntPtr credPtr);',
+    '  public static long GetLastWrittenMs(string target) {',
+    '    IntPtr ptr;',
+    '    if (!CredRead(target, 1, 0, out ptr) || ptr == IntPtr.Zero) return -1;',
+    '    try {',
+    '      var cred = Marshal.PtrToStructure<CREDENTIAL>(ptr);',
+    '      long ft = (((long)cred.LastWritten.dwHighDateTime) << 32) | ((uint)cred.LastWritten.dwLowDateTime);',
+    '      return DateTimeOffset.FromFileTime(ft).ToUnixTimeMilliseconds();',
+    '    } finally { CredFree(ptr); }',
+    '  }',
+    '}',
+    '"@',
+    '}',
+    '[void][Reflection.Assembly]::LoadFile($dll)',
+    '[Console]::Out.Write([AgyCredMeta]::GetLastWrittenMs("gemini:antigravity"))'
+  ].join('\n');
+  return { pwsh, script };
+}
+
 function detectAgyKeyringLastWrittenMs(options = {}) {
   if (options.keyringLastWrittenMs !== undefined) return options.keyringLastWrittenMs;
   if (process.platform !== 'win32' || process.env.CODEX_EXECUTOR_TEST_ROOT) return null;
   try {
-    const probeHome = options.probeHomeDir || defaultAgyProbeHome();
-    fs.mkdirSync(probeHome, { recursive: true });
-    const dllPath = path.join(probeHome, 'agy-cred-meta-v1.dll');
-    const pwsh = options.pwsh || process.env.CODEX_EXECUTOR_PWSH || 'pwsh.exe';
-    const script = [
-      `$dll = ${JSON.stringify(dllPath)}`,
-      'if (-not (Test-Path -LiteralPath $dll)) {',
-      '  Add-Type -OutputAssembly $dll -TypeDefinition @"',
-      'using System;',
-      'using System.Runtime.InteropServices;',
-      'public static class AgyCredMeta {',
-      '  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]',
-      '  private struct CREDENTIAL {',
-      '    public uint Flags; public uint Type; public string TargetName; public string Comment;',
-      '    public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;',
-      '    public uint CredentialBlobSize; public IntPtr CredentialBlob; public uint Persist;',
-      '    public uint AttributeCount; public IntPtr Attributes; public string TargetAlias; public string UserName;',
-      '  }',
-      '  [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]',
-      '  private static extern bool CredRead(string target, uint type, uint flags, out IntPtr credPtr);',
-      '  [DllImport("advapi32.dll", SetLastError = true)]',
-      '  private static extern void CredFree(IntPtr credPtr);',
-      '  public static long GetLastWrittenMs(string target) {',
-      '    IntPtr ptr;',
-      '    if (!CredRead(target, 1, 0, out ptr) || ptr == IntPtr.Zero) return -1;',
-      '    try {',
-      '      var cred = Marshal.PtrToStructure<CREDENTIAL>(ptr);',
-      '      long ft = (((long)cred.LastWritten.dwHighDateTime) << 32) | ((uint)cred.LastWritten.dwLowDateTime);',
-      '      return DateTimeOffset.FromFileTime(ft).ToUnixTimeMilliseconds();',
-      '    } finally { CredFree(ptr); }',
-      '  }',
-      '}',
-      '"@',
-      '}',
-      '[void][Reflection.Assembly]::LoadFile($dll)',
-      '[Console]::Out.Write([AgyCredMeta]::GetLastWrittenMs("gemini:antigravity"))'
-    ].join('\n');
+    const { pwsh, script } = buildAgyKeyringScript(options);
     const res = spawnSync(pwsh, ['-NoProfile', '-NonInteractive', '-Command', script], {
       encoding: 'utf8',
       windowsHide: true,
@@ -1533,6 +1538,48 @@ function detectAgyKeyringLastWrittenMs(options = {}) {
   } catch {
     return null;
   }
+}
+
+function detectAgyKeyringLastWrittenMsAsync(options = {}) {
+  if (options.keyringLastWrittenMs !== undefined) return Promise.resolve(options.keyringLastWrittenMs);
+  if (process.platform !== 'win32' || process.env.CODEX_EXECUTOR_TEST_ROOT) return Promise.resolve(null);
+  let pwsh, script;
+  try {
+    ({ pwsh, script } = buildAgyKeyringScript(options));
+  } catch {
+    return Promise.resolve(null);
+  }
+  return new Promise(resolve => {
+    let stdout = '', settled = false;
+    const finish = val => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(val);
+    };
+    let child;
+    try {
+      child = spawn(pwsh, ['-NoProfile', '-NonInteractive', '-Command', script], {
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore']
+      });
+    } catch {
+      finish(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      try { killChildTree(child); } catch {}
+      finish(null);
+    }, 5000);
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.on('error', () => finish(null));
+    child.on('close', code => {
+      if (code !== 0) return finish(null);
+      const parsed = Number(String(stdout || '').trim());
+      finish(Number.isFinite(parsed) && parsed > 0 ? parsed : null);
+    });
+  });
 }
 
 function resolveAgyRetryPlan(options = {}) {
@@ -3224,6 +3271,8 @@ module.exports = {
   inspectAgyCliLog,
   detectCcSwitchAccountsMtimeMs,
   detectAgyKeyringLastWrittenMs,
+  detectAgyKeyringLastWrittenMsAsync,
+  advanceResetAnchor,
   parseAgyProbePayload,
   runExternalAgyProbe,
   runExternalAgyProbeAsync,

@@ -68,6 +68,7 @@ test('Windows process observation reuses and recovers its bounded helper', { ski
     assert.equal(second.items[0].identity, first.items[0].identity);
     assert.equal(query.child, helper);
     assert.equal((await query.request({ op: 'kill', pid: process.pid, identity: '1' })).requested, false);
+    assert.equal((await query.request({ op: 'kill', pid: 99999999, identity: '1' })).requested, false);
     query.close();
     const third = await query.request({ op: 'inspect', pids: [process.pid] });
     assert.equal(third.items[0].identity, first.items[0].identity);

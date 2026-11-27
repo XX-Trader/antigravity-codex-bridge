@@ -17,11 +17,69 @@ const read = file => {
   if (fs.statSync(file).size > 65536) throw new Error('Oversized background metadata');
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 };
-const write = (file, value) => {
-  const temp = file + '.' + process.pid + '.tmp';
-  fs.writeFileSync(temp, JSON.stringify(value), { encoding: 'utf8', flag: 'wx' });
-  fs.renameSync(temp, file);
+const sleepMs = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const write = (file, value, fsApi = fs) => {
+  const temp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  fsApi.writeFileSync(temp, JSON.stringify(value), { encoding: 'utf8', flag: 'wx' });
+  for (let attempt = 0; ; attempt++) {
+    try { fsApi.renameSync(temp, file); return; }
+    catch (error) {
+      if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt >= 9) {
+        try { fsApi.unlinkSync(temp); } catch {}
+        throw error;
+      }
+      sleepMs(20 * (attempt + 1));
+    }
+  }
 };
+function createLogAppender(log, maxBytes = 8 * 1024 * 1024, fsApi = fs) {
+  let fd = fsApi.openSync(log, 'a');
+  let bytes = fsApi.fstatSync(fd).size;
+  let nextRotateAt = 0;
+  const close = () => {
+    if (fd !== undefined) {
+      const current = fd;
+      fd = undefined;
+      fsApi.closeSync(current);
+    }
+  };
+  const append = chunk => {
+    try {
+      if (fd === undefined) {
+        fd = fsApi.openSync(log, 'a');
+        bytes = fsApi.fstatSync(fd).size;
+      }
+      if (bytes + chunk.length > maxBytes && Date.now() >= nextRotateAt) {
+        close();
+        const prior = log + '.1';
+        let rotated = false;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          try {
+            if (fsApi.existsSync(prior)) fsApi.unlinkSync(prior);
+            fsApi.renameSync(log, prior);
+            rotated = true;
+            break;
+          } catch (error) {
+            if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt >= 4) break;
+            sleepMs(20 * (attempt + 1));
+          }
+        }
+        if (!rotated) nextRotateAt = Date.now() + 5000;
+        fd = fsApi.openSync(log, 'a');
+        bytes = rotated ? 0 : fsApi.fstatSync(fd).size;
+      }
+      fsApi.writeSync(fd, chunk);
+      bytes += chunk.length;
+    } catch {
+      // Never crash the supervisor over a transient Windows log-rotation/file-lock error;
+      // keeping the owned child alive and recording status.json takes priority.
+      if (fd === undefined) {
+        try { fd = fsApi.openSync(log, 'a'); bytes = fsApi.fstatSync(fd).size; } catch {}
+      }
+    }
+  };
+  return { append, close, getFd: () => fd };
+}
 function contained(root, file) {
   const base = fs.realpathSync(root), actual = fs.realpathSync(file);
   const relative = path.relative(base, actual);
@@ -246,19 +304,11 @@ async function supervise(requestFile) {
   } catch (e) { query?.close(); throw e; }
   const launch = { id: request.id, job_id: request.job_id, nonce: request.nonce, pid: process.pid, identity: self };
   const log = path.join(dir, 'output.log');
-  let fd;
+  let logAppender;
   try {
-  fd = fs.openSync(log, 'a'); let bytes = fs.fstatSync(fd).size;
-  const append = chunk => {
-    if (bytes + chunk.length > 8 * 1024 * 1024) {
-      fs.closeSync(fd);
-      const prior = log + '.1'; if (fs.existsSync(prior)) fs.unlinkSync(prior);
-      fs.renameSync(log, prior); fd = fs.openSync(log, 'a'); bytes = 0;
-    }
-    fs.writeSync(fd, chunk); bytes += chunk.length;
-  };
+  logAppender = createLogAppender(log);
   const command = spawn(request.executable, request.args, { cwd: request.cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  command.stdout.on('data', append); command.stderr.on('data', append);
+  command.stdout.on('data', logAppender.append); command.stderr.on('data', logAppender.append);
   let error;
   command.on('error', e => { error = e.message; });
   const completion = new Promise(resolve => { command.once('close', resolve); });
@@ -276,15 +326,15 @@ async function supervise(requestFile) {
   query?.close();
   write(path.join(dir, 'launch.json'), launch);
   const code = await completion;
-  fs.closeSync(fd); fd = undefined;
+  logAppender.close();
   write(path.join(dir, 'status.json'), { id: request.id, job_id: request.job_id, nonce: request.nonce, exit_code: code, ended_at: new Date().toISOString(), ...(error ? { error } : {}) });
-  } finally { query?.close(); if (fd !== undefined) fs.closeSync(fd); }
+  } finally { query?.close(); logAppender?.close(); }
 }
 function release(file, id) {
   const { root } = layout(file), slot = path.join(root, 'active.json');
   if (fs.existsSync(slot) && read(slot).id === id) fs.unlinkSync(slot);
 }
-module.exports = { identity, killOwned, inspect, wait, start, enqueue, activate, release, contained };
+module.exports = { identity, killOwned, inspect, wait, start, enqueue, activate, release, contained, write, createLogAppender };
 if (require.main === module) {
   const action = process.argv[2], input = process.argv[3];
   const run = action === '--start' ? enqueue(process.env.CODEX_EXECUTOR_BACKGROUND_JOB, input).then(value => console.log('[CODEX_BACKGROUND_WAIT]\n' + JSON.stringify(value))) : action === '--supervise' ? supervise(input) : Promise.reject(new Error('Unknown background action'));

@@ -1008,5 +1008,67 @@ test('worker timeout diagnostics', async t => {
       const notices = require('../src/server.cjs').notificationEvents(file);
       assert.ok(notices.some(event => event.kind === 'terminal' && /30 秒/.test(event.detail)));
     });
+    await t.test('list() slices before summary(), listRaw() skips summary(), save() cleans tmp, readFromOffset() bounds reads', () => {
+      const { readFromOffset } = require('../src/server.cjs');
+      const isolatedData = fs.mkdtempSync(path.join(root, 'list-opt-'));
+      const isolatedBroker = new Broker({ ...settings, data: isolatedData });
+      for (let i = 0; i < 5; i++) {
+        const id = require('node:crypto').randomBytes(12).toString('hex');
+        const file = isolatedBroker.jobPath(id);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        save(file, {
+          job_id: id, status: 'completed', created_at: new Date(Date.now() - (5 - i) * 1000).toISOString(),
+          ended_at: new Date().toISOString(), cwd: project, sandbox: 'danger-full-access',
+          topic_id: id, thread_id: `00000000-0000-0000-0000-00000000000${i}`,
+          request_context: { source: 'caller_supplied', original_text: `req ${i}`, followups: i === 4 ? [{ job_id: id, text: 'f1' }] : [] },
+          settings
+        });
+      }
+      let summaryCalls = 0;
+      const origSummary = isolatedBroker.summary.bind(isolatedBroker);
+      isolatedBroker.summary = job => { summaryCalls++; return origSummary(job); };
+      const raw = isolatedBroker.listRaw();
+      assert.equal(raw.length, 5);
+      assert.equal(summaryCalls, 0);
+      const top2 = isolatedBroker.list(2);
+      assert.equal(top2.length, 2);
+      assert.equal(summaryCalls, 2);
+      assert.equal(isolatedBroker.knownSessions().length, 5);
+      assert.equal(summaryCalls, 2);
+
+      // save() cleans up its unique .tmp file when rename fails (target is an existing directory)
+      const dirTarget = path.join(isolatedData, 'existing-dir');
+      fs.mkdirSync(dirTarget);
+      assert.throws(() => save(dirTarget, { ok: true }));
+      assert.deepEqual(fs.readdirSync(isolatedData).filter(n => n.endsWith('.tmp')), []);
+
+      // readFromOffset() reads only bytes after offset and caps to maxBytes tail
+      const logFile = path.join(isolatedData, 'stderr.log');
+      fs.writeFileSync(logFile, 'old-prefix|new-payload-1234567890', 'utf8');
+      assert.equal(readFromOffset(logFile, 'old-prefix|'.length), 'new-payload-1234567890');
+      assert.equal(readFromOffset(logFile, 'old-prefix|'.length, 10), '1234567890');
+      assert.equal(readFromOffset(logFile, 99999), '');
+    });
+    await t.test('worker finally keeps stderr open during terminal notify so publish failure never throws EBADF or skips unlock', async () => {
+      const id = require('node:crypto').randomBytes(12).toString('hex'), file = broker.jobPath(id);
+      const jobDir = path.dirname(file);
+      fs.mkdirSync(jobDir, { recursive: true });
+      fs.mkdirSync(broker.lock, { recursive: true });
+      fs.writeFileSync(path.join(broker.lock, `${id}.json`), JSON.stringify({ job_id: id, worker_pid: process.pid }));
+      // Hold .publish.claim with our own live PID so publishNotification throws busy
+      const claimDir = path.join(jobDir, 'notifications', '.publish.claim');
+      fs.mkdirSync(claimDir, { recursive: true });
+      fs.writeFileSync(path.join(claimDir, `${process.pid}-11111111-1111-1111-1111-111111111111.json`), JSON.stringify({ pid: process.pid, nonce: '11111111-1111-1111-1111-111111111111' }));
+      save(file, {
+        job_id: id, status: 'queued', created_at: new Date().toISOString(), cwd: project,
+        sandbox: 'read-only', prompt: '预算耗尽', request_context: { original_text: '预算耗尽', followups: [] },
+        topic_id: id, conversation_id: '00000000-0000-0000-0000-000000000009', timeout_seconds: 30, execution_used_ms: 30000, settings
+      });
+      await worker(file);
+      assert.equal(fs.existsSync(path.join(broker.lock, `${id}.json`)), false, 'lock released despite notification publish failure');
+      assert.equal(fs.existsSync(path.join(jobDir, 'notice.json')), true, 'notice.json still written despite notification publish failure');
+      const stderrLog = fs.readFileSync(path.join(jobDir, 'stderr.log'), 'utf8');
+      assert.match(stderrLog, /notification persistence: Notification publisher busy/);
+    });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

@@ -23,7 +23,7 @@ const {
   evaluateCodexPacing,
   scanAgyTranscriptUsage,
   detectCcSwitchAccountsMtimeMs,
-  detectAgyKeyringLastWrittenMs,
+  detectAgyKeyringLastWrittenMsAsync,
   probeAgyQuotaAsync,
   evaluateAgyProbeHealth,
   activeCodexTasks,
@@ -211,15 +211,35 @@ function executionBlock(handoff, stderr = '', jobId = null) {
     auto_retry_allowed: false, preserve_original_plan: true };
 }
 function save(file, value) {
-  const tmp = `${file}.${process.pid}.tmp`;
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
   for (let attempt = 0; ; attempt++) {
     try { fs.renameSync(tmp, file); return; }
     catch (error) {
-      if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt >= 9) throw error;
+      if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt >= 9) {
+        try { fs.unlinkSync(tmp); } catch {}
+        throw error;
+      }
       // Windows scanners/readers can briefly prevent replacement; retry publication, not the task.
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (attempt + 1));
     }
+  }
+}
+function readFromOffset(file, offset = 0, maxBytes = 2 * 1024 * 1024) {
+  if (!fs.existsSync(file)) return '';
+  const fd = fs.openSync(file, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, Math.min(offset, size));
+    const total = size - start;
+    if (total <= 0) return '';
+    const readLen = Math.min(total, maxBytes);
+    const readPos = total > maxBytes ? size - readLen : start;
+    const buf = Buffer.alloc(readLen);
+    const actual = fs.readSync(fd, buf, 0, readLen, readPos);
+    return buf.subarray(0, actual).toString('utf8');
+  } finally {
+    fs.closeSync(fd);
   }
 }
 function createOnce(file, value) {
@@ -579,13 +599,13 @@ class Broker {
       if (parent.cwd !== cwd) throw new Error('A continuation must retain its original cwd');
       if (input.topic_id && parent.topic_id && input.topic_id !== parent.topic_id) throw new Error('topic_id and selected session disagree');
     }
-    const topicParent = input.topic_id ? this.list(Number.MAX_SAFE_INTEGER).find(job => job.topic_id === input.topic_id) : null;
+    const topicParent = input.topic_id ? this.listRaw().find(job => job.topic_id === input.topic_id) : null;
     if (input.topic_id && !topicParent) throw new Error('Unknown topic_id; omit it to create a new matter');
     if (input.topic && (parent?.topic || topicParent?.topic) && input.topic.trim() !== (parent?.topic || topicParent?.topic)) throw new Error('A different matter needs a new topic, not an existing topic_id/session_id');
     const currentPolicy = liveReviewSettings(this.settings);
-    const execution_route = executionRoute(input, currentPolicy, parent || (topicParent ? this.get(topicParent.job_id) : null));
+    const execution_route = executionRoute(input, currentPolicy, parent || topicParent);
     const taskSettings = { ...currentPolicy, service_tier: 'default', model: execution_route.model, reasoning_effort: input.reasoning_effort || parent?.settings?.reasoning_effort || this.settings.reasoning_effort || 'medium' };
-    const review_route = reviewRoute(input, taskSettings, parent || (topicParent ? this.get(topicParent.job_id) : null));
+    const review_route = reviewRoute(input, taskSettings, parent || topicParent);
     const review_only = input.review_only ?? parent?.review_only ?? topicParent?.review_only ?? false;
     if (!review_only && (parent?.review_only || topicParent?.review_only) && (typeof input.user_followup !== 'string' || !input.user_followup.trim())) throw new Error('Moving from review-only to execution requires the actual human instruction in user_followup');
     const id = crypto.randomBytes(12).toString('hex');
@@ -595,11 +615,11 @@ class Broker {
     for (let n = 0; n < 100 && !release; n++) { release = takeFileClaim(path.join(this.settings.data, 'dispatch.claim')); if (!release) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
     if (!release) throw new Error('Task admission is busy; no task submitted. This is not a running-task limit.');
     try {
-      const jobs = this.list(Number.MAX_SAFE_INTEGER);
+      const jobs = this.listRaw();
       const duplicate = jobs.find(j => !terminal.has(j.status) && (j.topic_id === topicId || (sessionId && j.thread_id === sessionId)));
       if (duplicate) throw new Error(`This matter/session is already running: ${duplicate.job_id}; no duplicate turn submitted`);
       const matterJobs = jobs.filter(j => j.topic_id === topicId || (sessionId && j.thread_id === sessionId));
-      const context_review = contextReview({ review_only, thread_id: sessionId, topic_id: topicId, cwd }, matterJobs.map(j => this.get(j.job_id)));
+      const context_review = contextReview({ review_only, thread_id: sessionId, topic_id: topicId, cwd }, matterJobs);
       if (taskSettings.execution_models) {
         if (!review_only) assertAvailable(taskSettings, taskSettings.model);
         if (!context_review) assertAvailable(taskSettings, review_route.model);
@@ -620,7 +640,7 @@ class Broker {
       const unresolved = pending.find(j => j.job_id !== plan_decision?.refusal_job_id);
       if (unresolved) throw new Error(`[CODEX_USER_DECISION_REQUIRED] 执行端已明确拒绝/阻塞方案，必须先向用户反馈原计划、理由、影响和选择，不得静默换方案。refusal_job_id=${unresolved.job_id}; read codex_result once; after the user's reply pass plan_decision.refusal_job_id and verbatim user_followup. No task submitted.`);
       const humanReset = plan_decision && pending.find(j => j.job_id === plan_decision.refusal_job_id)?.handoff?.blocker_type === 'human_takeover';
-      const guard = loopState(matterJobs.map(j => this.get(j.job_id)));
+      const guard = loopState(matterJobs);
       // The worker persists a normal needs_input receipt even when an older loaded
       // client admitted the job. No model is called to enforce this boundary.
       const held = guard.trigger && !humanReset;
@@ -649,10 +669,10 @@ class Broker {
       }
       if (pendingExecution.length && !execution_followup) throw new Error(`[CODEX_EXECUTION_POLICY_UNRESOLVED] 执行策略受阻，不代表原方案不成立。仅可声明 diagnose / continue_unblocked，保留原拒绝且不执行等价动作；恢复原动作须有正常授权或策略修复的证据。blocked_job_ids=${pendingExecution.map(j => j.job_id).join(',')}; no task submitted.`);
       const execution_constraints = execution_followup && execution_followup.intent !== 'resume_after_resolution' ? pendingExecution.map(j => ({ ...j.execution_block, blocked_job_id: j.job_id })) : [];
-      const contextHead = matterJobs.sort((a, b) =>
+      const contextHead = [...matterJobs].sort((a, b) =>
         Number(b.request_context?.source === 'caller_supplied') - Number(a.request_context?.source === 'caller_supplied') ||
-        (b.request_context?.followup_count || 0) - (a.request_context?.followup_count || 0))[0];
-      const contextParent = contextHead ? this.get(contextHead.job_id) : parent || topicParent;
+        (b.request_context?.followups?.length || 0) - (a.request_context?.followups?.length || 0))[0];
+      const contextParent = contextHead || parent || topicParent;
       const request_context = requestContext(input, contextParent, id);
       fs.mkdirSync(this.lock, { recursive: true });
       fs.writeFileSync(path.join(this.lock, `${id}.json`), JSON.stringify({ job_id: id }), { flag: 'wx' });
@@ -732,8 +752,8 @@ class Broker {
   }
   knownSessions() {
     const sessions = new Map();
-    for (const job of this.list(Number.MAX_SAFE_INTEGER)) {
-      if (job.thread_id && !sessions.has(job.thread_id)) sessions.set(job.thread_id, { session_id: job.thread_id, chat: chatAccess(job.thread_id), title: job.chat_title?.name || taskTitle(job), job_id: job.job_id, topic_id: job.topic_id, topic: job.topic, model: job.model, reasoning_effort: job.reasoning_effort, service_tier: job.service_tier, cwd: job.cwd, sandbox: job.sandbox, status: job.status, updated_at: job.ended_at || job.created_at });
+    for (const job of this.listRaw()) {
+      if (job.thread_id && !sessions.has(job.thread_id)) sessions.set(job.thread_id, { session_id: job.thread_id, chat: chatAccess(job.thread_id), title: job.chat_title?.name || taskTitle(job), job_id: job.job_id, topic_id: job.topic_id, topic: job.topic, model: job.settings?.model || null, reasoning_effort: job.settings?.reasoning_effort || null, service_tier: job.settings?.service_tier || null, cwd: job.cwd, sandbox: job.sandbox, status: job.status, updated_at: job.ended_at || job.created_at });
     }
     return [...sessions.values()];
   }
@@ -866,7 +886,7 @@ class Broker {
       const prevAgyProbeMs = Date.parse(agyProbedAt || '');
       const ccSwitchMtimeMs = fastCcMtimeMs;
       const effectiveProbeHome = input.probe_home_dir || projectPolicy.agy_probe_home || undefined;
-      const preKeyringMs = detectAgyKeyringLastWrittenMs({
+      const preKeyringMs = await detectAgyKeyringLastWrittenMsAsync({
         keyringLastWrittenMs: input.keyring_last_written_ms,
         probeHomeDir: effectiveProbeHome
       });
@@ -899,10 +919,10 @@ class Broker {
           nowMs
         });
         // Re-read keyring timestamp AFTER probe so our own hourly token refresh is recorded cleanly without double-probing next tick.
-        const postKeyringMs = detectAgyKeyringLastWrittenMs({
+        const postKeyringMs = (await detectAgyKeyringLastWrittenMsAsync({
           keyringLastWrittenMs: input.keyring_last_written_ms,
           probeHomeDir: effectiveProbeHome
-        }) ?? preKeyringMs;
+        })) ?? preKeyringMs;
         agyHealth = evaluateAgyProbeHealth({
           probed,
           prevHealth: prev?.agy_health || null,
@@ -971,7 +991,7 @@ class Broker {
     let resumption;
     if (input.topic_id) {
       if (typeof input.topic_id !== 'string' || !/^[a-f0-9]{24}$/.test(input.topic_id)) throw new Error('Invalid topic_id');
-      const latest = this.list(Number.MAX_SAFE_INTEGER).find(job => job.topic_id === input.topic_id);
+      const latest = this.listRaw().find(job => job.topic_id === input.topic_id);
       if (!latest) throw new Error('Unknown topic_id; omit it for a new matter');
       if (!terminal.has(latest.status)) throw new Error(`This matter is still running: ${latest.job_id}; continue normal chat, do not resubmit or poll`);
       if (input.session_id && input.session_id !== latest.thread_id) throw new Error('topic_id and selected session disagree');
@@ -1039,9 +1059,30 @@ class Broker {
     fs.writeFileSync(path.join(path.dirname(this.jobPath(id)), 'cancel'), stamp(), 'utf8');
     return { job_id: id, status: 'cancel_requested', next: 'Use codex_wait once only if cancellation confirmation is needed; no polling. Cancellation does not undo file edits.' };
   }
+  listRaw() {
+    if (!fs.existsSync(this.jobs)) return [];
+    const jobs = [];
+    for (const id of fs.readdirSync(this.jobs)) {
+      if (!/^[a-f0-9]{24}$/.test(id)) continue;
+      const file = this.jobPath(id);
+      if (!fs.existsSync(file)) continue;
+      let job;
+      try { job = read(file); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+      const needsRepair =
+        !terminal.has(job.status) ||
+        (job.status === 'failed' && job.error === 'Worker exited before recording completion' &&
+          ((job.execution_block && job.handoff?.kind === 'execution_blocked') || ['review_revise', 'review_needs_evidence', 'needs_input'].includes(job.handoff?.kind)));
+      if (needsRepair) {
+        try { job = this.get(id); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+      }
+      jobs.push(job);
+    }
+    return jobs.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+  }
   list(limit = 20, _cwd, activeOnly = false) {
-    return fs.readdirSync(this.jobs).filter(id => /^[a-f0-9]{24}$/.test(id) && fs.existsSync(this.jobPath(id)))
-      .map(id => this.status(id)).filter(job => !activeOnly || !terminal.has(job.status)).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, activeOnly ? Number.MAX_SAFE_INTEGER : limit);
+    const raw = this.listRaw();
+    const filtered = activeOnly ? raw.filter(job => !terminal.has(job.status)) : raw.slice(0, limit);
+    return filtered.map(job => this.summary(job));
   }
 }
 
@@ -1079,7 +1120,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
   const accounting = startUsage(job);
   const freshThreads = new Set();
   const dir = path.dirname(file), broker = new Broker(job.settings);
-  const events = fs.openSync(path.join(dir, 'events.jsonl'), 'a'), stderr = fs.openSync(path.join(dir, 'stderr.log'), 'a');
+  let events = fs.openSync(path.join(dir, 'events.jsonl'), 'a'), stderr = fs.openSync(path.join(dir, 'stderr.log'), 'a');
   let stopReason, finalChanges = null, terminationRequested = false;
   const update = changes => {
     if (finalChanges) { finalChanges = { ...finalChanges, ...changes }; job = { ...job, ...changes }; }
@@ -1090,7 +1131,10 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
   const finish = changes => { finalChanges = { ...finalChanges, ...changes }; job = { ...job, ...changes }; };
   const notify = (key, kind, detail) => {
     try { publishNotification(file, job, key, kind, detail); }
-    catch (error) { update({ notification_error: error.message }); fs.writeSync(stderr, 'notification persistence: ' + error.message + '\n'); }
+    catch (error) {
+      update({ notification_error: error.message });
+      if (stderr !== null) { try { fs.writeSync(stderr, 'notification persistence: ' + error.message + '\n'); } catch {} }
+    }
   };
   let naming = null;
   const updateTitle = () => {
@@ -1140,8 +1184,8 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
     update({ settings: { ...job.settings, service_tier: 'default', normal_mode_models: policySettings.normal_mode_models, review_only_models: policySettings.review_only_models } });
     if (job.stage === 'review' && !job.review_route) update({ review_route: reviewRoute(job, policySettings) });
     validateJobModels(job, policySettings);
-    const history = broker.list(Number.MAX_SAFE_INTEGER).filter(j => j.job_id !== job.job_id &&
-      (j.topic_id === job.topic_id || (job.thread_id && j.thread_id === job.thread_id))).map(j => broker.get(j.job_id));
+    const history = broker.listRaw().filter(j => j.job_id !== job.job_id &&
+      (j.topic_id === job.topic_id || (job.thread_id && j.thread_id === job.thread_id)));
     const resetRef = job.loop_reset?.refusal_job_id || job.plan_decision?.refusal_job_id;
     const humanReset = history.some(j => j.job_id === resetRef && j.handoff?.blocker_type === 'human_takeover') &&
       job.request_context?.followups?.some(f => f.job_id === job.job_id && f.text?.trim());
@@ -1234,7 +1278,7 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
       } finally { clearInterval(timer); }
       const output = path.join(dir, (reviewing ? 'review-' : '') + 'attempt-' + attempt + '.result.txt');
       const successful = !stopReason && outcome.code === 0 && turnCompleted && !turnFailed && fs.existsSync(output);
-      const attemptStderr = fs.readFileSync(path.join(dir, 'stderr.log')).subarray(stderrOffset).toString('utf8');
+      const attemptStderr = readFromOffset(path.join(dir, 'stderr.log'), stderrOffset);
       const capacity = !successful && !stopReason && !executionBlock(null, attemptStderr) && isCapacity(lastError);
        if (usage) recordUsage(accounting, job.thread_id, usage, freshThreads.has(job.thread_id));
        update({ ...(usage ? usageFields(accounting) : {}), attempts: [...job.attempts, { attempt, stage: job.stage, thread_id: job.thread_id || null, started_at: new Date(started).toISOString(), model: attemptModel, exit_code: outcome.code, capacity, ...(usage ? { usage } : {}), ...(lastError ? { error: lastError } : {}) }] });
@@ -1304,31 +1348,36 @@ async function worker(file, clock = { now: () => Date.now(), wait: capacityDelay
     fs.writeSync(stderr, error.stack + '\n');
   }
   finally {
-    if (terminal.has(job.status) && !job.configuration_error && job.handoff?.blocker_type !== 'human_takeover') {
-      if (['review_revise', 'failed', 'timed_out'].includes(job.status) && !job.execution_block) update({ repair_round_failed: true });
-      const history = broker.list(Number.MAX_SAFE_INTEGER).filter(j => j.job_id !== job.job_id && (j.topic_id === job.topic_id || (job.thread_id && j.thread_id === job.thread_id))).map(j => broker.get(j.job_id));
-      const guard = loopState([...history, job]); update({ loop_guard: guard });
-      if (guard.trigger && !job.execution_block && !job.background_commands?.length && job.status !== 'cancelled' && !job.handoff?.requires_user_decision) {
-        const finalFile = path.join(dir, 'result.txt'), original = fs.existsSync(finalFile) ? fs.readFileSync(finalFile, 'utf8') : job.error || '';
-        const human = takeover(guard);
-        fs.writeFileSync(finalFile, '[CODEX_NEEDS_INPUT]\n' + JSON.stringify(human) + '\n\n原始执行结果：\n' + original, 'utf8');
-        finish({ status: 'needs_input', prior_status: job.status, handoff: human, prior_handoff: job.handoff, stage: 'human_held' });
+    try {
+      if (terminal.has(job.status) && !job.configuration_error && job.handoff?.blocker_type !== 'human_takeover') {
+        if (['review_revise', 'failed', 'timed_out'].includes(job.status) && !job.execution_block) update({ repair_round_failed: true });
+        const history = broker.listRaw().filter(j => j.job_id !== job.job_id && (j.topic_id === job.topic_id || (job.thread_id && j.thread_id === job.thread_id)));
+        const guard = loopState([...history, job]); update({ loop_guard: guard });
+        if (guard.trigger && !job.execution_block && !job.background_commands?.length && job.status !== 'cancelled' && !job.handoff?.requires_user_decision) {
+          const finalFile = path.join(dir, 'result.txt'), original = fs.existsSync(finalFile) ? fs.readFileSync(finalFile, 'utf8') : job.error || '';
+          const human = takeover(guard);
+          fs.writeFileSync(finalFile, '[CODEX_NEEDS_INPUT]\n' + JSON.stringify(human) + '\n\n原始执行结果：\n' + original, 'utf8');
+          finish({ status: 'needs_input', prior_status: job.status, handoff: human, prior_handoff: job.handoff, stage: 'human_held' });
+        }
       }
-    }
-    if (naming) await naming;
-    if (finalChanges) {
-      // Running persisted state still excludes a duplicate while releasing the lease;
-      // the first observable terminal receipt must already have released it.
+      if (naming) await naming;
+      if (finalChanges) {
+        // Running persisted state still excludes a duplicate while releasing the lease;
+        // the first observable terminal receipt must already have released it.
+        broker.unlock(job.job_id);
+        job = changeJob(file, current => ({ ...current, ...finalChanges }));
+      }
+      if (events !== null) { try { fs.closeSync(events); } catch {} events = null; }
+      if (terminal.has(job.status)) {
+        broker.receipt(job.job_id);
+        notify('terminal', 'terminal', (job.status === 'timed_out' || job.prior_status === 'timed_out') ? `执行达到配置时限 ${job.timeout_seconds} 秒而停止；进程树终止已请求与否及命令退出状态请查回执，最近进度不是最终结果。` : job.error || '执行轮次已结束，请核对原结果与业务验收条件。');
+        if (job.conversation_id) createOnce(path.join(dir, 'notice.json'), { job_id: job.job_id, topic_id: job.topic_id, conversation_id: job.conversation_id, status: job.status, created_at: stamp() });
+      }
+    } finally {
+      if (events !== null) { try { fs.closeSync(events); } catch {} events = null; }
+      if (stderr !== null) { try { fs.closeSync(stderr); } catch {} stderr = null; }
       broker.unlock(job.job_id);
-      job = changeJob(file, current => ({ ...current, ...finalChanges }));
     }
-    fs.closeSync(events); fs.closeSync(stderr);
-    if (terminal.has(job.status)) {
-      broker.receipt(job.job_id);
-      notify('terminal', 'terminal', (job.status === 'timed_out' || job.prior_status === 'timed_out') ? `执行达到配置时限 ${job.timeout_seconds} 秒而停止；进程树终止已请求与否及命令退出状态请查回执，最近进度不是最终结果。` : job.error || '执行轮次已结束，请核对原结果与业务验收条件。');
-      if (job.conversation_id) createOnce(path.join(dir, 'notice.json'), { job_id: job.job_id, topic_id: job.topic_id, conversation_id: job.conversation_id, status: job.status, created_at: stamp() });
-    }
-    broker.unlock(job.job_id);
   }
 }
 
@@ -1420,7 +1469,7 @@ function serve(settings = config()) {
   lines.on('close', () => { setImmediate(() => { for (const controller of requests.values()) controller.abort(); }); });
 }
 
-module.exports = { recordEvidence, recordBackgroundEvidence, restoreExecutionEvidence, contextReview, liveReviewSettings, reviewRoute, reviewVersion, reviewOutcome, executionSandbox, finalHandoff, executionBlock, taskTitle, syncTaskTitle, latestProgress, chatAccess, toolResponse, nativeMetadata, worker, capacityRetryAt, isCapacity, capacityMessage, Broker, config, dispatch, tools, inside, read, save, terminal, childEnvironment, notificationEvents, publishNotification, notificationSummary, commandPhase, alive, takeFileClaim };
+module.exports = { recordEvidence, recordBackgroundEvidence, restoreExecutionEvidence, contextReview, liveReviewSettings, reviewRoute, reviewVersion, reviewOutcome, executionSandbox, finalHandoff, executionBlock, taskTitle, syncTaskTitle, latestProgress, chatAccess, toolResponse, nativeMetadata, worker, capacityRetryAt, isCapacity, capacityMessage, Broker, config, dispatch, tools, inside, read, save, readFromOffset, terminal, childEnvironment, notificationEvents, publishNotification, notificationSummary, commandPhase, alive, takeFileClaim };
 if (require.main === module) {
   if (process.argv[2] === '--worker') worker(process.argv[3]).catch(error => {
     try { fs.writeFileSync(path.join(path.dirname(process.argv[3]), 'worker-error.txt'), `${error.stack}\n`, 'utf8'); } catch {}

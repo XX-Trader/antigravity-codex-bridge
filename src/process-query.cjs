@@ -26,7 +26,17 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     } elseif ($q.op -eq 'kill') {
       $p = Get-Process -Id ([int]$q.pid) -ErrorAction SilentlyContinue
       $requested = $false
-      if ($p -and $p.StartTime.ToUniversalTime().Ticks.ToString() -eq $q.identity) { $p.Kill($true); $p.WaitForExit(10000) | Out-Null; $requested = $true }
+      if ($p) {
+        $startTicks = $null
+        try { $startTicks = $p.StartTime.ToUniversalTime().Ticks.ToString() } catch {
+          if (Get-Process -Id ([int]$q.pid) -ErrorAction SilentlyContinue) { throw }
+        }
+        if ($startTicks -eq $q.identity) {
+          try { $p.Kill($true); $p.WaitForExit(10000) | Out-Null; $requested = $true } catch {
+            if (Get-Process -Id ([int]$q.pid) -ErrorAction SilentlyContinue) { throw }
+          }
+        }
+      }
       $reply = @{ id=$q.id; requested=$requested }
     } else { throw 'Unknown operation' }
     [Console]::WriteLine(($reply | ConvertTo-Json -Compress -Depth 5))
