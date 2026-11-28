@@ -4,6 +4,22 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { spawn, spawnSync } = require('node:child_process');
+const {
+  DEFAULT_PACING,
+  DEFAULT_AGY_PACING,
+  DEFAULT_AGY_GUARD,
+  DEFAULT_AGY_TIERS,
+  DEFAULT_AGY_PROBE,
+  DEFAULT_MAINTENANCE,
+  PARAM_CATALOG,
+  PARAM_BY_KEY,
+  PARAM_GROUPS,
+  getParamValue,
+  setParamValue,
+  resetParamValue,
+  listParams,
+  buildDefaultTemplate
+} = require('./param-catalog.cjs');
 
 const MODE_ALIASES = Object.freeze({
   auto: 'auto',
@@ -21,51 +37,6 @@ const TERMINAL_STATUSES = new Set([
   'needs_input', 'blocked', 'execution_blocked',
   'review_revise', 'review_needs_evidence'
 ]);
-
-const DEFAULT_PACING = Object.freeze({
-  plan_days: 5,                   // Consume 100% of Codex weekly quota proportionally within 5 days
-  target_utilization: 100,
-  codex_priority_margin: -3,
-  balanced_upper_margin: 5,
-  agy_priority_used_percent: 92,
-  codex_protect_used_percent: 97,
-  drain_window_hours: 12,
-  drain_min_remaining_percent: 10,
-  ahead_max_concurrent: 3,        // Throttle Codex concurrency in auto mode when ahead of pace or >= 85%
-  high_max_concurrent: 2,         // Tighter cap when >= 92% used
-  protect_max_concurrent: 1       // Hard cap at >= 97% used so sticky continuations cannot stampede last 3%
-});
-
-const DEFAULT_AGY_PACING = Object.freeze({
-  target_utilization: 90,         // Consume up to 90% of AGY weekly quota, reserving 10% emergency buffer
-  window_minutes: 10080,          // 7-day weekly quota window
-  window_5h_minutes: 300,         // AGY 5-hour rolling/refresh limit window
-  dual_compare_margin: 5,         // |delta_codex - delta_agy| <= 5% => balanced
-  window_5h_caution_percent: 75,  // AGY 5h >= 75% => throttle to balanced to avoid hitting 5h wall
-  window_5h_protect_percent: 88,  // AGY 5h >= 88% => AGY 5h limited (keeps 12% 5h buffer), Codex takes over as fallback
-  weekly_protect_used_percent: 90,// Hard reserve 10% weekly buffer for sudden burst usage
-  buffer_unlock_window_hours: 6,  // Auto-unlock reserved 10% buffer within final 6h before weekly reset
-  drain_window_hours: 12,
-  drain_min_remaining_percent: 10,// Only drain when >= 10% usable headroom remains below target_utilization
-  window_5h_tokens: null,         // Optional local 5h token calibration budget
-  window_7d_tokens: null,         // Optional local 7d token calibration budget
-  weekly_resets_at: null          // Optional ISO timestamp for AGY weekly reset anchor
-});
-
-const DEFAULT_AGY_TIERS = Object.freeze({
-  simple: 'flash_lite',
-  standard: 'flash',
-  complex: 'pro',
-  expert: 'inherit'
-});
-
-const DEFAULT_AGY_GUARD = Object.freeze({
-  max_same_error_failures: 3,    // Same normalized error 3x in a row => genuine loop, stop!
-  max_consecutive_failures: 8,   // Distinct errors are allowed to self-heal; safety cap at 8 with zero successes
-  review_gate: 'advisory',       // 'off' | 'advisory' | 'strict'
-  review_valid_hours: 12,
-  quota_error_cooldown_minutes: 15
-});
 const REVIEW_GATES = new Set(['off', 'advisory', 'strict']);
 
 const round2 = value => Math.round(value * 100) / 100;
@@ -135,6 +106,8 @@ function defaultPolicy() {
     agy_guard: { ...DEFAULT_AGY_GUARD },
     agy_tiers: { ...DEFAULT_AGY_TIERS },
     agy_host_models: { standard: null, complex: null, expert: null },
+    agy_probe: { ...DEFAULT_AGY_PROBE, retry_delays_ms: [...DEFAULT_AGY_PROBE.retry_delays_ms] },
+    maintenance: { ...DEFAULT_MAINTENANCE },
     agy_model_pools: {},
     subagent_default_model: 'flash',
     subagent_research_model: 'flash_lite',
@@ -194,6 +167,7 @@ function parsePolicy(raw) {
       ['target_utilization', 10, 100],
       ['codex_priority_margin', -50, 20],
       ['balanced_upper_margin', -10, 50],
+      ['ahead_used_percent', 50, 100],
       ['agy_priority_used_percent', 50, 100],
       ['codex_protect_used_percent', 60, 100],
       ['drain_window_hours', 0, 72],
@@ -220,6 +194,7 @@ function parsePolicy(raw) {
       ['window_minutes', 60, 43200],
       ['window_5h_minutes', 30, 1440],
       ['dual_compare_margin', 0, 40],
+      ['linear_advisory_delta_percent', 0, 50],
       ['window_5h_caution_percent', 30, 99],
       ['window_5h_protect_percent', 40, 100],
       ['weekly_protect_used_percent', 60, 100],
@@ -230,6 +205,9 @@ function parsePolicy(raw) {
       if (typeof raw.agy_pacing[k] === 'number' && Number.isFinite(raw.agy_pacing[k]) && raw.agy_pacing[k] >= min && raw.agy_pacing[k] <= max) {
         ap[k] = raw.agy_pacing[k];
       }
+    }
+    if (raw.agy_pacing.emergency_downgrade_enabled !== undefined) {
+      ap.emergency_downgrade_enabled = Boolean(raw.agy_pacing.emergency_downgrade_enabled);
     }
     if (ap.window_5h_protect_percent < ap.window_5h_caution_percent) ap.window_5h_protect_percent = ap.window_5h_caution_percent;
     for (const k of ['window_5h_tokens', 'window_7d_tokens']) {
@@ -339,6 +317,42 @@ function parsePolicy(raw) {
   }
   if (typeof raw.cache_ttl_seconds === 'number' && Number.isFinite(raw.cache_ttl_seconds) && raw.cache_ttl_seconds >= 0 && raw.cache_ttl_seconds <= 3600) {
     policy.cache_ttl_seconds = Math.floor(raw.cache_ttl_seconds);
+  }
+  if (raw.agy_probe && typeof raw.agy_probe === 'object' && !Array.isArray(raw.agy_probe)) {
+    const pr = { ...base.agy_probe, retry_delays_ms: [...base.agy_probe.retry_delays_ms] };
+    for (const [k, min, max, isInt] of [
+      ['timeout_ms', 5000, 180000, true],
+      ['slow_oauth_threshold_ms', 1000, 60000, true],
+      ['slow_oauth_grace_ms', 1000, 90000, true],
+      ['fast_oauth_grace_ms', 100, 10000, true],
+      ['probe_interval_minutes', 1, 120, false],
+      ['auth_retry_interval_minutes', 5, 240, false],
+      ['codex_probe_refresh_minutes', 5, 360, false]
+    ]) {
+      if (typeof raw.agy_probe[k] === 'number' && Number.isFinite(raw.agy_probe[k]) && raw.agy_probe[k] >= min && raw.agy_probe[k] <= max) {
+        pr[k] = isInt ? Math.floor(raw.agy_probe[k]) : raw.agy_probe[k];
+      }
+    }
+    if (Array.isArray(raw.agy_probe.retry_delays_ms) && raw.agy_probe.retry_delays_ms.length <= 6) {
+      const cleaned = raw.agy_probe.retry_delays_ms
+        .filter(v => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 60000)
+        .map(v => Math.floor(v));
+      if (cleaned.length === raw.agy_probe.retry_delays_ms.length) pr.retry_delays_ms = cleaned;
+    }
+    policy.agy_probe = pr;
+  }
+  if (raw.maintenance && typeof raw.maintenance === 'object' && !Array.isArray(raw.maintenance)) {
+    const mt = { ...base.maintenance };
+    if (typeof raw.maintenance.prune_older_than_days === 'number' && Number.isFinite(raw.maintenance.prune_older_than_days) && raw.maintenance.prune_older_than_days >= 1 && raw.maintenance.prune_older_than_days <= 365) {
+      mt.prune_older_than_days = raw.maintenance.prune_older_than_days;
+    }
+    if (typeof raw.maintenance.keep_probe_logs === 'number' && Number.isFinite(raw.maintenance.keep_probe_logs) && raw.maintenance.keep_probe_logs >= 1 && raw.maintenance.keep_probe_logs <= 100) {
+      mt.keep_probe_logs = Math.floor(raw.maintenance.keep_probe_logs);
+    }
+    if (typeof raw.maintenance.index_wal_compact_kb === 'number' && Number.isFinite(raw.maintenance.index_wal_compact_kb) && raw.maintenance.index_wal_compact_kb >= 8 && raw.maintenance.index_wal_compact_kb <= 4096) {
+      mt.index_wal_compact_kb = Math.floor(raw.maintenance.index_wal_compact_kb);
+    }
+    policy.maintenance = mt;
   }
   if (raw.cooldowns && typeof raw.cooldowns === 'object' && !Array.isArray(raw.cooldowns)) {
     policy.cooldowns = {
@@ -469,6 +483,8 @@ function resolveProjectPolicy(policy, projectScope) {
     thinking_backups: [...(base.thinking_models.backups || [])],
     agy_tiers: { ...base.agy_tiers },
     agy_host_models: { ...base.agy_host_models },
+    agy_probe: { ...base.agy_probe, retry_delays_ms: [...base.agy_probe.retry_delays_ms] },
+    maintenance: { ...base.maintenance },
     agy_model_pools: Object.fromEntries(Object.entries(base.agy_model_pools || {}).map(([k, v]) => [k, { ...v }])),
     subagent_default_model: override?.subagent_default_model || base.subagent_default_model,
     subagent_research_model: base.subagent_research_model,
@@ -1591,13 +1607,12 @@ function resolveAgyRetryPlan(options = {}) {
   return { maxAttempts, delaysMs };
 }
 
-const SLOW_OAUTH_INTERCEPT_THRESHOLD_MS = 8000;
-const SLOW_OAUTH_INTERCEPT_GRACE_MS = 25000;
-const FAST_OAUTH_INTERCEPT_GRACE_MS = 600;
-
-function resolveInterceptGraceMs(elapsedMs, explicitGraceMs) {
+function resolveInterceptGraceMs(elapsedMs, explicitGraceMs, probeCfg = DEFAULT_AGY_PROBE) {
   if (explicitGraceMs !== undefined && explicitGraceMs !== null) return explicitGraceMs;
-  return elapsedMs >= SLOW_OAUTH_INTERCEPT_THRESHOLD_MS ? SLOW_OAUTH_INTERCEPT_GRACE_MS : FAST_OAUTH_INTERCEPT_GRACE_MS;
+  const threshold = probeCfg?.slow_oauth_threshold_ms ?? DEFAULT_AGY_PROBE.slow_oauth_threshold_ms;
+  const slowGrace = probeCfg?.slow_oauth_grace_ms ?? DEFAULT_AGY_PROBE.slow_oauth_grace_ms;
+  const fastGrace = probeCfg?.fast_oauth_grace_ms ?? DEFAULT_AGY_PROBE.fast_oauth_grace_ms;
+  return elapsedMs >= threshold ? slowGrace : fastGrace;
 }
 
 function isRetryableAgyProbeFailure(result, attempt = 1) {
@@ -1676,7 +1691,7 @@ function runExternalAgyProbeAsync(command, options = {}) {
     const interceptPoll = (!options.allowBrowser && markerPath) ? setInterval(() => {
       if (interceptAbortTimer || !fs.existsSync(markerPath)) return;
       const elapsedMs = Date.now() - spawnedAtMs;
-      const graceMs = resolveInterceptGraceMs(elapsedMs, explicitGraceMs);
+      const graceMs = resolveInterceptGraceMs(elapsedMs, explicitGraceMs, options.probeCfg);
       interceptAbortTimer = setTimeout(() => {
         killChildTree(child);
         finish({
@@ -1828,12 +1843,17 @@ function prepareSilentAgyProbeHome(probeHome, nowMs = Date.now(), options = {}) 
 }
 
 async function probeAgyQuotaAsync(projectPolicy, options = {}) {
-  const { maxAttempts, delaysMs } = resolveAgyRetryPlan(options);
+  const probeCfg = { ...DEFAULT_AGY_PROBE, ...(projectPolicy?.agy_probe || {}) };
+  const retryOptions = {
+    ...options,
+    retryDelaysMs: options.retryDelaysMs ?? probeCfg.retry_delays_ms
+  };
+  const { maxAttempts, delaysMs } = resolveAgyRetryPlan(retryOptions);
   if (Array.isArray(projectPolicy?.agy_quota_command) && projectPolicy.agy_quota_command.length > 0) {
     let last = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (attempt > 1) await sleepMs(delaysMs[Math.min(attempt - 2, delaysMs.length - 1)] ?? 0);
-      last = await runExternalAgyProbeAsync(projectPolicy.agy_quota_command, options);
+      last = await runExternalAgyProbeAsync(projectPolicy.agy_quota_command, { probeCfg, ...options });
       if (last && typeof last === 'object') last = { ...last, attempts: attempt };
       if (!isRetryableAgyProbeFailure(last, attempt)) return last;
     }
@@ -1850,7 +1870,7 @@ async function probeAgyQuotaAsync(projectPolicy, options = {}) {
     const cmdPrefix = Array.isArray(agyBin) ? agyBin : [agyBin];
     return runExternalAgyProbeAsync(
       [...cmdPrefix, `--log-file=${logFile}`, `--gemini_dir=${probeHome}`, '--print', '/usage', '--output-format', 'json'],
-      { timeoutMs: 65000, noBrowserBinDir, interceptMarkerPath: marker, logFilePath: logFile, ...options }
+      { timeoutMs: probeCfg.timeout_ms, probeCfg, noBrowserBinDir, interceptMarkerPath: marker, logFilePath: logFile, ...options }
     );
   };
   let last = null;
@@ -2117,7 +2137,7 @@ async function runAgyPoolTaskAsync(options = {}) {
     const interceptPoll = setInterval(() => {
       if (interceptAbortTimer || !fs.existsSync(markerPath)) return;
       const elapsedMs = Date.now() - spawnedAtMs;
-      const graceMs = resolveInterceptGraceMs(elapsedMs, explicitGraceMs);
+      const graceMs = resolveInterceptGraceMs(elapsedMs, explicitGraceMs, options.probeCfg);
       interceptAbortTimer = setTimeout(() => {
         killChildTree(child);
         finish({
@@ -2504,10 +2524,13 @@ function decideRoute(input = {}) {
       : `AGY 7天目标(${agyTargetPct}%上限/留${agyBufferPct}%缓冲${unlockTag}) 进度 ${agyPacing.window_7d.target_used_percent}% / 已用 ${agyPacing.window_7d.used_percent}%（偏差 ${agyPacing.window_7d.pacing_delta >= 0 ? '+' : ''}${agyPacing.window_7d.pacing_delta}%）`)
     : `AGY 7天未标定（上限${agyTargetPct}%/留${agyBufferPct}%缓冲，按本地5h+Codex${codexPlanLabel}均衡）`;
 
+  const emergencyDowngrade = policy.agy_pacing?.emergency_downgrade_enabled === true;
   const engineLabel = preferredEngine === 'paused'
     ? `双端耗尽暂停（最快 ${earliestResetHours ?? '?'}h 后重置 / 可用 CC Switch 切备用号）`
     : emergencyRationing
-      ? `应急省流 → ${preferredEngine === 'agy' ? 'AGY 剩余缓冲' : 'Codex 剩余缓冲'}`
+      ? (emergencyDowngrade
+        ? `应急省流 → ${preferredEngine === 'agy' ? 'AGY 剩余缓冲' : 'Codex 剩余缓冲'}`
+        : `应急缓冲保质接管 → ${preferredEngine === 'agy' ? 'AGY 最后 10% 缓冲' : 'Codex 剩余缓冲'}`)
       : preferredEngine === 'codex'
         ? '优先 Codex（Codex 兜底）'
         : preferredEngine === 'balanced'
@@ -2526,7 +2549,9 @@ function decideRoute(input = {}) {
   const handoverGuidance = preferredEngine === 'paused'
     ? `Codex 与 AGY 当前均已耗尽可用额度（最快重置倒计时：${earliestResetHours ?? '未知'}h）。已停止自动派发与空转重试；请向用户展示三个选项：① 等待最快窗口重置；② 在 CC Switch 切换到备用账号（自动共享生效）；③ 是否授权使用额外 Credits / 重置券。`
     : emergencyRationing
-      ? `单边已 100% 硬归零，另一边已进入软缓冲应急区（当前启用 ${preferredEngine.toUpperCase()} 应急省流模式）：禁止批量扇出（run_workflow），仅用最低成本档位处理用户紧急指令，并提示最快重置剩余 ${earliestResetHours ?? '未知'}h。`
+      ? (emergencyDowngrade
+        ? `单边已 100% 硬归零，另一边已进入软缓冲应急区（当前启用 ${preferredEngine.toUpperCase()} 应急省流模式）：禁止批量扇出（run_workflow），仅用最低成本档位处理用户紧急指令，并提示最快重置剩余 ${earliestResetHours ?? '未知'}h。`
+        : `Codex 已 100% 耗尽，当前正在使用 ${preferredEngine.toUpperCase()} 预留应急缓冲（默认保持原模型质量不降档，距最快重置约 ${earliestResetHours ?? '未知'}h）；请留意余量合理安排任务。`)
       : codexExhausted
         ? `Codex 周额度已 100% 耗尽（距重置 ${codexPacing.hours_until_reset ?? '?'}h）：原 Codex 未完事项自动解除粘性锁定，请先只读读取原任务 codex_result/job.json 与 Git 差异，在 AGY 无缝接力完成（未经用户明确授权禁止静默消耗额外 Credits 或重置券）。`
         : (agyConstrained && !codexHardBlocked && codexPacing.available)
@@ -2898,7 +2923,8 @@ function evaluateCodexConcurrencyGate({ args = {}, projectPolicy, codexPacing, a
     };
   }
 
-  if ((codexPacing.band === 'agy_priority' || used >= 85) && cfg.ahead_max_concurrent !== null && totalActiveCodexTasks >= cfg.ahead_max_concurrent) {
+  const aheadUsedPct = cfg.ahead_used_percent ?? DEFAULT_PACING.ahead_used_percent;
+  if ((codexPacing.band === 'agy_priority' || used >= aheadUsedPct) && cfg.ahead_max_concurrent !== null && totalActiveCodexTasks >= cfg.ahead_max_concurrent) {
     const deltaPart = typeof codexPacing.pacing_delta === 'number'
       ? `，相对线性目标偏差 ${codexPacing.pacing_delta >= 0 ? '+' : ''}${codexPacing.pacing_delta}%`
       : '';
@@ -2959,17 +2985,19 @@ function evaluateAgyQuotaGate({ toolName = '', args = {}, projectPolicy, codexPa
     };
   }
 
-  // 2b. Linear pacing >+10% advisory reminder (NO blocking during linear phase — only remind and guide towards Codex!):
+  // 2b. Linear pacing > linear_advisory_delta_percent advisory reminder (NO blocking during linear phase — only remind and guide towards Codex!):
+  const agyCfg = { ...DEFAULT_AGY_PACING, ...(projectPolicy?.agy_pacing || {}) };
+  const linearAdvisoryDelta = agyCfg.linear_advisory_delta_percent ?? DEFAULT_AGY_PACING.linear_advisory_delta_percent;
   const w7 = agyPacing?.window_7d;
   const agyAheadLinear10 = Boolean(
     w7?.available
     && typeof w7.pacing_delta === 'number'
-    && w7.pacing_delta > 10
+    && w7.pacing_delta > linearAdvisoryDelta
   );
   const codexPlenty = Boolean(
     codexHasRoom
-    && (codexPacing.used_percent ?? 0) < 85
-    && (codexPacing.pacing_delta === null || codexPacing.pacing_delta === undefined || codexPacing.pacing_delta <= 5)
+    && (codexPacing.used_percent ?? 0) < (projectPolicy?.pacing?.ahead_used_percent ?? DEFAULT_PACING.ahead_used_percent)
+    && (codexPacing.pacing_delta === null || codexPacing.pacing_delta === undefined || codexPacing.pacing_delta <= (projectPolicy?.pacing?.balanced_upper_margin ?? DEFAULT_PACING.balanced_upper_margin))
   );
   if (agyAheadLinear10 && codexPlenty) {
     const isBatchDelegation = (isInvokeSubagent && !isReadOnlyResearch && !['browser', 'image-generator'].includes(subType))
@@ -2978,27 +3006,37 @@ function evaluateAgyQuotaGate({ toolName = '', args = {}, projectPolicy, codexPa
     if (isBatchDelegation) {
       return {
         blocked: false,
-        note: `[线性额度提醒] AGY 7天额度已用 ${w7.used_percent}%（超出线性目标 +${w7.pacing_delta}% > 10%），而 Codex 当前仅用 ${codexPacing.used_percent}%；本次操作放行不拦截，建议后续新批次优先改用 codex_run 执行。`
+        note: `[线性额度提醒] AGY 7天额度已用 ${w7.used_percent}%（超出线性目标 +${w7.pacing_delta}% > ${linearAdvisoryDelta}%），而 Codex 当前仅用 ${codexPacing.used_percent}%；本次操作放行不拦截，建议后续新批次优先改用 codex_run 执行。`
       };
     }
   }
 
-  // 3. Codex is 100% exhausted AND AGY is in its soft buffer (e.g. 90%~99% with >6h to reset) => Emergency Rationing Mode!
+  // 3. Codex is 100% exhausted AND AGY is using its reserved 10% emergency buffer (90%~99%):
+  // Default (`emergency_downgrade_enabled: false`): preserve full model quality and never block run_workflow;
+  // surface a clear headroom reminder instead. Opt-in `emergency_downgrade_enabled: true` enables strict rationing.
   if (codexDead && agyPacing?.soft_buffered) {
-    if (isWorkflow) {
-      return {
-        blocked: true,
-        kind: 'agy_emergency_rationing_no_workflow',
-        reason: '[AGY_EMERGENCY_RATIONING] Codex 已 100% 耗尽且 AGY 处于最后 10% 应急缓冲省流模式：已拦截 run_workflow 批量扇出，请仅对用户明确要求的紧急任务使用单个 flash_lite 子代理或最小化直接修改。'
-      };
-    }
-    if (isInvokeSubagent && !['browser', 'image-generator'].includes(subType)) {
-      const modelKey = Object.hasOwn(args, 'Model') ? 'Model' : Object.hasOwn(args, 'model') ? 'model' : 'Model';
-      const minTier = projectPolicy.agy_tiers?.simple || 'flash_lite';
+    if (agyCfg.emergency_downgrade_enabled === true) {
+      if (isWorkflow) {
+        return {
+          blocked: true,
+          kind: 'agy_emergency_rationing_no_workflow',
+          reason: '[AGY_EMERGENCY_RATIONING] Codex 已 100% 耗尽且 AGY 处于最后 10% 应急缓冲省流模式：已拦截 run_workflow 批量扇出，请仅对用户明确要求的紧急任务使用单个 flash_lite 子代理或最小化直接修改。'
+        };
+      }
+      if (isInvokeSubagent && !['browser', 'image-generator'].includes(subType)) {
+        const modelKey = Object.hasOwn(args, 'Model') ? 'Model' : Object.hasOwn(args, 'model') ? 'model' : 'Model';
+        const minTier = projectPolicy.agy_tiers?.simple || 'flash_lite';
+        return {
+          blocked: false,
+          overwrite: { [modelKey]: minTier },
+          note: `[应急省流模式] Codex 已 100% 耗尽且 AGY 进入应急缓冲（距周重置 ${agyPacing.window_7d?.hours_until_reset ?? '?'}h），子代理已强制降为最低成本 ${minTier} 省流执行。`
+        };
+      }
+    } else if (isWorkflow || (isInvokeSubagent && !['browser', 'image-generator'].includes(subType))) {
+      const remPct = agyPacing.window_7d?.remaining_percent;
       return {
         blocked: false,
-        overwrite: { [modelKey]: minTier },
-        note: `[应急省流模式] Codex 已 100% 耗尽且 AGY 进入应急缓冲（距周重置 ${agyPacing.window_7d?.hours_until_reset ?? '?'}h），子代理已强制降为最低成本 ${minTier} 省流执行。`
+        note: `[AGY 应急缓冲提醒] Codex 已 100% 耗尽，当前正在动用 AGY 最后应急缓冲（剩余约 ${remPct ?? '?'}%，距周重置 ${agyPacing.window_7d?.hours_until_reset ?? '?'}h）；保持原模型档位不降质，请留意余量。`
       };
     }
   }
@@ -3257,6 +3295,16 @@ module.exports = {
   DEFAULT_AGY_PACING,
   DEFAULT_AGY_GUARD,
   DEFAULT_AGY_TIERS,
+  DEFAULT_AGY_PROBE,
+  DEFAULT_MAINTENANCE,
+  PARAM_CATALOG,
+  PARAM_BY_KEY,
+  PARAM_GROUPS,
+  getParamValue,
+  setParamValue,
+  resetParamValue,
+  listParams,
+  buildDefaultTemplate,
   normalizeMode,
   normalizeSubagentModel,
   defaultPolicy,

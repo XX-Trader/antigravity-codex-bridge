@@ -324,6 +324,15 @@ pwsh -NoProfile -File scripts/Mode.ps1 agy-login
 
 # 8. 开启/关闭“对所有未登记项目生效的 AGY 通用守护与水位注入”（桥接仓库自身始终豁免，不强制走 Codex）
 pwsh -NoProfile -File scripts/Mode.ps1 global-guard --enabled true
+
+# 9. 统一参数档查看、修改、重置与导出（单一权威参数字典见 src/param-catalog.cjs，默认模板见 config/bridge-params.default.json）
+pwsh -NoProfile -File scripts/Mode.ps1 params list
+pwsh -NoProfile -File scripts/Mode.ps1 params list --group agy_pacing
+pwsh -NoProfile -File scripts/Mode.ps1 params get --key agy_pacing.buffer_unlock_window_hours
+pwsh -NoProfile -File scripts/Mode.ps1 params set --key agy_pacing.buffer_unlock_window_hours --value 12
+pwsh -NoProfile -File scripts/Mode.ps1 params set --key agy_pacing.emergency_downgrade_enabled --value false
+pwsh -NoProfile -File scripts/Mode.ps1 params reset --key agy_probe.slow_oauth_grace_ms
+pwsh -NoProfile -File scripts/Mode.ps1 params export --out ./my-params.json
 ```
 
 ---

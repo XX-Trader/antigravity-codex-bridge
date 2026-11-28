@@ -23,7 +23,13 @@ const {
   runAgyPoolTaskAsync,
   readStaleQuotaCache,
   writeQuotaCache,
-  activeCodexTasks
+  activeCodexTasks,
+  PARAM_GROUPS,
+  listParams,
+  getParamValue,
+  setParamValue,
+  resetParamValue,
+  buildDefaultTemplate
 } = require('../src/routing-policy.cjs');
 const { defaultGuardStatePath, resetAgyGuard, readGuardQuotaCooldown } = require('../src/agy-guard.cjs');
 
@@ -52,7 +58,8 @@ function usage() {
     '  tier [--simple MODEL] [--standard MODEL] [--complex MODEL] [--expert MODEL] [--enforce-low-cost true|false]',
     '  cooldown --engine codex|agy --minutes N [--reason TEXT]',
     '  clear-cooldown --engine codex|agy',
-    '  global-guard --enabled true|false [--policy POLICY_JSON]'
+    '  global-guard --enabled true|false [--policy POLICY_JSON]',
+    '  params [list|get|set|reset|export] [--group GROUP] [--key KEY] [--value VAL] [--all] [--out PATH] [--policy POLICY_JSON]'
   ].join('\n');
 }
 
@@ -60,8 +67,13 @@ function parseArgs(argv) {
   const command = argv[0] && !argv[0].startsWith('--') ? argv[0] : 'status';
   const rest = argv[0] && !argv[0].startsWith('--') ? argv.slice(1) : argv;
   const opts = { command };
-  const flags = new Set(['--refresh', '--clear', '--clear-snapshot', '--remove', '--force', '--apply', '--help', '-h']);
-  for (let i = 0; i < rest.length; i++) {
+  const flags = new Set(['--refresh', '--clear', '--clear-snapshot', '--remove', '--force', '--apply', '--all', '--help', '-h']);
+  let startIdx = 0;
+  if (command === 'params' && rest[0] && !rest[0].startsWith('--')) {
+    opts.action = rest[0];
+    startIdx = 1;
+  }
+  for (let i = startIdx; i < rest.length; i++) {
     const token = rest[i];
     if (flags.has(token)) { opts[token.replace(/^-+/, '')] = true; continue; }
     if (!token.startsWith('--') || i + 1 >= rest.length) throw new Error('Invalid option or missing value: ' + token);
@@ -188,11 +200,13 @@ async function run(argv) {
         if (p?.data) dataRoots.push(p.data);
       }
     }
-    const olderThanDays = opts['older-than-days'] !== undefined ? Number(opts['older-than-days']) : 7;
+    const defaultDays = current.maintenance?.prune_older_than_days ?? 7;
+    const defaultKeepLogs = current.maintenance?.keep_probe_logs ?? 10;
+    const olderThanDays = opts['older-than-days'] !== undefined ? Number(opts['older-than-days']) : defaultDays;
     if (!Number.isFinite(olderThanDays) || olderThanDays < 0 || olderThanDays > 3650) {
       throw new Error('--older-than-days must be a number in 0..3650');
     }
-    const keepProbeLogs = opts['keep-probe-logs'] !== undefined ? Math.floor(Number(opts['keep-probe-logs'])) : 10;
+    const keepProbeLogs = opts['keep-probe-logs'] !== undefined ? Math.floor(Number(opts['keep-probe-logs'])) : defaultKeepLogs;
     if (!Number.isFinite(keepProbeLogs) || keepProbeLogs < 1 || keepProbeLogs > 500) {
       throw new Error('--keep-probe-logs must be an integer in 1..500');
     }
@@ -580,6 +594,52 @@ async function run(argv) {
       policy_path: saved.path,
       apply_to_unregistered_projects: saved.apply_to_unregistered_projects
     }, null, 2);
+  }
+
+  if (opts.command === 'params') {
+    const action = (opts.action || 'list').toLowerCase();
+    if (action === 'list') {
+      const items = listParams(current, opts.group || null);
+      return JSON.stringify({ policy_path: policyFile, groups: PARAM_GROUPS, count: items.length, params: items }, null, 2);
+    }
+    if (action === 'get') {
+      if (!opts.key) throw new Error('--key is required (e.g. --key agy_pacing.buffer_unlock_window_hours)');
+      const item = listParams(current).find(p => p.key === opts.key);
+      if (!item) throw new Error(`Unknown parameter "${opts.key}". Run "Mode.ps1 params list" to see all keys.`);
+      return JSON.stringify({ policy_path: policyFile, ...item }, null, 2);
+    }
+    if (action === 'set') {
+      if (!opts.key) throw new Error('--key is required');
+      if (opts.value === undefined) throw new Error('--value is required');
+      const { policy: updated, spec, value } = setParamValue(current, opts.key, opts.value);
+      const saved = saveRoutingPolicy(policyFile, updated);
+      return JSON.stringify({ state: 'updated', policy_path: saved.path, key: spec.key, value: getParamValue(saved, spec.key), requested: value, unit: spec.unit, desc: spec.desc }, null, 2);
+    }
+    if (action === 'reset') {
+      if (opts.all) {
+        let next = current;
+        for (const item of listParams(current)) {
+          next = resetParamValue(next, item.key).policy;
+        }
+        const saved = saveRoutingPolicy(policyFile, next);
+        return JSON.stringify({ state: 'reset_all', policy_path: saved.path, count: listParams(saved).length }, null, 2);
+      }
+      if (!opts.key) throw new Error('Pass --key KEY or --all');
+      const { policy: updated, spec } = resetParamValue(current, opts.key);
+      const saved = saveRoutingPolicy(policyFile, updated);
+      return JSON.stringify({ state: 'reset', policy_path: saved.path, key: spec.key, value: getParamValue(saved, spec.key), default: spec.default }, null, 2);
+    }
+    if (action === 'export') {
+      const template = buildDefaultTemplate();
+      if (opts.out) {
+        const outPath = path.resolve(opts.out);
+        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+        fs.writeFileSync(outPath, `${JSON.stringify(template, null, 2)}\n`, 'utf8');
+        return JSON.stringify({ state: 'exported', out: outPath, groups: PARAM_GROUPS }, null, 2);
+      }
+      return JSON.stringify(template, null, 2);
+    }
+    throw new Error(`Unknown params action "${action}"; expected list, get, set, reset, or export`);
   }
 
   throw new Error('Unknown command: ' + opts.command);

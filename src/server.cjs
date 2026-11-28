@@ -859,8 +859,9 @@ class Broker {
       && rawCached.agy_health?.cc_switch_mtime_ms !== undefined
       && fastCcMtimeMs !== rawCached.agy_health.cc_switch_mtime_ms
     );
+    const codexRefreshMs = (projectPolicy.agy_probe?.codex_probe_refresh_minutes ?? 60) * 60 * 1000;
     const cachedCodexAgeMs = rawCached?.codex_probed_at ? nowMs - Date.parse(rawCached.codex_probed_at) : 0;
-    const codexProbeExpiredHourly = Boolean(rawCached?.codex_probed_at && Number.isFinite(cachedCodexAgeMs) && cachedCodexAgeMs >= 3600 * 1000);
+    const codexProbeExpiredHourly = Boolean(rawCached?.codex_probed_at && Number.isFinite(cachedCodexAgeMs) && cachedCodexAgeMs >= codexRefreshMs);
     const cached = (ccChangedVsCache || codexProbeExpiredHourly) ? null : rawCached;
 
     if (cached) {
@@ -970,7 +971,9 @@ class Broker {
         && prev?.agy_health?.keyring_last_written_ms !== null
         && preKeyringMs !== prev.agy_health.keyring_last_written_ms;
       const authSignalChanged = ccSwitchChanged || keyringChanged;
-      const probeIntervalMs = prev?.agy_health?.status === 'auth_required' ? 30 * 60 * 1000 : 10 * 60 * 1000;
+      const normalProbeMs = (projectPolicy.agy_probe?.probe_interval_minutes ?? 10) * 60 * 1000;
+      const authRetryMs = (projectPolicy.agy_probe?.auth_retry_interval_minutes ?? 30) * 60 * 1000;
+      const probeIntervalMs = prev?.agy_health?.status === 'auth_required' ? authRetryMs : normalProbeMs;
       const anyBucketExpired = Boolean(
         prev?.agy_external?.buckets
         && Object.values(prev.agy_external.buckets).some(b => {

@@ -542,29 +542,33 @@ test('dual 7-day 100% proportional pacing + AGY 5-hour limit guard + Codex fallb
   assert.equal(rBufferHit.preferred_engine, 'codex');
   assert.equal(rBufferHit.reason, 'agy_7d_protected_codex_fallback');
 
-  // 9. Last-12h drain (>6h before reset) keeps AGY's reserved 10% buffer; <=6h before reset automatically unlocks the remaining 10% buffer!
-  const reset8h = new Date(now + 8 * 3600000).toISOString(); // 8h > 6h => 10% buffer still locked
-  const apNoDrain = evaluateAgyPacing({
+  // 9. >12h before reset keeps AGY's reserved 10% buffer locked; <=12h before reset automatically unlocks the remaining 10% buffer and prioritizes draining it!
+  const reset15h = new Date(now + 15 * 3600000).toISOString(); // 15h > 12h => 10% buffer still locked
+  const apLocked15h = evaluateAgyPacing({
+    agyUsage: { available: false }, agyExternal: null, codexPacing: codexAhead, nowMs: now,
+    projectPolicy: resolveProjectPolicy({
+      ...base,
+      agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 85, weekly_resets_at: reset15h, five_hour_used_percent: 10, five_hour_resets_at: reset5h }
+    }, scope)
+  });
+  assert.equal(apLocked15h.window_7d.buffer_unlocked, false);
+  assert.equal(apLocked15h.window_7d.usable_remaining_percent, 5);
+  assert.notEqual(apLocked15h.window_7d.band, 'agy_drain');
+
+  // Within final 12h before weekly reset (e.g. 8h left <= 12h): remaining 10% buffer automatically unlocks and enters agy_drain!
+  const reset8h = new Date(now + 8 * 3600000).toISOString();
+  const apUnlocked8h = evaluateAgyPacing({
     agyUsage: { available: false }, agyExternal: null, codexPacing: codexAhead, nowMs: now,
     projectPolicy: resolveProjectPolicy({
       ...base,
       agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 85, weekly_resets_at: reset8h, five_hour_used_percent: 10, five_hour_resets_at: reset5h }
     }, scope)
   });
-  assert.equal(apNoDrain.window_7d.buffer_unlocked, false);
-  assert.equal(apNoDrain.window_7d.usable_remaining_percent, 5);
-  assert.notEqual(apNoDrain.window_7d.band, 'agy_drain');
-  const apDrain = evaluateAgyPacing({
-    agyUsage: { available: false }, agyExternal: null, codexPacing: codexAhead, nowMs: now,
-    projectPolicy: resolveProjectPolicy({
-      ...base,
-      agy_manual_snapshot: { recorded_at: new Date(now - 60000).toISOString(), weekly_used_percent: 75, weekly_resets_at: reset8h, five_hour_used_percent: 10, five_hour_resets_at: reset5h }
-    }, scope)
-  });
-  assert.equal(apDrain.window_7d.usable_remaining_percent, 15);
-  assert.equal(apDrain.window_7d.band, 'agy_drain');
+  assert.equal(apUnlocked8h.window_7d.buffer_unlocked, true);
+  assert.equal(apUnlocked8h.window_7d.usable_remaining_percent, 15);
+  assert.equal(apUnlocked8h.window_7d.band, 'agy_drain');
 
-  // Within final 6h before weekly reset (e.g. 4h left): 93% used unlocks the remaining 10% buffer (effective cap 100%, usable = 7%)!
+  // Within final 12h before weekly reset (e.g. 4h left): 93% used unlocks the remaining 10% buffer (effective cap 100%, usable = 7%)!
   const reset4h = new Date(now + 4 * 3600000).toISOString();
   const apUnlocked = evaluateAgyPacing({
     agyUsage: { available: false }, agyExternal: null, codexPacing: codexAhead, nowMs: now,
@@ -1017,34 +1021,35 @@ test('6h automatic buffer unlock, 100% exhaustion cross-engine handover, strict 
   );
   assert.equal(allowedAgyResearch.decision, 'allow');
 
-  // Advance clock to 4h before weekly reset (now + 20h => 4h <= 6h left): remaining 10% buffer unlocks automatically for BOTH main AGY and extpool!
-  const nowAt4hLeft = now + 20 * 3600000;
+  // Advance clock to 10h before weekly reset (now + 14h => 10h <= 12h default unlock window): remaining 10% buffer unlocks automatically for BOTH main AGY and extpool!
+  const nowAt10hLeft = now + 14 * 3600000;
   writeQuotaCache(cachePath, {
     codex_pacing: makeCodex(40, 48),
     agy_usage: { available: true, window_5h: { total_tokens: 0 }, window_7d: { total_tokens: 0 }, quota_errors_5h: 0, auto_degraded: false },
     agy_external: null,
-    fetched_at: new Date(nowAt4hLeft).toISOString()
+    fetched_at: new Date(nowAt10hLeft).toISOString()
   });
   const unlockedAgySub = bindOrigin(
     { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'invoke_subagent', args: { TypeName: 'self', Role: 'Impl', Prompt: 'drain remaining 7%' } } },
     projects,
-    { policyPath: f.policyPath, nowMs: nowAt4hLeft }
+    { policyPath: f.policyPath, nowMs: nowAt10hLeft }
   );
   assert.equal(unlockedAgySub.decision, 'allow');
-  const polAt4h = loadRoutingPolicy(f.policyPath);
-  const routeAt4h = decideRoute({
-    policy: polAt4h,
-    projectPolicy: resolveProjectPolicy(polAt4h, projects[0]),
+  const polAt10h = loadRoutingPolicy(f.policyPath);
+  const routeAt10h = decideRoute({
+    policy: polAt10h,
+    projectPolicy: resolveProjectPolicy(polAt10h, projects[0]),
     projectScope: projects[0],
     codexPacing: makeCodex(40, 48),
-    nowMs: nowAt4hLeft
+    nowMs: nowAt10hLeft
   });
-  assert.equal(routeAt4h.agy_pacing.window_7d.buffer_unlocked, true);
-  assert.equal(routeAt4h.agy_model_pools.extpool.buffer_unlocked, true);
-  assert.equal(routeAt4h.agy_model_pools.extpool.stopped, false);
+  assert.equal(routeAt10h.agy_pacing.window_7d.buffer_unlocked, true);
+  assert.equal(routeAt10h.agy_pacing.window_7d.band, 'agy_drain');
+  assert.equal(routeAt10h.agy_model_pools.extpool.buffer_unlocked, true);
+  assert.equal(routeAt10h.agy_model_pools.extpool.stopped, false);
 
   // 3. Dual-Constrained Matrix:
-  //    (a) Codex 100% dead + AGY 93% soft buffer (>6h to reset) => routes to AGY Emergency Rationing (NEVER dead Codex!), blocks run_workflow, forces flash_lite!
+  //    (a) Codex 100% dead + AGY 93% soft buffer (>12h to reset) => routes to AGY buffer preserving full model quality by default (no forced flash_lite downgrade, no run_workflow block)!
   writeQuotaCache(cachePath, {
     codex_pacing: makeCodex(100, 68),
     agy_usage: { available: true, window_5h: { total_tokens: 0 }, window_7d: { total_tokens: 0 }, quota_errors_5h: 0, auto_degraded: false },
@@ -1052,8 +1057,8 @@ test('6h automatic buffer unlock, 100% exhaustion cross-engine handover, strict 
     fetched_at: new Date(now).toISOString()
   });
   const routeRation = decideRoute({
-    policy: polAt4h,
-    projectPolicy: resolveProjectPolicy(polAt4h, projects[0]),
+    policy: polAt10h,
+    projectPolicy: resolveProjectPolicy(polAt10h, projects[0]),
     projectScope: projects[0],
     codexPacing: makeCodex(100, 68),
     nowMs: now
@@ -1062,22 +1067,44 @@ test('6h automatic buffer unlock, 100% exhaustion cross-engine handover, strict 
   assert.equal(routeRation.emergency_rationing, true);
   assert.equal(routeRation.reason, 'codex_exhausted_agy_emergency_rationing');
 
-  const blockedWorkflow = bindOrigin(
+  const allowedWorkflowDefault = bindOrigin(
     { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'run_workflow', args: { Script: 'x' } } },
     projects,
     { policyPath: f.policyPath, nowMs: now }
   );
-  assert.equal(blockedWorkflow.decision, 'deny');
-  assert.match(blockedWorkflow.reason, /\[AGY_EMERGENCY_RATIONING\]/);
+  assert.equal(allowedWorkflowDefault.decision, 'allow', 'default emergency_downgrade_enabled=false must NOT block run_workflow');
+  assert.match(allowedWorkflowDefault.reason || '', /AGY 应急缓冲提醒/);
 
-  const rationSub = bindOrigin(
+  const qualityPreservedSub = bindOrigin(
     { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'invoke_subagent', args: { TypeName: 'self', Model: 'pro', Role: 'Urgent Fix', Prompt: 'fix' } } },
     projects,
     { policyPath: f.policyPath, nowMs: now }
   );
-  assert.equal(rationSub.decision, 'allow');
-  assert.equal(rationSub.overwrite.Model, 'flash_lite');
-  assert.match(rationSub.reason, /应急省流模式/);
+  assert.equal(qualityPreservedSub.decision, 'allow');
+  assert.equal(qualityPreservedSub.overwrite?.Model, undefined, 'default emergency_downgrade_enabled=false must NOT downgrade pro to flash_lite');
+  assert.match(qualityPreservedSub.reason || '', /保持原模型档位不降质/);
+
+  //    (a2) Opt-in emergency_downgrade_enabled=true still enforces strict rationing (blocks run_workflow, forces flash_lite)
+  saveRoutingPolicy(f.policyPath, {
+    ...polAt10h,
+    agy_pacing: { ...polAt10h.agy_pacing, emergency_downgrade_enabled: true }
+  });
+  const blockedWorkflowOptIn = bindOrigin(
+    { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'run_workflow', args: { Script: 'x' } } },
+    projects,
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(blockedWorkflowOptIn.decision, 'deny');
+  assert.match(blockedWorkflowOptIn.reason, /\[AGY_EMERGENCY_RATIONING\]/);
+
+  const rationSubOptIn = bindOrigin(
+    { conversationId: convId, workspacePaths: [f.quantProject], toolCall: { name: 'invoke_subagent', args: { TypeName: 'self', Model: 'pro', Role: 'Urgent Fix', Prompt: 'fix' } } },
+    projects,
+    { policyPath: f.policyPath, nowMs: now }
+  );
+  assert.equal(rationSubOptIn.decision, 'allow');
+  assert.equal(rationSubOptIn.overwrite.Model, 'flash_lite');
+  assert.match(rationSubOptIn.reason, /应急省流模式/);
 
   //    (b) Both Codex 100% dead + AGY 100% dead => paused + [DUAL_QUOTA_EXHAUSTED] on both sides with earliest reset hours & CC Switch option!
   saveRoutingPolicy(f.policyPath, {
@@ -1983,4 +2010,43 @@ test('advanceResetAnchor is O(1) across huge epochs, detectAgyKeyringLastWritten
   const lockVal = withGuardLock(stateFile, () => 'inside');
   assert.equal(lockVal, 'inside');
   assert.equal(fs.existsSync(lockFile), false);
+});
+
+test('normalized parameter catalog, config/bridge-params.default.json alignment, and Mode.ps1 params CLI work end to end', async t => {
+  const { buildDefaultTemplate, PARAM_CATALOG } = require('../src/routing-policy.cjs');
+  const f = fixture(t);
+
+  // 1. Repo default parameter file stays 100% aligned with param-catalog.cjs
+  const repoDefault = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'config', 'bridge-params.default.json'), 'utf8'));
+  assert.deepEqual(repoDefault, buildDefaultTemplate());
+  assert.equal(repoDefault.agy_pacing.buffer_unlock_window_hours, 12);
+  assert.equal(repoDefault.agy_pacing.emergency_downgrade_enabled, false);
+  assert.equal(repoDefault.agy_probe.slow_oauth_grace_ms, 25000);
+
+  // 2. Mode.ps1 params list / get / set / reset / export
+  const listed = JSON.parse(await runModeCli(['params', 'list', '--group', 'agy_probe', '--policy', f.policyPath]));
+  assert.equal(listed.count, PARAM_CATALOG.filter(p => p.group === 'agy_probe').length);
+  assert.ok(listed.params.some(p => p.key === 'agy_probe.slow_oauth_grace_ms' && p.value === 25000));
+
+  const setOut = JSON.parse(await runModeCli(['params', 'set', '--key', 'agy_probe.slow_oauth_grace_ms', '--value', '30000', '--policy', f.policyPath]));
+  assert.equal(setOut.value, 30000);
+  const got = JSON.parse(await runModeCli(['params', 'get', '--key', 'agy_probe.slow_oauth_grace_ms', '--policy', f.policyPath]));
+  assert.equal(got.value, 30000);
+  assert.equal(got.modified, true);
+
+  // Reject out-of-range and unknown parameter keys
+  await assert.rejects(() => runModeCli(['params', 'set', '--key', 'agy_probe.slow_oauth_grace_ms', '--value', '999999', '--policy', f.policyPath]), /<= 90000/);
+  await assert.rejects(() => runModeCli(['params', 'set', '--key', 'unknown.key', '--value', '1', '--policy', f.policyPath]), /Unknown parameter/);
+
+  // Array parameter parsing via comma-separated input
+  const arrSet = JSON.parse(await runModeCli(['params', 'set', '--key', 'agy_probe.retry_delays_ms', '--value', '1000,2000', '--policy', f.policyPath]));
+  assert.deepEqual(arrSet.value, [1000, 2000]);
+
+  // Reset single key and export template
+  const resetOne = JSON.parse(await runModeCli(['params', 'reset', '--key', 'agy_probe.slow_oauth_grace_ms', '--policy', f.policyPath]));
+  assert.equal(resetOne.value, 25000);
+  const outTemplate = path.join(f.root, 'exported-params.json');
+  const exp = JSON.parse(await runModeCli(['params', 'export', '--out', outTemplate, '--policy', f.policyPath]));
+  assert.equal(exp.state, 'exported');
+  assert.deepEqual(JSON.parse(fs.readFileSync(outTemplate, 'utf8')), buildDefaultTemplate());
 });

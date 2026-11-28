@@ -1,0 +1,83 @@
+{
+  "schema": 1,
+  "default_mode": "auto",
+  "apply_to_unregistered_projects": false,
+  "enforce_subagent_low_cost": true,
+  "cache_ttl_seconds": 300,
+  "agy_quota_hint": "normal",
+  "pacing": {
+    "plan_days": 5,
+    "target_utilization": 100,
+    "codex_priority_margin": -3,
+    "balanced_upper_margin": 5,
+    "ahead_used_percent": 85,
+    "agy_priority_used_percent": 92,
+    "codex_protect_used_percent": 97,
+    "drain_window_hours": 12,
+    "drain_min_remaining_percent": 10,
+    "ahead_max_concurrent": 3,
+    "high_max_concurrent": 2,
+    "protect_max_concurrent": 1
+  },
+  "agy_pacing": {
+    "target_utilization": 90,
+    "window_minutes": 10080,
+    "window_5h_minutes": 300,
+    "dual_compare_margin": 5,
+    "linear_advisory_delta_percent": 10,
+    "window_5h_caution_percent": 75,
+    "window_5h_protect_percent": 88,
+    "weekly_protect_used_percent": 90,
+    "buffer_unlock_window_hours": 12,
+    "drain_window_hours": 12,
+    "drain_min_remaining_percent": 10,
+    "emergency_downgrade_enabled": false,
+    "window_5h_tokens": null,
+    "window_7d_tokens": null,
+    "weekly_resets_at": null
+  },
+  "agy_guard": {
+    "max_same_error_failures": 3,
+    "max_consecutive_failures": 8,
+    "review_gate": "advisory",
+    "review_valid_hours": 12,
+    "quota_error_cooldown_minutes": 15
+  },
+  "agy_tiers": {
+    "simple": "flash_lite",
+    "standard": "flash",
+    "complex": "pro",
+    "expert": "inherit"
+  },
+  "agy_host_models": {
+    "standard": null,
+    "complex": null,
+    "expert": null
+  },
+  "agy_probe": {
+    "timeout_ms": 65000,
+    "slow_oauth_threshold_ms": 8000,
+    "slow_oauth_grace_ms": 25000,
+    "fast_oauth_grace_ms": 600,
+    "probe_interval_minutes": 10,
+    "auth_retry_interval_minutes": 30,
+    "codex_probe_refresh_minutes": 60,
+    "retry_delays_ms": [
+      1500,
+      3000,
+      5000
+    ]
+  },
+  "maintenance": {
+    "prune_older_than_days": 7,
+    "keep_probe_logs": 10,
+    "index_wal_compact_kb": 64
+  },
+  "agy_model_pools": {},
+  "thinking_models": {
+    "general": null,
+    "quant": null,
+    "backups": []
+  },
+  "projects": {}
+}
