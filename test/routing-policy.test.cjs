@@ -1907,8 +1907,15 @@ test('apply_to_unregistered_projects enables flexible local AGY guard across unr
 });
 
 test('advanceResetAnchor is O(1) across huge epochs, detectAgyKeyringLastWrittenMsAsync works, and agy-guard skips unnecessary job scans + reclaims stale locks', async t => {
-  const { advanceResetAnchor, detectAgyKeyringLastWrittenMsAsync } = require('../src/routing-policy.cjs');
+  const { advanceResetAnchor, detectAgyKeyringLastWrittenMsAsync, resolveInterceptGraceMs } = require('../src/routing-policy.cjs');
   const { withGuardLock, checkAgyExecutionGate, recordToolOutcome, loadGuardState } = require('../src/agy-guard.cjs');
+
+  // 0. Slow silent OAuth refresh grace window (>=8s gets 25s silent write-back grace; <8s fast auth drop stays 600ms)
+  assert.equal(resolveInterceptGraceMs(500), 600);
+  assert.equal(resolveInterceptGraceMs(7999), 600);
+  assert.equal(resolveInterceptGraceMs(8000), 25000);
+  assert.equal(resolveInterceptGraceMs(10500), 25000);
+  assert.equal(resolveInterceptGraceMs(10500, 80), 80);
 
   // 1. O(1) advanceResetAnchor boundary & epoch=0 safety
   const win5h = 5 * 3600 * 1000;

@@ -1591,6 +1591,15 @@ function resolveAgyRetryPlan(options = {}) {
   return { maxAttempts, delaysMs };
 }
 
+const SLOW_OAUTH_INTERCEPT_THRESHOLD_MS = 8000;
+const SLOW_OAUTH_INTERCEPT_GRACE_MS = 25000;
+const FAST_OAUTH_INTERCEPT_GRACE_MS = 600;
+
+function resolveInterceptGraceMs(elapsedMs, explicitGraceMs) {
+  if (explicitGraceMs !== undefined && explicitGraceMs !== null) return explicitGraceMs;
+  return elapsedMs >= SLOW_OAUTH_INTERCEPT_THRESHOLD_MS ? SLOW_OAUTH_INTERCEPT_GRACE_MS : FAST_OAUTH_INTERCEPT_GRACE_MS;
+}
+
 function isRetryableAgyProbeFailure(result, attempt = 1) {
   if (!result || result.available) return false;
   // If CLI log proved credentials are missing or explicitly revoked (`auth_required`), retry at most once
@@ -1662,11 +1671,12 @@ function runExternalAgyProbeAsync(command, options = {}) {
     // When Google's closed-source `agy.exe` (`keyring.go:111`) hits its hardcoded 10s timeout refreshing an expired
     // hourly access_token, `printmode.go:433` calls `rundll32 url.dll,FileProtocolHandler`.
     // Our `no-browser-bin/rundll32.cmd` blocks the browser popup and writes `markerPath`;
-    // wait `graceMs` (6s if 10s refresh is in flight, 600ms if keyring failed immediately) so `keyringAuth` can save the new token.
+    // wait `graceMs` (25s if slow >10s refresh is in flight so `keyringAuth` finishes writing back the new token,
+    // 600ms if keyring failed immediately due to missing/revoked credentials).
     const interceptPoll = (!options.allowBrowser && markerPath) ? setInterval(() => {
       if (interceptAbortTimer || !fs.existsSync(markerPath)) return;
       const elapsedMs = Date.now() - spawnedAtMs;
-      const graceMs = explicitGraceMs ?? (elapsedMs >= 8000 ? 6000 : 600);
+      const graceMs = resolveInterceptGraceMs(elapsedMs, explicitGraceMs);
       interceptAbortTimer = setTimeout(() => {
         killChildTree(child);
         finish({
@@ -2107,7 +2117,7 @@ async function runAgyPoolTaskAsync(options = {}) {
     const interceptPoll = setInterval(() => {
       if (interceptAbortTimer || !fs.existsSync(markerPath)) return;
       const elapsedMs = Date.now() - spawnedAtMs;
-      const graceMs = explicitGraceMs ?? (elapsedMs >= 8000 ? 6000 : 600);
+      const graceMs = resolveInterceptGraceMs(elapsedMs, explicitGraceMs);
       interceptAbortTimer = setTimeout(() => {
         killChildTree(child);
         finish({
@@ -3277,6 +3287,7 @@ module.exports = {
   detectCcSwitchAccountsMtimeMs,
   detectAgyKeyringLastWrittenMs,
   detectAgyKeyringLastWrittenMsAsync,
+  resolveInterceptGraceMs,
   advanceResetAnchor,
   parseAgyProbePayload,
   runExternalAgyProbe,
