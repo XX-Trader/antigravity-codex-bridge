@@ -298,6 +298,7 @@ async function deliver(broker, id, send, options = {}) {
     });
     if (!hasPending) return false;
   } else {
+    if (job.notification_schema === 2) return false;
     const noticeFile = path.join(dir, 'notice.json');
     if (!fs.existsSync(noticeFile)) return false;
     const legacyDelivery = path.join(dir, 'delivery.json');
@@ -340,6 +341,7 @@ async function deliver(broker, id, send, options = {}) {
     if (!events.length) return false; // Explicit diagnostics may use an old job; stale business notices may not.
   }
   if (!events.length) {
+    if (job.notification_schema === 2) return false;
     const file = path.join(dir, 'notice.json'); if (!fs.existsSync(file)) return false;
     const notice = read(file);
     if (!terminal.has(job.status) || notice.status !== job.status) throw new Error('Notice identity mismatch');
@@ -474,7 +476,13 @@ function watch(broker, send, options = {}) {
     }
     if (job.notification_schema === 2) {
       // A worker crash can persist a terminal state without ever running its finalizer.
-      if (terminal.has(job.status) && !notificationEvents(broker.jobPath(id)).some(e => e.kind === 'terminal')) publishNotification(broker.jobPath(id), job, 'terminal', 'terminal', job.error || '执行轮次已结束，请核对原回执与业务验收。');
+      // However, worker() writes notice.json ONLY AFTER calling publishNotification('terminal'),
+      // so an existing notice.json proves the terminal notice was already finalized (e.g. later pruned);
+      // never synthesize a duplicate terminal event for an already-finalized job.
+      const finalizedNotice = fs.existsSync(path.join(path.dirname(broker.jobPath(id)), 'notice.json'));
+      if (terminal.has(job.status) && !finalizedNotice && !notificationEvents(broker.jobPath(id)).some(e => e.kind === 'terminal')) {
+        publishNotification(broker.jobPath(id), job, 'terminal', 'terminal', job.error || '执行轮次已结束，请核对原回执与业务验收。');
+      }
       return;
     }
     if (terminal.has(job.status)) {
@@ -498,7 +506,8 @@ function watch(broker, send, options = {}) {
       if (job.notification_schema === 2) schema2Jobs.add(id);
       // Worker status is saved before its terminal outbox event. Do not retire
       // that job in the gap, or a lost final callback will bypass reconciliation.
-      const settled = terminal.has(job.status) && ((job.notification_schema !== 2 && rows.length === 0) || rows.some(e => e.kind === 'terminal')) && rows.every(e => {
+      const finalizedNotice = job.notification_schema === 2 && rows.length === 0 && fs.existsSync(path.join(path.dirname(broker.jobPath(id)), 'notice.json'));
+      const settled = terminal.has(job.status) && (finalizedNotice || (job.notification_schema !== 2 && rows.length === 0) || rows.some(e => e.kind === 'terminal')) && rows.every(e => {
         const f = e.file.replace(/\.json$/, '.delivery.json'); return fs.existsSync(f) && SETTLED_DELIVERY_STATES.has(read(f).state);
       });
       if (settled) tracked.delete(id); else tracked.add(id);

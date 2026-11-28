@@ -1776,10 +1776,12 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
     fs.writeFileSync(path.join(oldJobDir, 'result.txt'), 'FINAL_RESULT', 'utf8');
     fs.writeFileSync(path.join(oldJobDir, 'events.jsonl'), 'e'.repeat(4096), 'utf8');
     fs.writeFileSync(path.join(oldJobDir, 'attempt-1.result.txt'), 'attempt1', 'utf8');
-    fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000001.json'), '{"kind":"terminal"}', 'utf8');
-    fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000001.delivery.json'), '{"state":"accepted"}', 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000001.json'), '{"kind":"started"}', 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000001.delivery.json'), '{"state":"suppressed"}', 'utf8');
     fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000002.json'), '{"kind":"terminal"}', 'utf8');
-    fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000002.delivery.json'), '{"state":"uncertain"}', 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000002.delivery.json'), '{"state":"accepted"}', 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000003.json'), '{"kind":"terminal"}', 'utf8');
+    fs.writeFileSync(path.join(oldJobDir, 'notifications', '00000003.delivery.json'), '{"state":"uncertain"}', 'utf8');
 
     fs.writeFileSync(path.join(activeJobDir, 'job.json'), JSON.stringify({ job_id: activeJobId, status: 'running', created_at: relIso(now, -10 * DAY_MS) }), 'utf8');
     fs.writeFileSync(path.join(activeJobDir, 'events.jsonl'), 'active-events', 'utf8');
@@ -1797,8 +1799,10 @@ test('unused / 0% unactivated windows, epoch-zero sentinels, cross-pool reset is
     assert.equal(applied.dry_run, false);
     assert.equal(fs.existsSync(path.join(oldJobDir, 'events.jsonl')), false);
     assert.equal(fs.existsSync(path.join(oldJobDir, 'attempt-1.result.txt')), false);
-    assert.equal(fs.existsSync(path.join(oldJobDir, 'notifications', '00000001.delivery.json')), false);
-    assert.equal(fs.existsSync(path.join(oldJobDir, 'notifications', '00000002.delivery.json')), true, 'Uncertain notifications must NEVER be pruned');
+    assert.equal(fs.existsSync(path.join(oldJobDir, 'notifications', '00000001.delivery.json')), false, 'Settled intermediate notifications are pruned');
+    assert.equal(fs.existsSync(path.join(oldJobDir, 'notifications', '00000002.json')), true, 'Settled terminal event MUST be preserved to prevent notifier replay');
+    assert.equal(fs.existsSync(path.join(oldJobDir, 'notifications', '00000002.delivery.json')), true, 'Settled terminal delivery receipt MUST be preserved');
+    assert.equal(fs.existsSync(path.join(oldJobDir, 'notifications', '00000003.delivery.json')), true, 'Uncertain notifications must NEVER be pruned');
     assert.equal(fs.existsSync(path.join(oldJobDir, 'job.json')), true, 'Core job.json must be preserved');
     assert.equal(fs.existsSync(path.join(oldJobDir, 'receipt.json')), true, 'Core receipt.json must be preserved');
     assert.equal(fs.existsSync(path.join(oldJobDir, 'result.txt')), true, 'Core result.txt must be preserved');

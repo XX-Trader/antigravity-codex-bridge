@@ -770,3 +770,19 @@ test('deliverEvent on already-uncertain event performs zero claim or disk writes
   assert.equal(await deliver(f.broker, id, async () => { throw Error('must not send'); }, { reconcile: async () => false }), false);
   assert.equal(diskMut, 0, 'Already-uncertain event must not create .claim or rewrite delivery.json when still unreconciled');
 });
+
+test('schema-2 finalized job with pruned notifications dir never republishes terminal or falls back to legacy notice.json', async t => {
+  const f = fixture(t, 'completed');
+  // Simulate a completed schema-2 job whose worker already wrote notice.json, then notifications/ was externally pruned.
+  save(path.join(path.dirname(f.file), 'notice.json'), {
+    job_id: id, topic_id: id, conversation_id: chat, status: 'completed', created_at: new Date(Date.now() - 86400000).toISOString()
+  });
+  let sent = 0;
+  const service = watch(f.broker, async () => { sent++; return { exit_code: 0 }; }, { reconcileMs: 5000 });
+  t.after(() => service.close());
+  await new Promise(r => setTimeout(r, 250));
+  assert.equal(sent, 0, 'must never replay terminal or legacy notice for an already-finalized schema-2 job');
+  assert.equal(notificationEvents(f.file).length, 0, 'adaptLegacy must not synthesize a duplicate terminal event');
+  assert.equal(await deliver(f.broker, id, async () => { sent++; return { exit_code: 0 }; }), false);
+  assert.equal(sent, 0);
+});

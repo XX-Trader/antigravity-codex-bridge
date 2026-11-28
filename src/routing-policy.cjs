@@ -3176,7 +3176,9 @@ function pruneBridgeRuntimeCache(options = {}) {
         } catch {}
       }
 
-      // 3. Already delivered/superseded/suppressed notification outbox files (never touch pending/sending/uncertain/not_sent!)
+      // 3. Already delivered/superseded/suppressed non-terminal notification outbox files.
+      // ALWAYS preserve `terminal` and `execution_alert` events + their `.delivery.json` receipts so
+      // `notifier.cjs` never mistakes a pruned completed job for a crashed worker that missed its final notice.
       const notifDir = path.join(jobDir, 'notifications');
       if (fs.existsSync(notifDir)) {
         try {
@@ -3189,6 +3191,9 @@ function pruneBridgeRuntimeCache(options = {}) {
             if (!DELIVERED_NOTICE_STATES.has(dDoc?.state)) continue;
             const evtFile = path.join(notifDir, e.name.replace(/\.delivery\.json$/, '.json'));
             if (fs.existsSync(evtFile)) {
+              let evtDoc = null;
+              try { evtDoc = JSON.parse(fs.readFileSync(evtFile, 'utf8')); } catch {}
+              if (['terminal', 'execution_alert'].includes(evtDoc?.kind)) continue;
               recordCandidate('delivered_notifications', evtFile, fs.statSync(evtFile).size);
             }
             recordCandidate('delivered_notifications', dFile, fs.statSync(dFile).size);
